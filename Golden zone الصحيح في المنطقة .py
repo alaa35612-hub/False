@@ -9047,6 +9047,8 @@ def _collect_recent_event_hits(
     latest_events: Any,
     *,
     bars: int = 2,
+    allowed_keys: Optional[Set[str]] = None,
+    required_status: Optional[str] = None,
 ) -> Tuple[List[str], List[int]]:
     """Identify latest-event keys that fall within the most recent candles."""
 
@@ -9068,11 +9070,17 @@ def _collect_recent_event_hits(
 
     hits: List[str] = []
     for key, payload in latest_events.items():
-        timestamp: Optional[Union[int, float]] = None
+        key_str = str(key)
+        if allowed_keys and key_str not in allowed_keys:
+            continue
         if isinstance(payload, dict):
+            if required_status and payload.get("status") != required_status:
+                continue
             timestamp = payload.get("time") or payload.get("ts") or payload.get("timestamp")
+        else:
+            timestamp = None
         if isinstance(timestamp, (int, float)) and int(timestamp) in recent_times:
-            hits.append(str(key))
+            hits.append(key_str)
     return hits, recent_times
 
 
@@ -10788,17 +10796,14 @@ def _android_cli_entry() -> int:
                     continue
 
                 metrics = runtime.gather_console_metrics()
-                # فلتر: نكمل فقط إذا كان السعر الحالي داخل منطقة Golden Zone
-                if not _is_price_inside_golden_zone(metrics):
-                    if args.verbose:
-                        print(
-                            f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لأن السعر الحالي خارج منطقة Golden Zone",
-                            flush=True,
-                        )
-                    continue
                 latest_events = metrics.get("latest_events") or {}
+                target_keys = {"GOLDEN_ZONE", "EXT_OB", "IDM_OB", "HIST_EXT_OB", "HIST_IDM_OB"}
                 recent_hits, _ = _collect_recent_event_hits(
-                    runtime.series, latest_events, bars=recent_window
+                    runtime.series,
+                    latest_events,
+                    bars=recent_window,
+                    allowed_keys=target_keys,
+                    required_status="touched",
                 )
                 if not recent_hits:
                     if recent_window == 1:
