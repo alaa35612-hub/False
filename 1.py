@@ -20,7 +20,7 @@ import math
 import random
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Callable
 
 import ccxt
 import numpy as np
@@ -114,6 +114,7 @@ maxDistanceToLastBar = 5000
 
 # === EMA Trend Dashboard (simplified but keeps alert logic) ===
 trend_dashboard_length = 200
+dashboard_timeframes = ["15", "60", "240", "D", "W"]
 
 # =============================================================================
 # Helper utilities mirroring Pine behaviour
@@ -254,6 +255,66 @@ def variant_ma(ma_type: str, series: pd.Series, length: int, off_sig: float, off
                 out.iloc[i] = c1 * (val + series.iloc[i - 1]) / 2 + c2 * out.iloc[i - 1] + c3 * out.iloc[i - 2]
         return out
     return sma(series, length)
+
+
+# --- Multi-timeframe emulation ---
+
+def timeframe_to_timedelta(tf: str) -> Optional[pd.Timedelta]:
+    """Convert a TradingView-style timeframe string to pandas Timedelta."""
+    tf = (tf or "").strip()
+    if tf in ("", "0"):
+        return None
+    mapping = {
+        "1": "1T",
+        "2": "2T",
+        "3": "3T",
+        "4": "4T",
+        "5": "5T",
+        "10": "10T",
+        "15": "15T",
+        "30": "30T",
+        "45": "45T",
+        "60": "60T",
+        "120": "120T",
+        "240": "240T",
+        "360": "360T",
+        "720": "720T",
+        "D": "1D",
+        "1D": "1D",
+        "3D": "3D",
+        "W": "1W",
+        "1W": "1W",
+        "M": "1M",
+        "1M": "1M",
+    }
+    pd_str = mapping.get(tf, None)
+    return pd.Timedelta(pd_str) if pd_str else None
+
+
+def resample_ohlcv(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    """Emulate request.security by resampling without lookahead (using closed='left')."""
+    delta = timeframe_to_timedelta(timeframe)
+    if delta is None:
+        return df
+    rule = delta
+    agg = {
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+    }
+    resampled = df.resample(rule, closed="left", label="left").agg(agg).dropna(how="any")
+    resampled = resampled.reindex(df.resample(rule, closed="left", label="left").mean().index).ffill()
+    return resampled
+
+
+def request_security(df: pd.DataFrame, timeframe: str, func: Callable[[pd.DataFrame], pd.Series]) -> pd.Series:
+    """Minimal replacement for Pine's request.security returning series aligned to base df."""
+    htf = resample_ohlcv(df, timeframe)
+    htf_result = func(htf)
+    aligned = htf_result.reindex(htf.index).reindex(df.index, method="ffill")
+    return aligned
 
 
 # =============================================================================
@@ -597,40 +658,138 @@ def kde_probabilities(values: List[float], steps: int, bandwidth: float, kernel:
 
 
 def compute_rsi_kde(df: pd.DataFrame) -> Dict[str, pd.Series]:
+    """PRO V6 RSI + KDE pivots (logic mirror).
+
+    The Pine script builds KDE distributions for RSI values captured at price
+    swing pivots (ta.pivothigh/low) and evaluates probabilities either via the
+    nearest bin or cumulative sum. Alerts fire when the color resets to na on a
+    confirmed bar while the previous bar was colored bullish/bearish.
+    """
+
     src = df[rsiSourceInput] if rsiSourceInput in df.columns else df["close"]
     rsi_series = ta_rsi(src, rsiLengthInput)
 
-    high_pivot = rsi_series.shift(highPivotLen).rolling(highPivotLen * 2 + 1).apply(lambda x: 1 if x.iloc[highPivotLen] == x.max() else 0, raw=False)
-    low_pivot = rsi_series.shift(lowPivotLen).rolling(lowPivotLen * 2 + 1).apply(lambda x: 1 if x.iloc[lowPivotLen] == x.min() else 0, raw=False)
+    # Price-based pivots, mirroring ta.pivothigh/low(highPivotLen, highPivotLen)
+    high_pivot = (
+        df["high"].shift(highPivotLen)
+        .rolling(highPivotLen * 2 + 1)
+        .apply(lambda x: 1 if x.iloc[highPivotLen] == x.max() else 0, raw=False)
+    )
+    low_pivot = (
+        df["low"].shift(lowPivotLen)
+        .rolling(lowPivotLen * 2 + 1)
+        .apply(lambda x: 1 if x.iloc[lowPivotLen] == x.min() else 0, raw=False)
+    )
 
-    pivot_values: List[float] = []
-    cur_color = pd.Series(index=df.index, dtype=float)
+    kde_limit = KDELimit
+    activation = activationThreshold if activationThresholdStr == "" else (
+        0.4 if activationThresholdStr == "High" else 0.25 if activationThresholdStr == "Medium" else 0.15
+    )
+
+    cur_color = pd.Series(np.nan, index=df.index)
     possible_bull = pd.Series(False, index=df.index)
     possible_bear = pd.Series(False, index=df.index)
 
-    activation = 0.4 if activationThresholdStr == "High" else 0.25 if activationThresholdStr == "Medium" else 0.15
+    highPivotRSIs: List[float] = []
+    lowPivotRSIs: List[float] = []
+    KDEHighX: Optional[np.ndarray] = None
+    KDEHighY: Optional[np.ndarray] = None
+    KDEHighYSum: Optional[np.ndarray] = None
+    KDELowX: Optional[np.ndarray] = None
+    KDELowY: Optional[np.ndarray] = None
+    KDELowYSum: Optional[np.ndarray] = None
+
+    def build_kde(arr: List[float]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        arr_np = np.array(arr, dtype=float)
+        arr_range = float(arr_np.max() - arr_np.min()) if arr_np.size > 0 else 0.0
+        arr_min = float(arr_np.min()) - (arr_range / 2.0 if minPadding else 0.0)
+        step_count = arr_range / KDEStep if KDEStep != 0 else 0.0
+
+        density_range = np.array([arr_min + i * step_count for i in range(KDEStep * 2)], dtype=float)
+        x_arr: List[float] = []
+        y_arr: List[float] = []
+
+        for val in density_range:
+            temp = 0.0
+            for item in arr_np:
+                distance = val - item
+                if KDEKernel == "Gaussian":
+                    temp += (1.0 / math.sqrt(2.0 * math.pi)) * math.exp(-0.5 * (distance / (1.0 / KDEBandwidth)) ** 2)
+                elif KDEKernel == "Uniform":
+                    temp += 0.0 if abs(distance) > (1.0 / KDEBandwidth) else 0.5
+                else:  # Sigmoid
+                    temp += 2.0 / math.pi * (1.0 / (math.exp(distance / (1.0 / KDEBandwidth)) + math.exp(-(distance / (1.0 / KDEBandwidth)))))
+            x_arr.append(val)
+            y_arr.append((1.0 / len(arr_np)) * temp if len(arr_np) > 0 else 0.0)
+
+        y_np = np.array(y_arr, dtype=float)
+        y_sum = np.cumsum(y_np)
+        return np.array(x_arr, dtype=float), y_np, y_sum
+
+    def prefix_sum(arr: np.ndarray, l: int, r: int) -> float:
+        if arr.size == 0:
+            return 0.0
+        return arr[r] - (0.0 if l == 0 else arr[l - 1])
+
+    confirmed = pd.Series(True, index=df.index)
+    if len(df) > 0:
+        confirmed.iloc[-1] = False  # mimic barstate.isconfirmed for the live bar
 
     for i in range(len(df)):
         if high_pivot.iloc[i] == 1:
-            pivot_values.append(rsi_series.iloc[i])
-            cur_color.iloc[i] = -1
-        elif low_pivot.iloc[i] == 1:
-            pivot_values.append(rsi_series.iloc[i])
-            cur_color.iloc[i] = 1
-        else:
-            cur_color.iloc[i] = np.nan
+            pivot_idx = max(i - highPivotLen, 0)
+            highPivotRSIs.append(rsi_series.iloc[pivot_idx])
+            if len(highPivotRSIs) > kde_limit:
+                highPivotRSIs = highPivotRSIs[-kde_limit:]
+            KDEHighX, KDEHighY, KDEHighYSum = build_kde(highPivotRSIs)
 
-        recent = pivot_values[-KDELimit:]
-        if recent:
-            probs = kde_probabilities(recent, KDEStep, KDEBandwidth, KDEKernel)
-            current_prob = probs[-1]
-            if current_prob >= activation:
-                if len(recent) > 0:
-                    last_val = recent[-1]
-                    if cur_color.iloc[i] == 1 or (not np.isnan(cur_color.shift(1).iloc[i]) and cur_color.shift(1).iloc[i] == 1):
-                        possible_bull.iloc[i] = True
-                    if cur_color.iloc[i] == -1 or (not np.isnan(cur_color.shift(1).iloc[i]) and cur_color.shift(1).iloc[i] == -1):
-                        possible_bear.iloc[i] = True
+        if low_pivot.iloc[i] == 1:
+            pivot_idx = max(i - lowPivotLen, 0)
+            lowPivotRSIs.append(rsi_series.iloc[pivot_idx])
+            if len(lowPivotRSIs) > kde_limit:
+                lowPivotRSIs = lowPivotRSIs[-kde_limit:]
+            KDELowX, KDELowY, KDELowYSum = build_kde(lowPivotRSIs)
+
+        highProb = None
+        maxHighProb = None
+        lowProb = None
+        maxLowProb = None
+
+        if (len(df) - i) < maxDistanceToLastBar and KDEHighX is not None and KDEHighY is not None:
+            nearest_idx = int(np.searchsorted(KDEHighX, rsi_series.iloc[i]))
+            nearest_idx = min(max(nearest_idx, 0), len(KDEHighX) - 1)
+            if probMode == "Nearest":
+                highProb = float(KDEHighY[nearest_idx])
+                maxHighProb = float(np.max(KDEHighY))
+            else:
+                highProb = float(prefix_sum(KDEHighYSum, 0, nearest_idx))
+                maxHighProb = float(np.sum(KDEHighY))
+
+        if (len(df) - i) < maxDistanceToLastBar and KDELowX is not None and KDELowY is not None:
+            nearest_idx_low = int(np.searchsorted(KDELowX, rsi_series.iloc[i]))
+            nearest_idx_low = min(max(nearest_idx_low, 0), len(KDELowX) - 1)
+            if probMode == "Nearest":
+                lowProb = float(KDELowY[nearest_idx_low])
+                maxLowProb = float(np.max(KDELowY))
+            else:
+                lowProb = float(prefix_sum(KDELowYSum, nearest_idx_low, len(KDELowYSum) - 1))
+                maxLowProb = float(np.sum(KDELowY))
+
+        cur_color.iloc[i] = np.nan
+        if KDELowY is not None and KDEHighY is not None:
+            if probMode == "Nearest":
+                if lowProb is not None and maxLowProb is not None and abs(lowProb - maxLowProb) < activation / 50.0:
+                    cur_color.iloc[i] = 1  # bullish color
+                if highProb is not None and maxHighProb is not None and abs(highProb - maxHighProb) < activation / 50.0:
+                    cur_color.iloc[i] = -1  # bearish color
+            else:
+                if lowProb is not None and maxLowProb is not None and lowProb > maxLowProb * (1.0 - activation):
+                    cur_color.iloc[i] = 1
+                elif highProb is not None and maxHighProb is not None and highProb > maxHighProb * (1.0 - activation):
+                    cur_color.iloc[i] = -1
+
+        possible_bull.iloc[i] = pd.isna(cur_color.iloc[i]) and cur_color.shift(1).iloc[i] == 1 and confirmed.iloc[i]
+        possible_bear.iloc[i] = pd.isna(cur_color.iloc[i]) and cur_color.shift(1).iloc[i] == -1 and confirmed.iloc[i]
 
     return {
         "curColor": cur_color,
@@ -648,6 +807,31 @@ def compute_trend_indicator(df: pd.DataFrame) -> pd.Series:
     indicator = indicator.mask(ema_fast > ema_slow, 1)
     indicator = indicator.mask(ema_fast < ema_slow, -1)
     return indicator
+
+
+def compute_dashboard_alignment(df: pd.DataFrame) -> Dict[str, pd.Series]:
+    """Mirror dashboard/resolution trend alignment across multiple timeframes."""
+    trend_status = {}
+    for tf in dashboard_timeframes:
+        trend_status[tf] = request_security(df, tf, lambda d: compute_trend_indicator(d))
+
+    idx = df.index
+    alignment_up = pd.Series(False, index=idx)
+    alignment_down = pd.Series(False, index=idx)
+    mixed_state = pd.Series(False, index=idx)
+
+    stacked = pd.concat([trend_status[tf] for tf in dashboard_timeframes], axis=1)
+    stacked.columns = dashboard_timeframes
+    alignment_up = (stacked == 1).all(axis=1)
+    alignment_down = (stacked == -1).all(axis=1)
+    mixed_state = ~(alignment_up | alignment_down)
+
+    return {
+        "trend_status": trend_status,
+        "alignment_up": alignment_up,
+        "alignment_down": alignment_down,
+        "alignment_mixed": mixed_state,
+    }
 
 
 # =============================================================================
@@ -694,6 +878,11 @@ def compute_all_pro_v6_signals(df: pd.DataFrame) -> Dict[str, pd.Series]:
     })
 
     signals["trend_indicator"] = compute_trend_indicator(df)
+
+    dashboard = compute_dashboard_alignment(df)
+    signals["alignment_up"] = dashboard["alignment_up"] & ~dashboard["alignment_up"].shift(1, fill_value=False)
+    signals["alignment_down"] = dashboard["alignment_down"] & ~dashboard["alignment_down"].shift(1, fill_value=False)
+    signals["alignment_mixed"] = dashboard["alignment_mixed"] & ~dashboard["alignment_mixed"].shift(1, fill_value=False)
 
     return signals
 
@@ -788,6 +977,9 @@ def print_signals(symbol: str, timeframe: str, df: pd.DataFrame, signals: Dict[s
         "z3_short": "Zone 3 Cross Up (Downtrend)",
         "theil_sen_break": "Theil-Sen Channel Break",
         "trend_indicator": "Trend Changed",
+        "alignment_up": "Dashboard Alignment Up",
+        "alignment_down": "Dashboard Alignment Down",
+        "alignment_mixed": "Dashboard Alignment Mixed",
     }
 
     for key, series in signals.items():
