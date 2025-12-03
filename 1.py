@@ -306,8 +306,16 @@ def timeframe_to_timedelta(tf: str) -> Optional[pd.Timedelta]:
     return None
 
 
+def infer_time_delta(index: pd.Index) -> Optional[pd.Timedelta]:
+    """Infer a representative bar duration from an index of timestamps."""
+    if len(index) < 2:
+        return None
+    deltas = pd.Series(index).diff().dropna()
+    return deltas.median() if not deltas.empty else None
+
+
 def resample_ohlcv(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
-    """Emulate request.security resampling without lookahead (using closed='left')."""
+    """Emulate request.security resampling without lookahead (closed='right', label='right')."""
     delta = timeframe_to_timedelta(timeframe)
     if delta is None:
         return df
@@ -319,8 +327,7 @@ def resample_ohlcv(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
         "close": "last",
         "volume": "sum",
     }
-    resampled = df.resample(rule, closed="left", label="left").agg(agg).dropna(how="any")
-    resampled = resampled.reindex(df.resample(rule, closed="left", label="left").mean().index).ffill()
+    resampled = df.resample(rule, closed="right", label="right").agg(agg).dropna(how="any")
     return resampled
 
 
@@ -334,8 +341,13 @@ def request_security(df: pd.DataFrame, timeframe: str, func: Callable[[pd.DataFr
         htf_df = resample_ohlcv(df, timeframe)
 
     htf_result = func(htf_df)
-    htf_result.index = htf_df.index
-    aligned = htf_result.reindex(df.index, method="ffill")
+    htf_delta = timeframe_to_timedelta(timeframe) or pd.Timedelta(0)
+    htf_result.index = htf_df.index + htf_delta  # shift to close time to avoid lookahead
+
+    base_delta = infer_time_delta(df.index) or pd.Timedelta(0)
+    base_close_index = df.index + base_delta
+    aligned = htf_result.reindex(base_close_index, method="ffill")
+    aligned.index = df.index
     return aligned
 
 
@@ -699,15 +711,15 @@ def compute_rsi_kde(df: pd.DataFrame, htf_df: Optional[pd.DataFrame] = None, htf
         for pos, flag in enumerate(high_flags):
             if flag == 1:
                 pivot_ts = htf_index[pos] + delta
-                base_pos = base_index.searchsorted(pivot_ts)
-                if base_pos < len(base_index):
+                base_pos = base_index.searchsorted(pivot_ts, side="right") - 1
+                if 0 <= base_pos < len(base_index):
                     pivot_idx = max(pos - highPivotLen, 0)
                     high_map[base_pos].append(htf_rsi_series.iloc[pivot_idx])
         for pos, flag in enumerate(low_flags):
             if flag == 1:
                 pivot_ts = htf_index[pos] + delta
-                base_pos = base_index.searchsorted(pivot_ts)
-                if base_pos < len(base_index):
+                base_pos = base_index.searchsorted(pivot_ts, side="right") - 1
+                if 0 <= base_pos < len(base_index):
                     pivot_idx = max(pos - lowPivotLen, 0)
                     low_map[base_pos].append(htf_rsi_series.iloc[pivot_idx])
         return high_map, low_map
