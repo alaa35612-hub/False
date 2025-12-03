@@ -449,6 +449,9 @@ def compute_trend_follow(df: pd.DataFrame) -> Dict[str, pd.Series]:
     z3 = ex + (trail - ex) * zone3_level / 100.0
     l100 = trail
 
+    fixnan_z1 = z1.ffill()
+    dynamic_change = fixnan_z1 != fixnan_z1.shift(1)
+
     z1_long = enable_trend_follow and (state.shift(1) == "up") & crossunder(norm_c, z1.shift(1))
     z2_long = enable_trend_follow and (state.shift(1) == "up") & crossunder(norm_c, z2.shift(1))
     z3_long = enable_trend_follow and (state.shift(1) == "up") & crossunder(norm_c, z3.shift(1))
@@ -465,6 +468,7 @@ def compute_trend_follow(df: pd.DataFrame) -> Dict[str, pd.Series]:
         "z3": z3,
         "l100": l100,
         "state": state,
+        "dynamic_change": pd.Series(dynamic_change, index=df.index),
         "z1_long": pd.Series(z1_long, index=df.index),
         "z2_long": pd.Series(z2_long, index=df.index),
         "z3_long": pd.Series(z3_long, index=df.index),
@@ -861,26 +865,46 @@ def compute_trend_indicator(df: pd.DataFrame) -> pd.Series:
 
 def compute_dashboard_alignment(df: pd.DataFrame) -> Dict[str, pd.Series]:
     """Mirror dashboard/resolution trend alignment across multiple timeframes."""
-    trend_status = {}
-    for tf in dashboard_timeframes:
+    trend_status: Dict[str, pd.Series] = {}
+    tf_list = dashboard_timeframes if len(dashboard_timeframes) >= 5 else (dashboard_timeframes + [dashboard_timeframes[-1]] * (5 - len(dashboard_timeframes)))
+    for tf in tf_list:
         trend_status[tf] = request_security(df, tf, lambda d: compute_trend_indicator(d))
 
-    idx = df.index
-    alignment_up = pd.Series(False, index=idx)
-    alignment_down = pd.Series(False, index=idx)
-    mixed_state = pd.Series(False, index=idx)
+    stacked = pd.concat([trend_status[tf] for tf in tf_list], axis=1)
+    stacked.columns = tf_list
 
-    stacked = pd.concat([trend_status[tf] for tf in dashboard_timeframes], axis=1)
-    stacked.columns = dashboard_timeframes
+    base_indicator = stacked.iloc[:, 0]
+    prev_base = base_indicator.shift(1)
+    trend_changed = base_indicator != prev_base
+    trend_up_start = trend_changed & (base_indicator == 1)
+    trend_down_start = trend_changed & (base_indicator == -1)
+    trend_neutral_start = trend_changed & (base_indicator == 0)
+
+    align_tf345 = (stacked.iloc[:, 2] == stacked.iloc[:, 3]) & (stacked.iloc[:, 3] == stacked.iloc[:, 4])
+    align_tf234 = (stacked.iloc[:, 1] == stacked.iloc[:, 2]) & (stacked.iloc[:, 2] == stacked.iloc[:, 3])
+    align_tf123 = (stacked.iloc[:, 0] == stacked.iloc[:, 1]) & (stacked.iloc[:, 1] == stacked.iloc[:, 2])
+    align_tf1234 = align_tf123 & (stacked.iloc[:, 2] == stacked.iloc[:, 3])
+    align_all = align_tf1234 & (stacked.iloc[:, 3] == stacked.iloc[:, 4])
+
     alignment_up = (stacked == 1).all(axis=1)
     alignment_down = (stacked == -1).all(axis=1)
     mixed_state = ~(alignment_up | alignment_down)
 
     return {
         "trend_status": trend_status,
+        "base_indicator": base_indicator,
+        "trend_changed": trend_changed,
+        "trend_up_start": trend_up_start,
+        "trend_down_start": trend_down_start,
+        "trend_neutral_start": trend_neutral_start,
         "alignment_up": alignment_up,
         "alignment_down": alignment_down,
         "alignment_mixed": mixed_state,
+        "align_tf345": align_tf345,
+        "align_tf234": align_tf234,
+        "align_tf123": align_tf123,
+        "align_tf1234": align_tf1234,
+        "align_all": align_all,
     }
 
 
@@ -905,6 +929,7 @@ def compute_all_pro_v6_signals(df: pd.DataFrame, htf_df: Optional[pd.DataFrame] 
         "z1_short": trend["z1_short"],
         "z2_short": trend["z2_short"],
         "z3_short": trend["z3_short"],
+        "dynamic_change": trend["dynamic_change"],
     })
 
     if enable_theilsen:
@@ -927,12 +952,20 @@ def compute_all_pro_v6_signals(df: pd.DataFrame, htf_df: Optional[pd.DataFrame] 
         "possible_bearish_pivot": rsi_kde["possible_bearish_pivot"],
     })
 
-    signals["trend_indicator"] = compute_trend_indicator(df)
-
     dashboard = compute_dashboard_alignment(df)
+    signals["trend_indicator"] = dashboard["base_indicator"]
+    signals["trend_changed"] = dashboard["trend_changed"]
+    signals["trend_up_start"] = dashboard["trend_up_start"]
+    signals["trend_down_start"] = dashboard["trend_down_start"]
+    signals["trend_neutral_start"] = dashboard["trend_neutral_start"]
     signals["alignment_up"] = dashboard["alignment_up"] & ~dashboard["alignment_up"].shift(1, fill_value=False)
     signals["alignment_down"] = dashboard["alignment_down"] & ~dashboard["alignment_down"].shift(1, fill_value=False)
     signals["alignment_mixed"] = dashboard["alignment_mixed"] & ~dashboard["alignment_mixed"].shift(1, fill_value=False)
+    signals["align_tf345"] = dashboard["align_tf345"] & ~dashboard["align_tf345"].shift(1, fill_value=False)
+    signals["align_tf234"] = dashboard["align_tf234"] & ~dashboard["align_tf234"].shift(1, fill_value=False)
+    signals["align_tf123"] = dashboard["align_tf123"] & ~dashboard["align_tf123"].shift(1, fill_value=False)
+    signals["align_tf1234"] = dashboard["align_tf1234"] & ~dashboard["align_tf1234"].shift(1, fill_value=False)
+    signals["align_all"] = dashboard["align_all"] & ~dashboard["align_all"].shift(1, fill_value=False)
 
     return signals
 
@@ -1026,10 +1059,20 @@ def print_signals(symbol: str, timeframe: str, df: pd.DataFrame, signals: Dict[s
         "z2_short": "Zone 2 Cross Up (Downtrend)",
         "z3_short": "Zone 3 Cross Up (Downtrend)",
         "theil_sen_break": "Theil-Sen Channel Break",
+        "dynamic_change": "Dynamic Line Change",
         "trend_indicator": "Trend Changed",
+        "trend_changed": "Trend Changed",
+        "trend_up_start": "Dashboard - Uptrend started",
+        "trend_down_start": "Dashboard - Downtrend started",
+        "trend_neutral_start": "Dashboard - Neutral trend started",
         "alignment_up": "Dashboard Alignment Up",
         "alignment_down": "Dashboard Alignment Down",
         "alignment_mixed": "Dashboard Alignment Mixed",
+        "align_tf345": "Dashboard TF3 TF4 TF5 aligned",
+        "align_tf234": "Dashboard TF2 TF3 TF4 aligned",
+        "align_tf123": "Dashboard TF1 TF2 TF3 aligned",
+        "align_tf1234": "Dashboard TF1 TF2 TF3 TF4 aligned",
+        "align_all": "Dashboard All TF aligned",
     }
 
     for key, series in signals.items():
