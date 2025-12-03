@@ -1649,6 +1649,7 @@ class SmartMoneyAlgoProE5:
         metrics["ext_ob_new"] = _status_total(ext_counter, "new")
         metrics["ext_ob_touched"] = _status_total(ext_counter, "touched", "retest")
         metrics["current_price"] = self.series.get("close")
+        metrics["latest_bar_time"] = self.series.get_time()
         metrics["latest_events"] = self._collect_latest_console_events()
         return metrics
 
@@ -8949,6 +8950,16 @@ def _is_price_inside_golden_zone(metrics: Dict[str, Any]) -> bool:
 
     gz = latest.get("GOLDEN_ZONE")
     if not isinstance(gz, dict):
+        return False
+
+    if gz.get("status") != "touched":
+        return False
+
+    latest_bar_time = metrics.get("latest_bar_time")
+    gz_time = gz.get("time")
+    if not isinstance(latest_bar_time, (int, float)) or not isinstance(gz_time, (int, float)):
+        return False
+    if int(gz_time) != int(latest_bar_time):
         return False
 
     bounds = gz.get("price")
