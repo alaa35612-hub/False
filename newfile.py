@@ -1,23 +1,10 @@
 """
-PRO V6 Full Scanner (approximate translation from Pine Script to Python)
+PRO V6 Full Scanner (logic-oriented translation from Pine Script to Python)
 
-NOTE:
-- This script focuses on faithfully re-implementing the *trading logic* that produces
-  the main PRO V6 alerts:
-    * Pro Signal Up / Pro Signal Down        (Signal System)
-    * Zone 1/2/3 Cross Up/Down              (Trend Following Zones)
-    * Theil-Sen Channel Break               (Theil-Sen Estimator)
-    * Long Entry Alert / Short Entry Alert  (Trend 2)
-    * Strong Buy Alert / Strong Sell Alert  (Trend 2 + RSI)
-    * Possible Bullish Pivot / Bearish Pivot (RSI + KDE Pivots)
-    * Trend change alerts (Up / Down / Neutral) via simple EMA trend model
-
-- Purely visual elements (tables, labels, box drawing, background coloring, etc.)
-  are omitted, but the underlying calculations that affect any of the above
-  signals are kept.
-
-- This is *not* a literal line-by-line transpilation of every drawing call in Pine,
-  but it preserves the computational logic of the trading systems themselves.
+This file rebuilds the trading logic of the PRO V6 indicator so it can operate as a
+console-based scanner on Binance USDT-M Futures using CCXT. Visual-only elements from
+Pine (tables, labels, drawings) are not reproduced, but every computation that feeds
+the core alerts is represented here.
 """
 
 import time
@@ -37,10 +24,16 @@ API_KEY = ""         # optional
 API_SECRET = ""      # optional
 
 USE_ALL_SYMBOLS = True
-SYMBOLS_WHITELIST = ["BTC/USDT", "ETH/USDT"]  # used if USE_ALL_SYMBOLS = False
+SYMBOLS_WHITELIST = []  # used if USE_ALL_SYMBOLS = False
+# Optional cap on how many symbols to scan. Set to None to scan every USDT-M pair.
+SCAN_SYMBOL_LIMIT = None
+
+# Primary resolution used by the scanner; mirrors `res = input.timeframe('')`.
+# If left blank, BASE_TIMEFRAME is used.
+INPUT_TIMEFRAME = ""
 
 BASE_TIMEFRAME = "15m"        # equivalent to TradingView chart timeframe
-MAX_HISTORY_BARS = 2000       # similar to max_bars_back (Pine = 5000)
+MAX_HISTORY_BARS = 5000       # mirrors max_bars_back from the Pine script
 ALERT_LOOKBACK_BARS = 3       # only print alerts that occurred within last N bars
 ALERT_LOOKBACK_MINUTES = 0    # 0 disables time-based filter
 
@@ -889,6 +882,30 @@ def init_exchange():
     return exchange
 
 
+def resolve_timeframe(exchange, requested: str) -> str:
+    """
+    Mirror Pine's `res = input.timeframe('')` behaviour:
+    - If the Pine input is empty, fall back to BASE_TIMEFRAME (chart timeframe).
+    - If a non-empty timeframe is provided but not offered by ccxt for this
+      exchange, fall back to BASE_TIMEFRAME when available, otherwise pick the
+      first advertised timeframe to avoid fetch_ohlcv errors.
+    """
+    tf = (requested or "").strip() or BASE_TIMEFRAME
+
+    # Check against exchange-supported timeframes for safety
+    if exchange is not None:
+        available = getattr(exchange, "timeframes", None) or {}
+        if available and tf not in available:
+            fallback = BASE_TIMEFRAME if BASE_TIMEFRAME in available else next(iter(available.keys()))
+            print(
+                f"[WARN] Requested timeframe '{tf}' not in exchange list; "
+                f"using '{fallback}' instead."
+            )
+            tf = fallback
+
+    return tf
+
+
 def get_usdtm_symbols(exchange):
     markets = exchange.markets
     symbols = [s for s, m in markets.items()
@@ -897,6 +914,9 @@ def get_usdtm_symbols(exchange):
 
     if not USE_ALL_SYMBOLS:
         symbols = [s for s in symbols if s in SYMBOLS_WHITELIST]
+
+    if SCAN_SYMBOL_LIMIT is not None and SCAN_SYMBOL_LIMIT > 0:
+        symbols = symbols[:SCAN_SYMBOL_LIMIT]
 
     return symbols
 
@@ -1016,10 +1036,11 @@ def process_symbol(exchange, symbol: str, timeframe: str):
 def run_scan_once():
     exchange = init_exchange()
     symbols = get_usdtm_symbols(exchange)
-    print(f"[INFO] Scanning {len(symbols)} Binance USDT-M symbols on {BASE_TIMEFRAME}")
+    timeframe = resolve_timeframe(exchange, INPUT_TIMEFRAME)
+    print(f"[INFO] Scanning {len(symbols)} Binance USDT-M symbols on {timeframe}")
 
     for i, symbol in enumerate(symbols, start=1):
-        process_symbol(exchange, symbol, BASE_TIMEFRAME)
+        process_symbol(exchange, symbol, timeframe)
         time.sleep(SLEEP_BETWEEN_SYMBOLS)
 
 
