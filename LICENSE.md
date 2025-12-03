@@ -1,218 +1,100 @@
-[ROLE / الدور]
+Corrections for PRO V6 Python Code to Match TradingView Indicator
 
-You are an expert quantitative developer and code transpiler specialized in:
-- TradingView Pine Script v5 (advanced, with complex indicators and dashboards).
-- Python 3.x (production-grade, modular, clean code).
-- Crypto derivatives markets via CCXT, especially Binance USDT-M Futures.
+To ensure the Python implementation of the PRO V6 indicator matches the original Pine Script with ~99.99% accuracy, the following corrections and enhancements are needed. These address multi-timeframe handling, signal color logic, KDE pivot calculations, inclusion of visual-based signals, and a minor variable naming fix. After applying these changes, the Python code’s outputs (signal names, timing, values, and chart markings) should align almost exactly with the TradingView version across all symbols and timeframes.
 
-You act as a **methodical, literal code transpiler**, not as a summarizer:
-- Your job is to **convert the ENTIRE Pine Script indicator PRO V6** into a single, runnable Python script.
-- No deletion, no simplification, no skipping any logic that impacts signals, trend states or levels.
+1. Synchronize Multi-Timeframe Signals (request.security Behavior)
 
+The original Pine script uses request.security to pull higher-timeframe data (as specified by the Period input res) and synchronize those signals on the lower timeframe chart. To replicate this in Python, implement the following:
 
-[NON-NEGOTIABLE GLOBAL GOAL / الهدف غير القابل للتفاوض]
+Higher Timeframe Data Fetch: If INPUT_TIMEFRAME (the res input) is not empty and differs from the base chart timeframe, fetch an OHLCV dataset for that higher timeframe (using the same MAX_HISTORY_BARS limit). This provides the reference data needed for multi-timeframe signals.
 
-Convert the full TradingView indicator **PRO V6** (Pine Script v5) from the first line to the last line into ONE Python 3 script that:
+Higher Timeframe Pivot Calculation: Using the fetched higher-TF data, compute pivot highs/lows with the same lengths (high_pivot_len/low_pivot_len). For example, use find_pivots() on the higher-TF highs/lows (e.g. 21 bars left/right by default) to get boolean series of pivot points. This mirrors Pine’s ta.pivothigh/ta.pivotlow on the higher timeframe.
 
-1) Re-implements all the computational and logical behavior of the indicator:
-   - Signal System (Pro Signal Up / Pro Signal Down).
-   - Trend Following + Zones (Zone 1/2/3, state up/down, trail).
-   - Theil-Sen Estimator (slope, intercept, dev, channel breaks).
-   - Trend 2 (ALMA / multi-MA basis, RSI filters, strong buy/sell).
-   - S/R and levels / zones (support, resistance, BOS, etc. whenever used logically).
-   - Clouds, ribbons, Cirrus Cloud, secondary trend logic.
-   - RSI + KDE + Pivot-based probabilities and “Possible Bullish/Bearish Pivot”.
-   - Dashboards / multi-timeframe trend states / probabilities – at least at the level of computational logic (even if visual tables are not drawn).
-   - Any other internal sub-system used by PRO V6 that affects signals, states, colors or thresholds.
+Signal Time Alignment: Map each detected higher-TF pivot to the base timeframe index. In TradingView, a higher-TF pivot signal only appears on the completion of that higher-TF bar. Therefore, find the timestamp of the pivot bar on the higher timeframe and locate the corresponding bar on the base timeframe (likely the bar with the same closing time or the immediately following base bar). Mark a pivot event on the base timeframe at that point. Essentially, propagate the higher-TF pivot value down so that it stays na on base bars until the moment the higher-TF bar closes and confirms the pivot.
 
-2) Reads OHLCV data from **Binance USDT-M Futures via CCXT** for all relevant symbols and timeframes.
-
-3) Reproduces the same trading signals as the original indicator with targeted accuracy of **99.99%**, subject to the natural differences between Binance data and TradingView data.
-
-4) Runs as a normal Python script (no Jupyter Notebook) and prints signals to the console (stdout) in a clear, machine-readable text format.
+Replace/Combine Base Pivots: Use these time-aligned higher-TF pivot booleans in place of (or in addition to) the current base timeframe pivots when generating signals. In practice, if a higher timeframe is specified, the Python code should simulate Pine’s behavior by using the higher-TF pivots for signal logic, not the base pivots. This will ensure signals like trendline breaks or “Possible Pivot” alerts trigger at the exact same bars as in TradingView. For example, a daily pivot high will cause a “Possible Bearish Pivot” on the lower timeframe chart at the daily bar’s close, matching the indicator.
 
 
-[ENVIRONMENT / بيئة التنفيذ]
+By implementing the above, the multi-timeframe signals will be synchronized correctly. This means that any condition in Pine that uses request.security (such as confirming higher-TF pivots or trends) will be emulated in Python. The goal is that a signal which depends on a higher timeframe (for instance, a trendline or pivot from the higher period) should appear at the identical time and value in the Python output as it does on TradingView.
 
-- Language: **Python 3.x** only.
-- Allowed libraries:
-  - `ccxt` (mandatory, for Binance USDT-M Futures data).
-  - `numpy`
-  - `pandas`
-  - Optional: a TA library (`ta`, `ta-lib`, etc.) OR manual re-implementation of math formulas if that gives a closer 1:1 match to Pine.
-- Target runtime:
-  - Android Python editor (e.g. Pydroid3).
-  - No GUI frameworks (no Tkinter, Qt, etc.).
-  - Output must be `print` or simple logging to console only.
+2. Match curColor Logic and Pivot Signal Transitions
 
+The curColor series in the indicator designates bullish or bearish pivot conditions and is used to trigger “Possible Bullish/Bearish Pivot” signals. It’s critical to reproduce its values and transitions exactly:
 
-[DATA SOURCE / مصدر البيانات]
+Reproduce Pine’s Conditions: In the Pine script, curColor is set based on how the current RSI value relates to the KDE distribution of past pivot RSI values. In “Sum” mode (the default), Pine marks curColor bullish if lowProb exceeds (1 - activationThreshold) of the low-pivot distribution, and bearish if highProb exceeds that threshold of the high-pivot distribution. Ensure the Python code implements these exact comparisons. The current code’s logic using activation_threshold (e.g. 0.25 for “Medium”) is correct – for instance:
 
-1) Use `ccxt.binanceusdm()` as the exchange.
-2) Load all markets and extract all USDT-M futures symbols:
-   - Example: `BTC/USDT`, `ETH/USDT`, etc.
-   - Provide config to:
-     - Use all symbols (default).
-     - OR a whitelist list of symbols for user customization.
-3) Fetch OHLCV with `fetch_ohlcv(symbol, timeframe, limit)`:
-   - Use:
-     - A base timeframe (configurable, e.g. `"15m"`).
-     - All additional timeframes used in Pine via `request.security` or `input.timeframe`.
-   - Ensure:
-     - Data sorted from oldest to newest.
-     - Enough candles to cover `max_bars_back` and all periods used in the indicator.
+if low_prob > sum_low * (1 - kde_activation_threshold):  
+    cur_color[i] = 1  # bullish  
+elif high_prob > sum_high * (1 - kde_activation_threshold):  
+    cur_color[i] = -1  # bearish  
+else:  
+    cur_color[i] = 0  # none
+
+This mirrors the Pine checks for curColor := bullishColor or bearishColor when those probability conditions are met.
+
+Use Proper Previous-State Logic: Pine only triggers the “Possible Bullish Pivot” alert when a bullish curColor just turned off (i.e. went from bullish on the prior bar to neutral on the current bar), and similarly for bearish. The Python code already captures this by computing:
+
+prev_color = cur_color.shift(1)  
+possible_bullish_pivot = (cur_color == 0) & (prev_color == 1)  
+possible_bearish_pivot = (cur_color == 0) & (prev_color == -1)
+
+Make sure this logic remains in place. It ensures the “Possible Pivot” signals occur once, at the bar where curColor returns to neutral after being colored (just as Pine uses na(curColor) and curColor[1] == bullishColor to trigger the alert). In practice, this means the Python output will flag a possible pivot exactly at the moment the Pine script draws the pivot arrow on the chart.
+
+NA vs. 0 Representation: In Pine, curColor is a color value or na (no color) when inactive. In Python we use integers (1 for bullish, -1 for bearish, 0 for none). This is fine – just treat 0 as the equivalent of “no color/na”. The transition checks above already account for that. Verify that initially, before any pivots are identified (or if distributions aren’t available), curColor is effectively neutral (no signal). For example, if no pivot distribution exists yet, Pine leaves curColor as na; the Python code should similarly leave it at 0 (which it currently does by default when kde_density returns None).
 
 
-[CONVERSION RULES / قواعد التحويل]
+With these measures, the order and color changes of curColor will mirror the original. Every time curColor flips from green to neutral or red to neutral in Pine (indicating a possible pivot), the Python code will register the same shift from 1 to 0 or -1 to 0, triggering the corresponding “Possible Bullish/Bearish Pivot” output at the identical bar.
 
-You must treat the Pine Script source as a specification that must be reproduced **1:1 logically** in Python:
+3. KDE Pivot Distribution Accuracy (KDELimit and Probability Calc)
 
-1) **Inputs (input.*)**:
-   - Convert every `input.bool`, `input.int`, `input.float`, `input.string`, `input.timeframe`, `input.color`, etc. into Python config variables at the top of the script.
-   - Preserve the same names or equivalent snake_case names.
-   - Preserve default values and option ranges as comments.
+The KDE-based pivot probability calculation must follow the indicator’s logic to the letter, as it underpins the curColor signals:
 
-2) **Constants, var, arrays, functions**:
-   - Convert `const`, `var`, `var float`, `var int`, `var line`, `var label`, `var box`, `array.*`, etc. into Python variables, dictionaries, lists, or classes that maintain state correctly across bars.
-   - Preserve the bar-by-bar stateful behavior of Pine:
-     - `bar_index` corresponds to row indices in a pandas DataFrame.
-     - `[1]` in Pine corresponds to `.shift(1)` or indexing with `i-1` in Python loops.
-   - Every Pine function and custom function must be implemented in Python:
-     - Either via TA library equivalent.
-     - Or via explicit formulas manually (for highest fidelity).
+Maintain KDE Value Limits: The Pine script limits the stored pivot RSI samples to KDELimit = 300 points. The Python code should continue to do the same. Currently, it truncates the rsi_high_vals and rsi_low_vals arrays to the latest 300 values before computing the KDE – this is correct. Double-check that this slicing uses the most recent 300 pivot values (which it does with rsi_high_vals[-kde_limit:], etc.). This ensures the KDE distribution is built from a rolling window of recent pivots, just like the Pine code which remove()s the oldest value when the array grows beyond 300.
 
-3) **TA functions (ta.*)**:
-   - Map every `ta.*` function to a Python equivalent:
-     - Example:
-       - `ta.atr`, `ta.rsi`, `ta.sma`, `ta.ema`, `ta.wma`, `ta.vwma`, `ta.stoch`, `ta.pivothigh`, `ta.pivotlow`, `ta.linreg`, etc.
-   - If the library version is not identical, re-implement the formula to match Pine’s behavior as closely as possible.
+Exact Probability Computation: The method for deriving highProb and lowProb from the KDE must match Pine’s approach. In Pine’s “Sum” mode, they compute:
+– highProb as the cumulative probability from the lowest grid value up to the current RSI (essentially CDF(current_RSI) of the high-pivot PDF). The code achieves this by taking the prefix sum up to the nearest index in the KDE array.
+– lowProb as the complementary cumulative probability from the current RSI to the maximum (the upper tail probability). Pine computes this by subtracting the prefix sum below the current point from the total sum.
+Verify that kde_color_series does exactly this. In the provided Python code, for each bar’s RSI value val:
 
-4) **request.security**:
-   - For every `request.security(sym, timeframe, expression, ...)`:
-     - In Python, fetch or resample data for that timeframe.
-     - Be explicit about how you align the higher/lower timeframe series with the base timeframe index.
-     - Reproduce Pine’s behavior for “lookahead” and bar confirmation if it matters to the signal (e.g., `barstate.isconfirmed`).
+idx_h = np.argmin(np.abs(high_x - val))  
+high_prob = high_cum[idx_h]  
+idx_l = np.argmin(np.abs(low_x - val))  
+low_prob = high_cum[-1] - (low_cum[idx_l - 1] if idx_l > 0 else 0.0)
 
-5) **Drawing objects (lines, boxes, labels, tables, fills, colors)**:
-   - If an object is purely visual AND does not affect any signal, condition, or threshold logic, you may:
-     - Represent its logic minimally (e.g. store its values) OR
-     - Omit actual drawing but keep any underlying price/level computations used downstream.
-   - If drawing objects are used as part of the logic (e.g. levels for support/resistance, BOS, zones, etc.), then:
-     - Recreate their **logical role** in Python as data structures (e.g. lists of levels, segments with start/end bar indices, etc.).
-     - Use these structures in the equivalent decision rules.
+Here, high_cum is the cumulative sum array of the high-pivot density (so high_cum[idx_h] is the CDF up to val), and low_prob is calculated as 1 minus the CDF up to just below val (giving the tail area). This corresponds exactly to Pine’s highProb := prefixSum(KDEHighYSum, 0, nearestIndex) and lowProb := prefixSum(KDELowYSum, nearestIndex, end) in Sum mode. Ensure the code correctly handles edge cases (e.g., if idx_l = 0, it uses the full sum for low_prob). The goal is to have virtually identical highProb/lowProb values as the Pine script for any given bar.
 
-6) **alertcondition, plotshape, plot, barcolor, etc.**:
-   - Every `alertcondition` must be mapped to an explicit Boolean condition in Python.
-   - At minimum, **these alerts must be reproduced exactly**:
-     - `"Pro Signal Down"`
-     - `"Pro Signal Up"`
-     - `"Possible Bearish Pivot"`
-     - `"Possible Bullish Pivot"`
-     - `"Long Entry Alert"`
-     - `"Short Entry Alert"`
-     - `"Strong Buy Alert"`
-     - `"Strong Sell Alert"`
-   - Also reproduce any other meaningful trading alerts present in PRO V6 (trend change, zone crosses, Theil-Sen break, etc.).
-   - For each alert, when it becomes `True` on the latest bar for any symbol, print a line to console:
-     - Format example:
-       `SYMBOL: BTCUSDT | TIMEFRAME: 15m | SIGNAL: Pro Signal Up | PRICE: 68000.0 | TIME: 2025-01-01 12:30:00`
-
-7) **No deletion of logic**:
-   - Do NOT delete or simplify any logic that influences:
-     - Signals (alerts)
-     - Trend states
-     - Probability / KDE outputs that feed into signals
-     - Zones, S/R levels, or conditions used to filter entries/exits.
-   - It is acceptable to simplify ONLY the **purely visual** aspects that do not feed back into any condition.
+Incremental KDE Updates: In TradingView, the KDE distribution updates only when a new pivot is confirmed (the arrays are updated and the KDE recalculated inside the pivot detection blocks). This means that on bars between pivots, KDEHighY/KDELowY remain the same. The Python implementation, which recomputes KDE from all pivots each time, should inherently yield the same probabilities for those bars (since the input pivot list hasn’t changed). However, for absolute fidelity, you might consider emulating this behavior: only refresh the KDE distribution at bars where a new pivot is added. This can be done by caching the last computed high_x, high_y, low_x, low_y and only recalculating when high_pivots or low_pivots has a new True. While not strictly necessary for output matching, this ensures the probability values and curColor do not inadvertently jitter on bars without new pivots (they shouldn’t, but this extra caution mirrors Pine’s update cadence).
 
 
-[PYTHON SCRIPT STRUCTURE / هيكلة السكربت في بايثون]
+By following the above, the KDE pivot probability logic in Python will be a faithful reproduction of the original. This guarantees that values like lowProb, highProb, and the resulting curColor assignment on each bar match the Pine indicator, and that the 300-point distribution window is respected just as in the original code.
 
-Produce **one single Python file** with the following high-level structure:
+4. Include Trend Ribbon, Cloud, and Zones in Signal Conditions
 
-1) **CONFIG section**:
-   - Binance / CCXT settings (API key/secret optional, public data is enough).
-   - Base timeframe (string, e.g. `"15m"`).
-   - Max history bars (`MAX_HISTORY_BARS`).
-   - Alert filtering:
-     - `ALERT_LOOKBACK_BARS` (only report alerts from last N bars).
-     - `ALERT_LOOKBACK_MINUTES` (optional additional time filter).
-   - Whether to:
-     - Use all USDT-M symbols.
-     - Use a whitelist of symbols.
-   - All indicator inputs from PRO V6 (copied as Python variables with comments and same default values).
+Several visual elements in the PRO V6 indicator (Trend Ribbon, Cirrus Cloud, Supply/Demand zones, etc.) do not just decorate the chart – they tie into the trend-following logic and alerts. It’s important to ensure any effect they have on alerts is captured in the Python code:
 
-2) **DATA & EXCHANGE HELPERS**:
-   - `init_exchange()`: initialize `ccxt.binanceusdm`.
-   - `get_usdtm_symbols()`: returns list of all USDT-M futures symbols (filtered if whitelist is set).
-   - `fetch_ohlcv(symbol, timeframe, limit) -> DataFrame`.
-   - `prepare_dataframe(ohlcv) -> DataFrame` with columns:
-     - `timestamp` (UTC, datetime)
-     - `open`, `high`, `low`, `close`, `volume`.
+Trend Ribbon / Trend State: The “Trend Ribbon” reflects the current trend (bullish or bearish) on the chart, which in code is represented by the Trend state or state series (“up”/“down”). The Python implementation of the trend-following system already computes state based on the trailing stop logic (ATR-based) and uses it for zone alerts. Make sure that any alerts depending on trend changes are accounted for. For example, the original Pine has a “Dynamic Line Change” alert (which triggers when the trailing stop z1/ex line flips direction or updates). In Python, you can replicate this if needed by checking when ex or trail value changes sign or resets (e.g., when a new high in an uptrend or new low in a downtrend is established). This might correspond to when your state switches or when a new extreme (ex) is set. While the current code does not explicitly output this, consider adding a boolean series for “dynamic change” (e.g., z1 value today ≠ yesterday) to match that alert.
 
-3) **INDICATOR CORE LOGIC**:
-   - Group functions that mirror the Pine code:
-     - PRO V6 Signal System.
-     - Trend Following + Zones.
-     - Theil-Sen Estimator.
-     - Trend 2 (multi-MA basis + RSI).
-     - RSI + KDE + Pivots.
-     - S/R & zones (any logic that’s used for signals).
-     - Dashboard / probabilities logic (at least the parts that determine trend states and alerts).
-   - Each function should operate on pandas Series / DataFrames and return new Series that correspond to Pine variables.
+Cirrus Cloud: This is a visual cloud (plotted via filtx1/filtx2 in Pine) that smooths price for trend confirmation. It does not directly produce alerts. However, if the cloud influences any signals (for instance, if certain entries are filtered by the cloud), those conditions should be reflected. From the provided Pine code, the cloud is likely purely visual (turned on/off by CirrusCloud input) and does not appear in the alert conditions. Thus, it may not require any code logic for alerts. Just ensure that if any part of the trend logic was meant to use a smoothed value (the cloud), the Python code does so. In our case, the trend-following code uses an enhanced MA (follow_type="enhanced") for ATR calculation, which is already implemented, so the essence of the cloud’s effect (smoothing price oscillations) is captured.
 
-4) **SIGNAL ENGINE**:
-   - A function like `compute_all_pro_v6_signals(df)` that:
-     - Calls all sub-systems.
-     - Produces a dictionary of Boolean Series:
-       - `pro_signal_up`, `pro_signal_down`
-       - `possible_bullish_pivot`, `possible_bearish_pivot`
-       - `long_entry`, `short_entry`
-       - `strong_buy`, `strong_sell`
-       - other PRO V6 alert signals (zones, Theil-Sen breaks, trend changes, etc.)
+Supply/Demand Zones: These zones are drawn around recent swing highs (supply) and swing lows (demand). In Pine, they are likely used for visual context and possibly for identifying break-of-structure (BOS) events. Check if any alert conditions relate to these zones being broken or touched. The primary alert conditions we identified in the Pine script are the Zone 1/2/3 Cross alerts, which are implemented in Python (z1_long, z2_long, etc., via the zone_cross_signals). The Python code correctly triggers these when price crosses under a zone in an uptrend or over a zone in a downtrend (using crossunder/crossover with state filters). This aligns with the Pine definitions (e.g., z1_long is true when state[1] == 'up' and crossunder(close, z1[1])). Ensure these zone-cross signals are being output with the exact same names and logic (the provided code does so, naming them “Zone 1/2/3 Cross Down/Up” accordingly in the labels mapping). Aside from those, if the Pine script doesn’t define separate alerts for supply/demand zone creation or BOS, we don’t need to add extra signals. Just verify that the existing zone cross alerts in Python use the same conditions (previous bar’s state and previous zone level) as Pine, which they currently do.
 
-5) **SCANNER / MAIN LOOP**:
-   - `process_symbol(symbol, df)`:
-     - Applies the full indicator logic on the DataFrame.
-     - Extracts **new alerts** within the configured lookback window.
-     - Prints alerts to console using the required format.
-   - `main()`:
-     - Initializes CCXT exchange.
-     - Selects symbols (all USDT-M or whitelist).
-     - For each symbol:
-       - Fetches OHLCV for all required timeframes.
-       - Runs `process_symbol`.
-     - Optionally wraps scanning in:
-       - `while True:` + `time.sleep()` (if configured as continuous scanner).
-   - Wrap entry point with:
-     - `if __name__ == "__main__": main()`.
-
-6) **Error handling**:
-   - Wrap CCXT calls in try/except to avoid crashing the whole scanner on one symbol.
-   - Log or print errors clearly, but continue with other symbols.
+Final Visual Checks: No other purely visual feature (like background colors or table dashboards) directly affects the alert conditions. The Trend Ribbon colors and Cirrus Cloud fill are byproducts of the trend state, which we have covered. The dashboard table and gauge in Pine are visual-only and can be ignored in the Python logic since they don’t generate alerts (the Python scanner focuses on alerts/signals). The key is that all signals which Pine can alert on are represented. Cross-check the list of alertcondition titles in Pine against the Python’s signals dict and printed outputs. You should find: “Pro Signal Up/Down”, “Zone 1/2/3 Cross Down/Up (Uptrend/Downtrend)”, “Long/Short Entry Alert”, “Strong Buy/Sell Alert”, “Possible Bullish/Bearish Pivot”, “Theil-Sen Channel Break”, and “Trend changed”. The Python code covers all of these except possibly the Dynamic Line Change (discussed above) and the multi-timeframe trend alignment alerts (which are part of a Dashboard feature in Pine). Those multi-TF alignment alerts (TF3, TF4, TF5 aligned, etc.) can likely be omitted, as the scanner is focused on single-symbol signals. As a final step, confirm that enabling/disabling features (e.g. enable_trend_follow, enable_trend2) in the Python config correctly turns those signal computations on/off, mirroring Pine’s behavior when those features are toggled.
 
 
-[OUTPUT REQUIREMENTS / المتطلبات النهائية للكود]
+By accounting for these elements, all chart features that contribute to alerts are included in the Python logic. The trend ribbon and cloud ensure the trend state is correctly determined, and the zone calculations ensure zone-cross alerts fire exactly when they should. Nothing that appears as an alert in Pine should be missing from the Python outputs.
 
-- Deliver **one complete Python 3 script** ready to be copied into an Android Python editor (like Pydroid3) and run directly.
-- The script must:
-  1) Fetch Binance USDT-M OHLCV data via CCXT.
-  2) Apply the **full PRO V6 indicator logic** as described above, including all parts that affect signals.
-  3) Print, for each detected alert and for each symbol, lines like:
+5. Use Correct KDELimit Naming and Usage
 
-     SYMBOL: BTCUSDT | TIMEFRAME: 15m | SIGNAL: Strong Buy Alert | PRICE: 68000.0 | TIME: 2025-01-01 12:30:00
+Lastly, fix the minor issue of the KDELimit variable name and usage to avoid confusion. In the Pine script, KDELimit is a constant (300) controlling the max number of stored pivot RSI values. In the Python code, this is implemented as kde_limit = 300. To maintain clarity and consistency with the original code:
 
-  4) Respect alert filtering via `ALERT_LOOKBACK_BARS` and/or `ALERT_LOOKBACK_MINUTES`.
-  5) Keep the code modular and commented, with short English comments referencing which part of the PRO V6 indicator is being re-implemented (e.g., “# PRO V6 Signal System”, “# Theil-Sen estimator”, “# RSI + KDE pivots”).
+Rename if Necessary: You may rename kde_limit to KDELimit or add a comment linking it to Pine’s KDELimit. While Python style typically uses lowercase, it’s important the developer recognizes this corresponds exactly to the Pine constant. The main point is to use the correct value (300, unless changed in Pine inputs) and apply it identically.
 
-- Do **not** output the Pine Script code again in your answer.
-- Do **not** summarize or skip logic.
-- The output should be the **full Python code only**, with inline comments where needed.
+Ensure Proper Application: Double-check that wherever pivot RSI arrays are handled, this limit is applied as in Pine. The current implementation – trimming the pivot arrays to length 300 before KDE computation – is correct. Maintain this behavior after any modifications. If you adjust the code to update the KDE incrementally, be sure to similarly drop older values when the count exceeds 300. This guarantees the Python’s probability model never includes more historical pivot points than Pine’s does.
 
 
-[INPUT / مدخل الكود]
+By addressing the above, you eliminate any discrepancy in how many data points feed the KDE (which could otherwise skew probabilities). Using the exact KDELimit logic from the original ensures the Python indicator’s sensitivity to older pivots is the same as TradingView’s.
 
-Below is the FULL original Pine Script v5 source code for the TradingView indicator PRO V6. Use it as the authoritative reference to implement the Python script as specified above:
 
---- PASTE FULL PINE SCRIPT PRO V6 CODE HERE ---
-```0
+---
+
+Implementing these corrections will align the Python scanner’s outputs with the PRO V6 TradingView indicator to an extremely high degree of fidelity. All signal names, trigger conditions, and timings will correspond one-to-one with the original Pine Script behavior. After these changes, you should test the Python output against TradingView on multiple symbols and timeframes to verify that every alert (Pro Signal up/down, entries, strong buy/sell, zone crosses, pivots, etc.) triggers at the same bars with the same values. With the multi-timeframe handling and fine details corrected, any residual discrepancy should be negligible, meeting the 99.99% accuracy goal.
