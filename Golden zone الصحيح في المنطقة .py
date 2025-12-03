@@ -9088,7 +9088,7 @@ def scan_binance(
     recent_window_bars: Optional[int] = None,
     max_symbols: Optional[int] = None,
     symbol_selector: Optional[BinanceSymbolSelectorConfig] = None,
-) -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
+    ) -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
     if ccxt is None:
         raise RuntimeError("ccxt is not available")
     exchange = ccxt.binanceusdm({"enableRateLimit": True})
@@ -9099,6 +9099,18 @@ def scan_binance(
     )
     if max_symbols and max_symbols > 0:
         all_symbols = all_symbols[: int(max_symbols)]
+    try:
+        ticker_map = exchange.fetch_tickers(all_symbols)
+        if not isinstance(ticker_map, dict):
+            ticker_map = {}
+    except Exception as exc:
+        print(
+            f"تعذر جلب tickers مُجمّعة ({exc})، سيتم استخدام fetch_ticker لكل رمز.",
+            file=sys.stderr,
+            flush=True,
+        )
+        ticker_map = {}
+
     summaries: List[Dict[str, Any]] = []
     primary_runtime: Optional[SmartMoneyAlgoProE5] = None
     window = recent_window_bars
@@ -9112,16 +9124,22 @@ def scan_binance(
         else:
             window = 2
     window = max(1, int(window))
-    for idx, symbol in enumerate(all_symbols):
-        try:
-            ticker = exchange.fetch_ticker(symbol)
-        except Exception as exc:
-            print(
-                f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ticker: {exc}",
-                file=sys.stderr,
-                flush=True,
-            )
-            continue
+
+    max_workers = 1 if (tracer and tracer.enabled) else max(1, int(concurrency))
+
+    def _process_symbol(idx: int, symbol: str) -> Optional[Tuple[SmartMoneyAlgoProE5, Dict[str, Any]]]:
+        local_exchange = exchange if max_workers == 1 else ccxt.binanceusdm({"enableRateLimit": True})
+        ticker = ticker_map.get(symbol)
+        if ticker is None:
+            try:
+                ticker = local_exchange.fetch_ticker(symbol)
+            except Exception as exc:
+                print(
+                    f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ticker: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return None
         daily_change = _extract_daily_change_percent(ticker)
         if min_daily_change > 0.0 and daily_change is not None and daily_change <= min_daily_change:
             print(
@@ -9137,8 +9155,8 @@ def scan_binance(
                     change=daily_change,
                     threshold=min_daily_change,
                 )
-            continue
-        candles = fetch_ohlcv(exchange, symbol, timeframe, limit)
+            return None
+        candles = fetch_ohlcv(local_exchange, symbol, timeframe, limit)
         runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
         runtime.console_max_age_bars = max(runtime.console_max_age_bars, window)
         runtime.process(candles)
@@ -9162,7 +9180,7 @@ def scan_binance(
                     reference_times=recent_times,
                     window=window,
                 )
-            continue
+            return None
 
         metrics["daily_change_percent"] = daily_change
         summaries.append(
@@ -9185,8 +9203,20 @@ def scan_binance(
                 timeframe=timeframe,
                 candles=len(candles),
             )
-        if primary_runtime is None:
-            primary_runtime = runtime
+        return runtime, metrics
+
+    futures: List[Tuple[int, concurrent.futures.Future]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for idx, symbol in enumerate(all_symbols):
+            futures.append((idx, executor.submit(_process_symbol, idx, symbol)))
+        for idx, future in futures:
+            result = future.result()
+            if not result:
+                continue
+            runtime, _metrics = result
+            if primary_runtime is None:
+                primary_runtime = runtime
+
     if primary_runtime is None:
         primary_runtime = SmartMoneyAlgoProE5(inputs=inputs, tracer=tracer)
         primary_runtime.console_max_age_bars = max(primary_runtime.console_max_age_bars, window)
