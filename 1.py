@@ -1,108 +1,138 @@
 """
-PRO V6 Full Scanner (logic-oriented translation from Pine Script to Python)
+PRO V6 Full Scanner (logic-oriented translation from Pine Script to Python).
 
-This file rebuilds the trading logic of the PRO V6 indicator so it can operate as a
-console-based scanner on Binance USDT-M Futures using CCXT. Visual-only elements from
-Pine (tables, labels, drawings) are not reproduced, but every computation that feeds
-the core alerts is represented here.
+This rewrite mirrors the trading logic (not the drawing elements) of the
+original Pine script found in `PRO V6 .txt`. All alert-generating conditions are
+reproduced with recursive state where Pine uses historical referencing.
+
+Notes on unavoidable differences:
+- request.security / rp_security in Pine fetch higher timeframe candles. In this
+  console version everything is driven by a single dataframe per symbol. The HTF
+  behaviour is emulated by re-sampling when possible; when resampling is not
+  available the current timeframe data is used and this can slightly alter the
+  exact bar at which an alert would have fired on TradingView.
+- Visual constructs (boxes, labels, tables, fills) are represented only when
+  they feed alert logic. Supply/Demand boxes and Cirrus Cloud are omitted because
+  they do not gate the alertcondition blocks in the source file.
 """
 
+import math
+import random
 import time
 from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Tuple
 
 import ccxt
 import numpy as np
 import pandas as pd
 
 # =============================================================================
-# CONFIG (implements Pine inputs as Python variables as much as is practical)
+# CONFIG — mirrors Pine inputs
 # =============================================================================
-
-# --- General exchange / scanner config ---------------------------------------
-
-API_KEY = ""         # optional
-API_SECRET = ""      # optional
+API_KEY = ""
+API_SECRET = ""
 
 USE_ALL_SYMBOLS = True
-SYMBOLS_WHITELIST = []  # used if USE_ALL_SYMBOLS = False
-# Optional cap on how many symbols to scan. Set to None to scan every USDT-M pair.
-SCAN_SYMBOL_LIMIT = None
+SYMBOLS_WHITELIST: List[str] = []
+SCAN_SYMBOL_LIMIT: Optional[int] = None
 
-# Primary resolution used by the scanner; mirrors `res = input.timeframe('')`.
-# If left blank, BASE_TIMEFRAME is used.
-INPUT_TIMEFRAME = ""
-
-BASE_TIMEFRAME = "15m"        # equivalent to TradingView chart timeframe
-MAX_HISTORY_BARS = 5000       # mirrors max_bars_back from the Pine script
-ALERT_LOOKBACK_BARS = 3       # only print alerts that occurred within last N bars
-ALERT_LOOKBACK_MINUTES = 0    # 0 disables time-based filter
+INPUT_TIMEFRAME = ""  # mirrors `res = input.timeframe('')`
+BASE_TIMEFRAME = "15m"
+MAX_HISTORY_BARS = 5000
+ALERT_LOOKBACK_BARS = 3
+ALERT_LOOKBACK_MINUTES = 0
 
 RUN_CONTINUOUS = False
 LOOP_SLEEP_SECONDS = 60
-
 SLEEP_BETWEEN_SYMBOLS = 0.25
 
-# --- CHỈ BÁO 1: SIGNAL SYSTEM inputs -----------------------------------------
-
+# === Signal System (Chỉ báo 1) ===
 enable_signal_system = True
-sensitivity = 5.0               # "Sensitivity"
-volatility_period = 10          # "Volatility Period"
+sensitivity = 5.0
+volatility_period = 10
 
-# --- CHỈ BÁO 2: TREND FOLLOWING & ZONES inputs -------------------------------
-
+# === Trend Following + Zones (Chỉ báo 2) ===
 enable_trend_follow = True
-follow_type = "enhanced"        # 'enhanced' or 'standard'
-trend_period = 10               # ATR / trueRange period
-trend_multiplier = 5.0          # ATR multiplier
+follow_type = "enhanced"  # enhanced | standard
+trend_period = 28
+trend_multiplier = 5.0
 show_zones = True
 zone1_level = 61.8
 zone2_level = 78.6
 zone3_level = 88.6
 
-# --- CHỈ BÁO 4: TREND 2 inputs (ALMA basis + RSI) ----------------------------
-
-enable_trend2 = True
-trend2_basis_type = "ALMA"      # 'TEMA','HullMA','ALMA', etc.
-trend2_basis_length = 50
-trend2_offset_sigma = 5
-trend2_offset_alma = 2.0
-trend2_delay_offset = 0
-trend2_rsi_period = 28
-trend2_rsi_ob = 65.0
-trend2_rsi_os = 35.0
-trend2_rsi_ema_length = 10
-trend2_ema_period = 144
-
-# --- CHỈ BÁO 3: THEIL-SEN ESTIMATOR inputs -----------------------------------
-
+# === Theil-Sen Estimator (Chỉ báo 3) ===
 enable_theilsen = False
 ts_len = 100
-ts_src_field = "close"          # Pine: ts_src = input(..., defval=close)
-ts_method = "All"               # 'All' or 'Random'
+ts_src_field = "close"
+ts_method = "All"  # All | Random
 ts_numpairs = 500
-ts_mult = 2.0                   # prediction interval multiplier
+ts_showinterval = True
+ts_mult = 2.0
+ts_showresult = False
+ts_extendln = True
 
-# --- RSI + KDE + Pivots inputs ----------------------------------------------
+# === Trend 2 / SAIYAN OCC ===
+res5 = "15"
+useRes = True
+intRes = 10
+basisType = "ALMA"  # TEMA, HullMA, ALMA
+basisLen = 50
+offsetSigma = 5
+offsetALMA = 2.0
+delayOffset = 0
+tradeType = "BOTH"  # LONG | SHORT | BOTH | NONE
+rsi_period = 28
+rsi_overbought = 65
+rsi_oversold = 35
+ema_period = 144
+show_basic_signals = True
+show_strong_signals = True
+show_rsi_confluence = False
+h_heikin_ashi = False
 
-rsi_kde_length = 14
-high_pivot_len = 21
-low_pivot_len = 21
-kde_bandwidth = 2.71828
-kde_steps = 100
-kde_limit = 300
-kde_activation_threshold = 0.25  # 'Medium' setting in original
+# Swing / Supply-Demand inputs that may gate pivots (kept for completeness)
+swing_length = 10
+history_of_demand_to_keep = 20
+box_width = 2.5
 
-# --- Trend dashboard style EMA trend (very simplified) -----------------------
+# === RSI + KDE Pivots ===
+rsiLengthInput = 14
+rsiSourceInput = "close"
+highPivotLen = 21
+lowPivotLen = 21
+activationThresholdStr = "Medium"  # High | Medium | Low
+KDEKernel = "Gaussian"  # Uniform | Gaussian | Sigmoid
+KDEBandwidth = 2.71828
+KDEStep = 100
+KDELimit = 300
+activationThreshold = 0.25
+probMode = "Sum"
+minPadding = False
+labelCooldown = 8
+maxDistanceToLastBar = 5000
 
-trend_ema_length = 200  # long EMA for basic up/down/neutral trend
-
+# === EMA Trend Dashboard (simplified but keeps alert logic) ===
+trend_dashboard_length = 200
 
 # =============================================================================
-# HELPER: TA functions
+# Helper utilities mirroring Pine behaviour
 # =============================================================================
+
+def nz(val, replacement=0.0):
+    if isinstance(val, pd.Series):
+        return val.fillna(replacement)
+    return replacement if pd.isna(val) else val
+
+
+def rma(series: pd.Series, length: int) -> pd.Series:
+    """Wilder's RMA using the same recursive form Pine uses."""
+    alpha = 1.0 / length
+    return series.ewm(alpha=alpha, adjust=False, min_periods=length).mean()
+
 
 def ema(series: pd.Series, length: int) -> pd.Series:
-    return series.ewm(span=length, adjust=False).mean()
+    return series.ewm(span=length, adjust=False, min_periods=length).mean()
 
 
 def sma(series: pd.Series, length: int) -> pd.Series:
@@ -110,11 +140,8 @@ def sma(series: pd.Series, length: int) -> pd.Series:
 
 
 def wma(series: pd.Series, length: int) -> pd.Series:
-    weights = np.arange(1, length + 1)
-    return series.rolling(length).apply(
-        lambda x: float(np.dot(x, weights)) / weights.sum(),
-        raw=True
-    )
+    weights = np.arange(1, length + 1, dtype=float)
+    return series.rolling(length).apply(lambda x: float(np.dot(x, weights)) / weights.sum(), raw=True)
 
 
 def vwma(close: pd.Series, volume: pd.Series, length: int) -> pd.Series:
@@ -123,62 +150,23 @@ def vwma(close: pd.Series, volume: pd.Series, length: int) -> pd.Series:
     return num / den
 
 
-def rsi(series: pd.Series, length: int) -> pd.Series:
-    delta = series.diff()
-    gain = np.where(delta > 0, delta, 0.0)
-    loss = np.where(delta < 0, -delta, 0.0)
-    gain = pd.Series(gain, index=series.index)
-    loss = pd.Series(loss, index=series.index)
-    avg_gain = gain.ewm(alpha=1.0 / length, min_periods=length, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1.0 / length, min_periods=length, adjust=False).mean()
-    rs = avg_gain / avg_loss
-    rs = rs.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    return 100.0 - (100.0 / (1.0 + rs))
-
-
-def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
-    prev_close = close.shift(1)
-    tr1 = high - low
-    tr2 = (high - prev_close).abs()
-    tr3 = (low - prev_close).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr
-
-
-def atr(high: pd.Series, low: pd.Series, close: pd.Series, length: int) -> pd.Series:
-    tr = true_range(high, low, close)
-    return tr.ewm(alpha=1.0 / length, min_periods=length, adjust=False).mean()
-
-
-def alma(series: pd.Series, length: int, offset: float, sigma: float) -> pd.Series:
-    if length <= 1:
-        return series
-
-    m = offset * (length - 1)
-    s = length / sigma
-
-    def _alma_window(x: np.ndarray) -> float:
-        idx = np.arange(len(x))
-        w = np.exp(-((idx - m) ** 2) / (2.0 * s * s))
-        return float(np.sum(x * w) / np.sum(w))
-
-    return series.rolling(length).apply(_alma_window, raw=True)
+def smma(series: pd.Series, length: int) -> pd.Series:
+    # Pine's smma implementation is the same recursive RMA
+    return rma(series, length)
 
 
 def hull_ma(series: pd.Series, length: int) -> pd.Series:
     if length < 2:
         return series
-
     half = int(length / 2)
-    sqrt_len = int(np.sqrt(length))
+    sqrt_len = int(math.sqrt(length))
     wma_half = wma(series, half)
     wma_full = wma(series, length)
     hull = 2.0 * wma_half - wma_full
-    return wma(hull, sqrt_len)
+    return wma(hull, max(sqrt_len, 1))
 
 
-def linreg(series: pd.Series, length: int, offset: int = 0) -> pd.Series:
-    """Least-squares regression similar to ta.linreg."""
+def lsma(series: pd.Series, length: int, offset: int = 0) -> pd.Series:
     def _linreg(y: np.ndarray) -> float:
         x = np.arange(len(y))
         x_mean = x.mean()
@@ -190,689 +178,531 @@ def linreg(series: pd.Series, length: int, offset: int = 0) -> pd.Series:
     return series.rolling(length).apply(_linreg, raw=True)
 
 
-def crossover(series1: pd.Series, series2: pd.Series) -> pd.Series:
-    prev1 = series1.shift(1)
-    prev2 = series2.shift(1)
-    return (series1 > series2) & (prev1 <= prev2)
+def alma(series: pd.Series, length: int, offset: float, sigma: float) -> pd.Series:
+    if length <= 1:
+        return series
+    m = offset * (length - 1)
+    s = length / sigma
+
+    def _alma_window(x: np.ndarray) -> float:
+        idx = np.arange(len(x))
+        w = np.exp(-((idx - m) ** 2) / (2.0 * s * s))
+        return float(np.sum(x * w) / np.sum(w))
+
+    return series.rolling(length).apply(_alma_window, raw=True)
 
 
-def crossunder(series1: pd.Series, series2: pd.Series) -> pd.Series:
-    prev1 = series1.shift(1)
-    prev2 = series2.shift(1)
-    return (series1 < series2) & (prev1 >= prev2)
+def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    prev_close = close.shift(1)
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
 
-# =============================================================================
-# VARIANT MA (used by Trend 2 basis)
-# =============================================================================
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, length: int) -> pd.Series:
+    return rma(true_range(high, low, close), length)
 
-def variant_ma(ma_type: str,
-               src: pd.Series,
-               length: int,
-               off_sig: int,
-               off_alma: float,
-               volume: pd.Series) -> pd.Series:
-    ma_type = ma_type.upper()
 
-    v2 = ema(src, length)  # EMA
-    v3 = 2.0 * v2 - ema(v2, length)  # DEMA
-    v4 = 3.0 * (v2 - ema(v2, length)) + ema(ema(v2, length), length)  # TEMA
-    v5 = wma(src, length)  # WMA
-    v6 = vwma(src, volume, length)  # VWMA
+def crossover(a: pd.Series, b: pd.Series) -> pd.Series:
+    return (a > b) & (a.shift(1) <= b.shift(1))
 
-    # SMMA
-    v7 = pd.Series(index=src.index, dtype="float64")
-    sma_1 = sma(src, length)
-    v7.iloc[0] = sma_1.iloc[0]
-    alpha = 1.0 / length
-    for i in range(1, len(src)):
-        prev = v7.iloc[i - 1]
-        v7.iloc[i] = prev + alpha * (src.iloc[i] - prev)
 
-    v8 = hull_ma(src, length)  # Hull MA
-    v9 = linreg(src, length, off_sig)  # LSMA
-    v10 = alma(src, length, off_alma, off_sig)  # ALMA
-    v11 = sma(sma(src, length), length)  # TMA
+def crossunder(a: pd.Series, b: pd.Series) -> pd.Series:
+    return (a < b) & (a.shift(1) >= b.shift(1))
 
-    # SuperSmoother (SSMA)
-    a1 = np.exp(-1.414 * np.pi / length)
-    b1 = 2.0 * a1 * np.cos(1.414 * np.pi / length)
-    c2 = b1
-    c3 = -a1 * a1
-    c1 = 1.0 - c2 - c3
-    v12 = pd.Series(index=src.index, dtype="float64")
-    if len(src) >= 2:
-        v12.iloc[0] = src.iloc[0]
-        v12.iloc[1] = src.iloc[1]
-        for i in range(2, len(src)):
-            v12.iloc[i] = (
-                c1 * (src.iloc[i] + src.iloc[i - 1]) / 2.0
-                + c2 * v12.iloc[i - 1]
-                + c3 * v12.iloc[i - 2]
-            )
-    else:
-        v12[:] = src
 
+def variant_ma(ma_type: str, series: pd.Series, length: int, off_sig: float, off_alma: float,
+               volume: Optional[pd.Series] = None) -> pd.Series:
+    ma_type = (ma_type or "").strip()
     if ma_type == "EMA":
-        return v2
+        return ema(series, length)
     if ma_type == "DEMA":
-        return v3
+        v2 = ema(series, length)
+        return 2 * v2 - ema(v2, length)
     if ma_type == "TEMA":
-        return v4
+        v2 = ema(series, length)
+        return 3 * (v2 - ema(v2, length)) + ema(ema(v2, length), length)
     if ma_type == "WMA":
-        return v5
+        return wma(series, length)
     if ma_type == "VWMA":
-        return v6
+        return vwma(series, volume if volume is not None else pd.Series(np.ones(len(series))), length)
     if ma_type == "SMMA":
-        return v7
-    if ma_type == "HULLMA":
-        return v8
+        return smma(series, length)
+    if ma_type == "HullMA":
+        return hull_ma(series, length)
     if ma_type == "LSMA":
-        return v9
+        return lsma(series, length, int(off_sig))
     if ma_type == "ALMA":
-        return v10
+        return alma(series, length, off_alma, off_sig if off_sig != 0 else 1)
     if ma_type == "TMA":
-        return v11
+        return sma(sma(series, length), length)
     if ma_type == "SSMA":
-        return v12
-    # default SMA
-    return sma(src, length)
+        # Super smoother filter
+        a1 = math.exp(-1.414 * math.pi / length)
+        b1 = 2 * a1 * math.cos(1.414 * math.pi / length)
+        c2 = b1
+        c3 = -a1 * a1
+        c1 = 1 - c2 - c3
+        out = pd.Series(index=series.index, dtype=float)
+        for i, val in enumerate(series):
+            if i == 0:
+                out.iloc[i] = val
+            elif i == 1:
+                out.iloc[i] = (val + series.iloc[i - 1]) / 2
+            else:
+                out.iloc[i] = c1 * (val + series.iloc[i - 1]) / 2 + c2 * out.iloc[i - 1] + c3 * out.iloc[i - 2]
+        return out
+    return sma(series, length)
 
 
 # =============================================================================
-# PIVOTS + KDE (RSI pivot probability logic)
+# Core computations
 # =============================================================================
 
-def find_pivots(high: pd.Series,
-                low: pd.Series,
-                left: int,
-                right: int):
-    n = len(high)
-    high_pivots = pd.Series(False, index=high.index)
-    low_pivots = pd.Series(False, index=low.index)
+def compute_signal_system(df: pd.DataFrame) -> Dict[str, pd.Series]:
+    src = df["close"]
+    xatr = atr(df["high"], df["low"], df["close"], volatility_period)
+    nloss = sensitivity * xatr
 
-    for i in range(left, n - right):
-        win_high = high.iloc[i - left : i + right + 1]
-        if high.iloc[i] == win_high.max():
-            high_pivots.iloc[i] = True
-        win_low = low.iloc[i - left : i + right + 1]
-        if low.iloc[i] == win_low.min():
-            low_pivots.iloc[i] = True
+    x_signal_line = pd.Series(index=df.index, dtype=float)
+    pos = pd.Series(index=df.index, dtype=float)
+    for i in range(len(df)):
+        src_i = src.iloc[i]
+        prev_sig = x_signal_line.iloc[i - 1] if i > 0 else np.nan
+        prev_src = src.iloc[i - 1] if i > 0 else np.nan
 
-    return high_pivots, low_pivots
-
-
-def kde_density(x_values: np.ndarray,
-                kernel: str,
-                bandwidth: float,
-                steps: int):
-    if len(x_values) == 0:
-        return None, None, None
-
-    x_min = float(x_values.min())
-    x_max = float(x_values.max())
-    padding = (x_max - x_min) * 0.5 if x_max > x_min else 1.0
-    x_min -= padding
-    x_max += padding
-
-    grid_x = np.linspace(x_min, x_max, steps * 2)
-
-    def gaussian(distance, bw):
-        return (1.0 / np.sqrt(2.0 * np.pi)) * np.exp(-0.5 * (distance / bw) ** 2)
-
-    def uniform(distance, bw):
-        return np.where(np.abs(distance) > bw, 0.0, 0.5)
-
-    def sigmoid(distance, bw):
-        return 2.0 / np.pi * (1.0 / (np.exp(distance / bw) + np.exp(-distance / bw)))
-
-    density_y = np.zeros_like(grid_x)
-    for val in x_values:
-        dist = grid_x - val
-        if kernel == "Gaussian":
-            density_y += gaussian(dist, 1.0 / bandwidth)
-        elif kernel == "Uniform":
-            density_y += uniform(dist, 1.0 / bandwidth)
-        elif kernel == "Sigmoid":
-            density_y += sigmoid(dist, 1.0 / bandwidth)
-        else:
-            density_y += gaussian(dist, 1.0 / bandwidth)
-
-    density_y /= float(len(x_values))
-    cum_y = np.cumsum(density_y)
-    return grid_x, density_y, cum_y
-
-
-def kde_color_series(rsi_series: pd.Series,
-                     rsi_high_pivots: np.ndarray,
-                     rsi_low_pivots: np.ndarray,
-                     kernel: str = "Gaussian",
-                     bandwidth: float = kde_bandwidth,
-                     steps: int = kde_steps,
-                     activation_threshold: float = kde_activation_threshold):
-    """
-    Build curColor series:
-    1 (bullish), -1 (bearish), 0 (none).
-    """
-    n = len(rsi_series)
-    cur_color = pd.Series(0, index=rsi_series.index, dtype="int32")
-
-    high_x, high_y, high_cum = kde_density(rsi_high_pivots, kernel, bandwidth, steps)
-    low_x, low_y, low_cum = kde_density(rsi_low_pivots, kernel, bandwidth, steps)
-    if high_x is None or low_x is None:
-        return cur_color
-
-    sum_low = float(low_y.sum())
-    sum_high = float(high_y.sum())
-
-    for i in range(n):
-        val = float(rsi_series.iloc[i])
-        idx_h = int(np.argmin(np.abs(high_x - val)))
-        high_prob = float(high_cum[idx_h])
-        idx_l = int(np.argmin(np.abs(low_x - val)))
-        low_prob = float(low_cum[-1] - (low_cum[idx_l - 1] if idx_l > 0 else 0.0))
-
-        if low_prob > sum_low * (1.0 - activation_threshold):
-            cur_color.iloc[i] = 1
-        elif high_prob > sum_high * (1.0 - activation_threshold):
-            cur_color.iloc[i] = -1
-        else:
-            cur_color.iloc[i] = 0
-
-    return cur_color
-
-
-# =============================================================================
-# THEIL-SEN ESTIMATOR (core calculation + channel break)
-# =============================================================================
-
-def all_slopes_ts(n: int, y: np.ndarray) -> np.ndarray:
-    """All slopes between all pairs of n points (Theil–Sen)."""
-    if n <= 2:
-        return np.array([], dtype="float64")
-    slopes = []
-    for i in range(n - 1):
-        for j in range(i + 1, n):
-            slopes.append((y[i] - y[j]) / float(j - i))
-    return np.array(slopes, dtype="float64")
-
-
-def rnd_slopes_ts(slopes: np.ndarray, numpoints: int, seed_base: float) -> np.ndarray:
-    """Random subset of slopes using pseudo-random generator similar in spirit."""
-    slopes = slopes.copy()
-    ntmp = len(slopes)
-    n = min(ntmp, numpoints)
-    if n <= 2 or ntmp == 0:
-        return slopes
-
-    s1 = int(seed_base) % 30269
-    s2 = (int(seed_base * 1.3) + 1) % 30307
-    s3 = (int(seed_base * 1.7) + 2) % 30323
-
-    out = []
-    for _ in range(n):
-        s1 = 171 * (s1 % 30269)
-        s2 = 172 * (s2 % 30307)
-        s3 = 170 * (s3 % 30323)
-        rnd = (float(s1) / 30269.0 + float(s2) / 30307.0 + float(s3) / 30323.0) % 1.0
-        idx = int(rnd * ntmp)
-        out.append(slopes[idx])
-        slopes = np.delete(slopes, idx)
-        ntmp -= 1
-        if ntmp == 0:
-            break
-
-    return np.array(out, dtype="float64")
-
-
-def intercepts_ts(src: np.ndarray, n: int, mslope: float) -> np.ndarray:
-    if n <= 2:
-        return np.array([], dtype="float64")
-    intercepts = []
-    # replicate: array.push(_I, _src[_n - 1 - i] - _mslope * i)
-    for i in range(n):
-        intercepts.append(src[n - 1 - i] - mslope * i)
-    return np.array(intercepts, dtype="float64")
-
-
-def theil_sen_channel(src: pd.Series,
-                      length: int,
-                      method: str,
-                      numpairs: int,
-                      mult: float):
-    """
-    Compute Theil-Sen slope, intercept, dev channel and 'isbroken' series.
-    """
-    n_total = len(src)
-    isbroken = pd.Series(False, index=src.index)
-
-    if not enable_theilsen:
-        return {
-            "mslope": np.nan,
-            "minter": np.nan,
-            "dev": np.nan,
-            "isbroken": isbroken,
-        }
-
-    if n_total < length:
-        return {
-            "mslope": np.nan,
-            "minter": np.nan,
-            "dev": np.nan,
-            "isbroken": isbroken,
-        }
-
-    # For performance we only compute channel for the last `length` bars
-    win = src.iloc[-length:].values.astype("float64")
-    n = len(win)
-
-    S = all_slopes_ts(n, win)
-    if method == "Random":
-        S = rnd_slopes_ts(S, numpairs, float(win[-1]))
-    if len(S) == 0:
-        return {
-            "mslope": np.nan,
-            "minter": np.nan,
-            "dev": np.nan,
-            "isbroken": isbroken,
-        }
-
-    mslope = float(np.median(S))
-    I = intercepts_ts(win, n, mslope)
-    if len(I) == 0:
-        return {
-            "mslope": mslope,
-            "minter": np.nan,
-            "dev": np.nan,
-            "isbroken": isbroken,
-        }
-    minter = float(np.median(I))
-
-    # RMSD over window
-    rmse = 0.0
-    for j in range(n):
-        # Pine: ts_src[j] - (minter + mslope * (ts_current_len - j))
-        rmse += (win[j] - (minter + mslope * (n - j))) ** 2 / n
-    dev = mult * (rmse ** 0.5)
-
-    # Last bar index
-    last_price = float(src.iloc[-1])
-    ts_y2 = minter + mslope * (n - 1)
-
-    broken_last = (last_price > ts_y2 + dev) or (last_price < ts_y2 - dev)
-    isbroken.iloc[-1] = broken_last
-    # NOTE: Pine uses isbroken and not isbroken[1]; هنا نحسب الكسر على آخر شمعة فقط
-
-    return {
-        "mslope": mslope,
-        "minter": minter,
-        "dev": dev,
-        "isbroken": isbroken,
-    }
-
-
-# =============================================================================
-# CORE INDICATOR LOGIC (all main systems)
-# =============================================================================
-
-def compute_signal_system(df: pd.DataFrame):
-    """
-    PRO V6 'Signal System' re-implementation.
-
-    Returns:
-        pro_signal_up, pro_signal_down : Series(bool)
-    """
-    if not enable_signal_system:
-        n = len(df)
-        return pd.Series([False] * n, index=df.index), pd.Series([False] * n, index=df.index)
-
-    c = df["close"]
-    h = df["high"]
-    l = df["low"]
-
-    x_atr = atr(h, l, c, volatility_period)
-    n_loss = sensitivity * x_atr
-
-    x_signal_line = pd.Series(index=c.index, dtype="float64")
-    x_signal_line.iloc[0] = c.iloc[0]
-
-    for i in range(1, len(df)):
-        src = c.iloc[i]
-        src_prev = c.iloc[i - 1]
-        prev_line = x_signal_line.iloc[i - 1]
-        loss = n_loss.iloc[i]
-
-        iff_1 = src - loss if src > prev_line else src + loss
-        if src < prev_line and src_prev < prev_line:
-            iff_2 = min(prev_line, src + loss)
+        iff_1 = src_i - nloss.iloc[i] if src_i > nz(prev_sig, 0) else src_i + nloss.iloc[i]
+        iff_2 = math.inf
+        if i > 0 and src_i < nz(prev_sig, 0) and prev_src < nz(prev_sig, 0):
+            iff_2 = min(nz(prev_sig, 0), src_i + nloss.iloc[i])
         else:
             iff_2 = iff_1
 
-        if src > prev_line and src_prev > prev_line:
-            x_signal_line.iloc[i] = max(prev_line, src - loss)
+        if i > 0 and src_i > nz(prev_sig, 0) and prev_src > nz(prev_sig, 0):
+            x_signal_line.iloc[i] = max(nz(prev_sig, 0), src_i - nloss.iloc[i])
         else:
             x_signal_line.iloc[i] = iff_2
 
-    pro_signal_up = crossover(c, x_signal_line)
-    pro_signal_down = crossunder(c, x_signal_line)
-    return pro_signal_up.fillna(False), pro_signal_down.fillna(False)
-
-
-def compute_trend_following_zones(df: pd.DataFrame):
-    """
-    PRO V6 'Trend Following + Zones' (CHỈ BÁO 2).
-
-    Returns:
-        trail: Series(float)
-        ex: Series(float)           - key points
-        state: Series(str)          - 'up'/'down'
-        z1, z2, z3: Series(float)   - zone levels
-        zone_cross_signals: dict of Series(bool)
-    """
-    h = df["high"]
-    l = df["low"]
-    c = df["close"]
-
-    # Normalized price == using current timeframe (we don't change timeframe here)
-    norm_h = h
-    norm_l = l
-    norm_c = c
-
-    # Enhanced MA for trueRange
-    def enhanced_ma(src: pd.Series, length: int) -> pd.Series:
-        enhanced = pd.Series(index=src.index, dtype="float64")
-        for i in range(len(src)):
-            if i == 0:
-                enhanced.iloc[0] = src.iloc[0]
-            else:
-                prev = enhanced.iloc[i - 1]
-                enhanced.iloc[i] = prev + (src.iloc[i] - prev) / length
-        return enhanced
-
-    HiLo = np.minimum(norm_h - norm_l,
-                      1.5 * (norm_h - norm_l).rolling(trend_period).mean())
-    HRef = np.where(
-        norm_l <= norm_h.shift(1),
-        norm_h - norm_c.shift(1),
-        norm_h - norm_c.shift(1) - 0.5 * (norm_l - norm_h.shift(1)),
-    )
-    LRef = np.where(
-        norm_h >= norm_l.shift(1),
-        norm_c.shift(1) - norm_l,
-        norm_c.shift(1) - norm_l - 0.5 * (norm_l.shift(1) - norm_h),
-    )
-
-    HRef = pd.Series(HRef, index=df.index)
-    LRef = pd.Series(LRef, index=df.index)
-
-    if follow_type == "enhanced":
-        true_range_tf = np.maximum.reduce([HiLo, HRef, LRef])
-        true_range_tf = pd.Series(true_range_tf, index=df.index)
-    else:
-        true_range_tf = pd.Series(
-            np.maximum.reduce(
-                [
-                    norm_h - norm_l,
-                    (norm_h - norm_c.shift(1)).abs(),
-                    (norm_l - norm_c.shift(1)).abs(),
-                ]
-            ),
-            index=df.index,
-        )
-
-    loss = trend_multiplier * enhanced_ma(true_range_tf, trend_period)
-
-    Up = norm_c - loss
-    Dn = norm_c + loss
-
-    TrendUp = Up.copy()
-    TrendDown = Dn.copy()
-    Trend = pd.Series(1, index=df.index, dtype="int32")
-
-    for i in range(1, len(df)):
-        if norm_c.iloc[i - 1] > TrendUp.iloc[i - 1]:
-            TrendUp.iloc[i] = max(Up.iloc[i], TrendUp.iloc[i - 1])
+        if i == 0:
+            pos.iloc[i] = 0
         else:
-            TrendUp.iloc[i] = Up.iloc[i]
+            iff_3 = -1 if prev_src > nz(prev_sig, 0) and src_i < nz(prev_sig, 0) else pos.iloc[i - 1]
+            pos.iloc[i] = 1 if prev_src < nz(prev_sig, 0) and src_i > nz(prev_sig, 0) else iff_3
 
-        if norm_c.iloc[i - 1] < TrendDown.iloc[i - 1]:
-            TrendDown.iloc[i] = min(Dn.iloc[i], TrendDown.iloc[i - 1])
-        else:
-            TrendDown.iloc[i] = Dn.iloc[i]
+    long_signal = enable_signal_system and crossover(src, x_signal_line)
+    short_signal = enable_signal_system and crossunder(src, x_signal_line)
+    barcolor_signal = src > x_signal_line
 
-        if norm_c.iloc[i] > TrendDown.iloc[i - 1]:
-            Trend.iloc[i] = 1
-        elif norm_c.iloc[i] < TrendUp.iloc[i - 1]:
-            Trend.iloc[i] = -1
-        else:
-            Trend.iloc[i] = Trend.iloc[i - 1]
+    return {
+        "x_signal_line": x_signal_line,
+        "pos": pos,
+        "long_signal": pd.Series(long_signal, index=df.index),
+        "short_signal": pd.Series(short_signal, index=df.index),
+        "barcolor_signal": pd.Series(barcolor_signal, index=df.index),
+    }
 
-    trail = pd.Series(index=df.index, dtype="float64")
+
+def enhanced_ma(series: pd.Series, length: int) -> pd.Series:
+    out = pd.Series(index=series.index, dtype=float)
+    for i, val in enumerate(series):
+        prev = out.iloc[i - 1] if i > 0 else 0.0
+        out.iloc[i] = prev + (val - prev) / length
+    return out
+
+
+def compute_trend_follow(df: pd.DataFrame) -> Dict[str, pd.Series]:
+    norm_o = df["open"]
+    norm_h = df["high"]
+    norm_l = df["low"]
+    norm_c = df["close"]
+
+    hilo = (norm_h - norm_l).combine(1.5 * sma(norm_h - norm_l, trend_period), min)
+    href = np.where(norm_l <= norm_h.shift(1), norm_h - norm_c.shift(1), norm_h - norm_c.shift(1) - 0.5 * (norm_l - norm_h.shift(1)))
+    lref = np.where(norm_h >= norm_l.shift(1), norm_c.shift(1) - norm_l,
+                    norm_c.shift(1) - norm_l - 0.5 * (norm_l.shift(1) - norm_h))
+    true_range_series = pd.Series(np.maximum.reduce([hilo, href, lref]) if follow_type == "enhanced"
+                                  else np.maximum.reduce([(norm_h - norm_l), (norm_h - norm_c.shift(1)).abs(), (norm_l - norm_c.shift(1)).abs()]),
+                                  index=df.index)
+
+    loss = trend_multiplier * enhanced_ma(true_range_series, trend_period)
+    up = norm_c - loss
+    dn = norm_c + loss
+
+    trend_up = pd.Series(index=df.index, dtype=float)
+    trend_down = pd.Series(index=df.index, dtype=float)
+    trend = pd.Series(index=df.index, dtype=float)
+    trail = pd.Series(index=df.index, dtype=float)
+    ex = pd.Series(index=df.index, dtype=float)
+
     for i in range(len(df)):
-        trail.iloc[i] = TrendUp.iloc[i] if Trend.iloc[i] == 1 else TrendDown.iloc[i]
-
-    ex = pd.Series(0.0, index=df.index, dtype="float64")
-    for i in range(1, len(df)):
-        if Trend.iloc[i] > 0 and Trend.iloc[i - 1] <= 0:
+        if i == 0:
+            trend_up.iloc[i] = up.iloc[i]
+            trend_down.iloc[i] = dn.iloc[i]
+            trend.iloc[i] = 1
+            trail.iloc[i] = trend_up.iloc[i]
             ex.iloc[i] = norm_h.iloc[i]
-        elif Trend.iloc[i] < 0 and Trend.iloc[i - 1] >= 0:
+            continue
+
+        prev_trend_up = trend_up.iloc[i - 1]
+        prev_trend_down = trend_down.iloc[i - 1]
+        trend_up.iloc[i] = max(up.iloc[i], prev_trend_up) if norm_c.iloc[i - 1] > prev_trend_up else up.iloc[i]
+        trend_down.iloc[i] = min(dn.iloc[i], prev_trend_down) if norm_c.iloc[i - 1] < prev_trend_down else dn.iloc[i]
+        trend.iloc[i] = 1 if norm_c.iloc[i] > prev_trend_down else -1 if norm_c.iloc[i] < prev_trend_up else trend.iloc[i - 1]
+        trail.iloc[i] = trend_up.iloc[i] if trend.iloc[i] == 1 else trend_down.iloc[i]
+        if crossover(pd.Series([trend.iloc[i - 1], trend.iloc[i]], index=[df.index[i - 1], df.index[i]]),
+                      pd.Series([0, 0], index=[df.index[i - 1], df.index[i]])).iloc[-1]:
+            ex.iloc[i] = norm_h.iloc[i]
+        elif crossunder(pd.Series([trend.iloc[i - 1], trend.iloc[i]], index=[df.index[i - 1], df.index[i]]),
+                        pd.Series([0, 0], index=[df.index[i - 1], df.index[i]])).iloc[-1]:
             ex.iloc[i] = norm_l.iloc[i]
         else:
-            if Trend.iloc[i] == 1:
-                ex.iloc[i] = max(ex.iloc[i - 1], norm_h.iloc[i])
-            elif Trend.iloc[i] == -1:
-                ex.iloc[i] = min(ex.iloc[i - 1], norm_l.iloc[i])
-            else:
-                ex.iloc[i] = ex.iloc[i - 1]
+            ex.iloc[i] = max(ex.iloc[i - 1], norm_h.iloc[i]) if trend.iloc[i] == 1 else min(ex.iloc[i - 1], norm_l.iloc[i])
 
-    state = pd.Series(np.where(Trend > 0, "up", "down"), index=df.index)
+    state = pd.Series(np.where(trend == 1, "up", "down"), index=df.index)
 
     z1 = ex + (trail - ex) * zone1_level / 100.0
     z2 = ex + (trail - ex) * zone2_level / 100.0
     z3 = ex + (trail - ex) * zone3_level / 100.0
+    l100 = trail
 
-    norm_c_series = norm_c
+    z1_long = enable_trend_follow and (state.shift(1) == "up") & crossunder(norm_c, z1.shift(1))
+    z2_long = enable_trend_follow and (state.shift(1) == "up") & crossunder(norm_c, z2.shift(1))
+    z3_long = enable_trend_follow and (state.shift(1) == "up") & crossunder(norm_c, z3.shift(1))
+    z1_short = enable_trend_follow and (state.shift(1) == "down") & crossover(norm_c, z1.shift(1))
+    z2_short = enable_trend_follow and (state.shift(1) == "down") & crossover(norm_c, z2.shift(1))
+    z3_short = enable_trend_follow and (state.shift(1) == "down") & crossover(norm_c, z3.shift(1))
 
-    z1_long = enable_trend_follow & (state.shift(1) == "up") & crossunder(norm_c_series, z1.shift(1))
-    z2_long = enable_trend_follow & (state.shift(1) == "up") & crossunder(norm_c_series, z2.shift(1))
-    z3_long = enable_trend_follow & (state.shift(1) == "up") & crossunder(norm_c_series, z3.shift(1))
-
-    z1_short = enable_trend_follow & (state.shift(1) == "down") & crossover(norm_c_series, z1.shift(1))
-    z2_short = enable_trend_follow & (state.shift(1) == "down") & crossover(norm_c_series, z2.shift(1))
-    z3_short = enable_trend_follow & (state.shift(1) == "down") & crossover(norm_c_series, z3.shift(1))
-
-    zone_cross_signals = {
-        "z1_long": z1_long.fillna(False),
-        "z2_long": z2_long.fillna(False),
-        "z3_long": z3_long.fillna(False),
-        "z1_short": z1_short.fillna(False),
-        "z2_short": z2_short.fillna(False),
-        "z3_short": z3_short.fillna(False),
+    return {
+        "trend": trend,
+        "trail": trail,
+        "ex": ex,
+        "z1": z1,
+        "z2": z2,
+        "z3": z3,
+        "l100": l100,
+        "state": state,
+        "z1_long": pd.Series(z1_long, index=df.index),
+        "z2_long": pd.Series(z2_long, index=df.index),
+        "z3_long": pd.Series(z3_long, index=df.index),
+        "z1_short": pd.Series(z1_short, index=df.index),
+        "z2_short": pd.Series(z2_short, index=df.index),
+        "z3_short": pd.Series(z3_short, index=df.index),
     }
 
-    return trail, ex, state, z1, z2, z3, zone_cross_signals
+
+# --- Theil-Sen ---
+
+def all_slopes(n: int, y: pd.Series) -> List[float]:
+    slopes: List[float] = []
+    if n > 2:
+        for i in range(n - 1):
+            for j in range(i + 1, n):
+                slopes.append((y.iloc[i] - y.iloc[j]) / (j - i))
+    return slopes
 
 
-def compute_trend2_signals(df: pd.DataFrame):
-    """
-    PRO V6 'Trend 2' logic (ALMA/TEMA/Hull basis, RSI filter).
-
-    Returns:
-        long_entry, short_entry, strong_buy, strong_sell : Series(bool)
-    """
-    if not enable_trend2:
-        n = len(df)
-        false_series = pd.Series([False] * n, index=df.index)
-        return false_series, false_series, false_series, false_series
-
-    c = df["close"]
-    o = df["open"]
-    v = df["volume"]
-
-    close_shifted = c.shift(trend2_delay_offset).fillna(method="bfill")
-    open_shifted = o.shift(trend2_delay_offset).fillna(method="bfill")
-
-    close_series = variant_ma(
-        trend2_basis_type,
-        close_shifted,
-        trend2_basis_length,
-        trend2_offset_sigma,
-        trend2_offset_alma,
-        v,
-    )
-    open_series = variant_ma(
-        trend2_basis_type,
-        open_shifted,
-        trend2_basis_length,
-        trend2_offset_sigma,
-        trend2_offset_alma,
-        v,
-    )
-
-    close_series_alt = close_series
-    open_series_alt = open_series
-
-    le_trigger = crossover(close_series_alt, open_series_alt)
-    se_trigger = crossunder(close_series_alt, open_series_alt)
-
-    rsi_val = rsi(c, trend2_rsi_period)
-    rsi_ema = ema(rsi_val, trend2_rsi_ema_length)
-    ema_price = ema(c, trend2_ema_period)
-
-    rsi_ob = (rsi_val > trend2_rsi_ob) & (rsi_val > rsi_ema)
-    rsi_os = (rsi_val < trend2_rsi_os) & (rsi_val < rsi_ema)
-
-    price_above_ema = c > ema_price
-    price_below_ema = c < ema_price
-
-    rsi_bullish = rsi_os | ((rsi_val < 50.0) & price_above_ema)
-    rsi_bearish = rsi_ob | ((rsi_val > 50.0) & price_below_ema)
-
-    strong_buy = le_trigger & rsi_bullish
-    strong_sell = se_trigger & rsi_bearish
-
-    long_entry = le_trigger
-    short_entry = se_trigger
-
-    return (
-        long_entry.fillna(False),
-        short_entry.fillna(False),
-        strong_buy.fillna(False),
-        strong_sell.fillna(False),
-    )
+def rnd_slopes(slopes: List[float], numpoints: int, seeds: Tuple[int, int, int]) -> List[float]:
+    s1, s2, s3 = seeds
+    result: List[float] = []
+    total = len(slopes)
+    n = min(total, numpoints)
+    for k in range(n):
+        s1 = 171 * (s1 % 30269)
+        s2 = 172 * (s2 % 30307)
+        s3 = 170 * (s3 % 30323)
+        rnd = (s1 / 30269.0 + s2 / 30307.0 + s3 / 30323.0) % 1
+        idx = int(rnd * total) if total else 0
+        if total:
+            result.append(slopes[idx])
+    return result
 
 
-def compute_rsi_kde_pivots(df: pd.DataFrame):
-    """
-    PRO V6 RSI + KDE pivot probability (Possible Bullish/Bearish Pivot).
-    """
-    c = df["close"]
-    h = df["high"]
-    l = df["low"]
-
-    rsi_kernel = rsi(c, rsi_kde_length)
-
-    high_pivots, low_pivots = find_pivots(h, l, high_pivot_len, high_pivot_len)
-    rsi_high_vals = rsi_kernel[high_pivots].dropna().values
-    rsi_low_vals = rsi_kernel[low_pivots].dropna().values
-
-    if len(rsi_high_vals) > kde_limit:
-        rsi_high_vals = rsi_high_vals[-kde_limit:]
-    if len(rsi_low_vals) > kde_limit:
-        rsi_low_vals = rsi_low_vals[-kde_limit:]
-
-    cur_color = kde_color_series(
-        rsi_kernel,
-        rsi_high_vals,
-        rsi_low_vals,
-        kernel="Gaussian",
-        bandwidth=kde_bandwidth,
-        steps=kde_steps,
-        activation_threshold=kde_activation_threshold,
-    )
-
-    prev_color = cur_color.shift(1)
-    possible_bullish_pivot = (cur_color == 0) & (prev_color == 1)
-    possible_bearish_pivot = (cur_color == 0) & (prev_color == -1)
-
-    return possible_bullish_pivot.fillna(False), possible_bearish_pivot.fillna(False)
+def intercepts(src: pd.Series, n: int, slope: float) -> List[float]:
+    inter: List[float] = []
+    if n > 0:
+        for i in range(n):
+            inter.append(src.iloc[i] - slope * i)
+    return inter
 
 
-def compute_trend_ema_dashboard(df: pd.DataFrame):
-    """
-    Simplified EMA trend for 'trend changed' style alerts.
+def compute_theil_sen(df: pd.DataFrame) -> Dict[str, pd.Series]:
+    src = df[ts_src_field]
+    mslope_series = pd.Series(index=df.index, dtype=float)
+    minter_series = pd.Series(index=df.index, dtype=float)
+    dev_series = pd.Series(index=df.index, dtype=float)
+    isbroken_series = pd.Series(index=df.index, dtype=bool)
 
-    Returns:
-        trend_indicator : Series(int) with 1 (uptrend), -1 (downtrend), 0 (neutral)
-    """
-    c = df["close"]
-    ema_val = ema(c, trend_ema_length)
-    ema_prev = ema_val.shift(1)
+    for idx in range(len(df)):
+        window_len = ts_len if enable_theilsen else 0
+        if idx + 1 < window_len or window_len <= 2:
+            mslope_series.iloc[idx] = np.nan
+            minter_series.iloc[idx] = np.nan
+            dev_series.iloc[idx] = np.nan
+            isbroken_series.iloc[idx] = False
+            continue
+        start = idx + 1 - window_len
+        segment = src.iloc[start:idx + 1].reset_index(drop=True)
+        slopes = all_slopes(window_len, segment)
+        if ts_method == "Random":
+            seeds = (int(df["close"].iloc[idx - 1]) if idx > 0 else 1,
+                     int(df["close"].iloc[idx - 2]) if idx > 1 else 2,
+                     int(df["close"].iloc[idx - 3]) if idx > 2 else 3)
+            slopes = rnd_slopes(slopes, ts_numpairs, seeds)
+        mslope = float(np.median(slopes)) if slopes else 0.0
+        inter = intercepts(segment, window_len, mslope)
+        minter = float(np.median(inter)) if inter else 0.0
+        mslope_series.iloc[idx] = mslope
+        minter_series.iloc[idx] = minter
 
-    trend_indicator = pd.Series(0, index=df.index, dtype="int32")
+        rmse = 0.0
+        for j in range(window_len):
+            rmse += (segment.iloc[j] - (minter + mslope * (window_len - j))) ** 2 / window_len
+        dev = ts_mult * math.sqrt(rmse)
+        dev_series.iloc[idx] = dev
+
+        y2 = minter + mslope * (window_len - 1)
+        isbroken_series.iloc[idx] = bool(segment.iloc[-1] > y2 + dev or segment.iloc[-1] < y2 - dev)
+
+    return {
+        "mslope": mslope_series,
+        "minter": minter_series,
+        "dev": dev_series,
+        "isbroken": isbroken_series,
+    }
+
+
+# --- Trend 2 ---
+
+def resample_series(series: pd.Series, tf: str) -> pd.Series:
+    # simple resampler based on timeframe minutes
+    try:
+        minutes = int(tf.rstrip("m"))
+    except ValueError:
+        return series
+    rule = f"{minutes}T"
+    return series.resample(rule, origin="start").last().reindex(series.index, method="ffill")
+
+
+def compute_trend2(df: pd.DataFrame) -> Dict[str, pd.Series]:
+    close_series = df["close"]
+    open_series = df["open"]
+    if h_heikin_ashi:
+        ha_close = (df["open"] + df["high"] + df["low"] + df["close"]) / 4
+        ha_open = ha_close.copy()
+        for i in range(len(df)):
+            if i == 0:
+                ha_open.iloc[i] = (df["open"].iloc[i] + df["close"].iloc[i]) / 2
+            else:
+                ha_open.iloc[i] = (ha_open.iloc[i - 1] + ha_close.iloc[i - 1]) / 2
+        close_series = ha_close
+        open_series = ha_open
+
+    close_series_ma = variant_ma(basisType, close_series.shift(delayOffset), basisLen, offsetSigma, offsetALMA)
+    open_series_ma = variant_ma(basisType, open_series.shift(delayOffset), basisLen, offsetSigma, offsetALMA)
+
+    if useRes:
+        close_series_ma = resample_series(close_series_ma, res5)
+        open_series_ma = resample_series(open_series_ma, res5)
+
+    leTrigger = crossover(close_series_ma, open_series_ma)
+    seTrigger = crossunder(close_series_ma, open_series_ma)
+
+    rsi_val = ta_rsi(df["close"], rsi_period)
+    rsi_ema_val = ema(rsi_val, 10)
+    ema_price = ema(df["close"], ema_period)
+
+    rsiOb = (rsi_val > rsi_overbought) & (rsi_val > rsi_ema_val)
+    rsiOs = (rsi_val < rsi_oversold) & (rsi_val < rsi_ema_val)
+    price_above_ema = df["close"] > ema_price
+    price_below_ema = df["close"] < ema_price
+
+    rsi_bullish = rsiOs | ((rsi_val < 50) & price_above_ema)
+    rsi_bearish = rsiOb | ((rsi_val > 50) & price_below_ema)
+
+    strong_buy = leTrigger & rsi_bullish
+    strong_sell = seTrigger & rsi_bearish
+
+    # Respect tradeType filter
+    if tradeType == "LONG":
+        seTrigger &= False
+        strong_sell &= False
+    elif tradeType == "SHORT":
+        leTrigger &= False
+        strong_buy &= False
+    elif tradeType == "NONE":
+        leTrigger &= False
+        seTrigger &= False
+        strong_buy &= False
+        strong_sell &= False
+
+    show_le = show_basic_signals & (strong_buy if show_rsi_confluence else leTrigger)
+    show_se = show_basic_signals & (strong_sell if show_rsi_confluence else seTrigger)
+
+    return {
+        "leTrigger": pd.Series(show_le, index=df.index),
+        "seTrigger": pd.Series(show_se, index=df.index),
+        "strong_buy": pd.Series(show_strong_signals and strong_buy, index=df.index),
+        "strong_sell": pd.Series(show_strong_signals and strong_sell, index=df.index),
+    }
+
+
+# --- RSI + KDE pivots ---
+
+def ta_rsi(series: pd.Series, length: int) -> pd.Series:
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = rma(gain, length)
+    avg_loss = rma(loss, length)
+    rs = avg_gain / avg_loss
+    rs = rs.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    return 100 - (100 / (1 + rs))
+
+
+def gaussian(distance: float, bandwidth: float) -> float:
+    return 1.0 / math.sqrt(2.0 * math.pi) * math.pow(math.e, -0.5 * math.pow(distance / bandwidth, 2.0))
+
+
+def uniform(distance: float, bandwidth: float) -> float:
+    return 0.0 if abs(distance) > bandwidth else 0.5
+
+
+def sigmoid(distance: float, bandwidth: float) -> float:
+    return 1.0 / (1.0 + math.exp(-distance / max(bandwidth, 1e-9)))
+
+
+def kde_probabilities(values: List[float], steps: int, bandwidth: float, kernel: str) -> List[float]:
+    if not values:
+        return [0.0] * steps
+    low = min(values)
+    high = max(values)
+    if low == high:
+        low -= 1
+        high += 1
+    bins = np.linspace(low, high, steps)
+    probs = []
+    for b in bins:
+        acc = 0.0
+        for v in values:
+            dist = b - v
+            if kernel == "Uniform":
+                acc += uniform(dist, bandwidth)
+            elif kernel == "Sigmoid":
+                acc += sigmoid(dist, bandwidth)
+            else:
+                acc += gaussian(dist, bandwidth)
+        probs.append(acc / len(values))
+    return probs
+
+
+def compute_rsi_kde(df: pd.DataFrame) -> Dict[str, pd.Series]:
+    src = df[rsiSourceInput] if rsiSourceInput in df.columns else df["close"]
+    rsi_series = ta_rsi(src, rsiLengthInput)
+
+    high_pivot = rsi_series.shift(highPivotLen).rolling(highPivotLen * 2 + 1).apply(lambda x: 1 if x.iloc[highPivotLen] == x.max() else 0, raw=False)
+    low_pivot = rsi_series.shift(lowPivotLen).rolling(lowPivotLen * 2 + 1).apply(lambda x: 1 if x.iloc[lowPivotLen] == x.min() else 0, raw=False)
+
+    pivot_values: List[float] = []
+    cur_color = pd.Series(index=df.index, dtype=float)
+    possible_bull = pd.Series(False, index=df.index)
+    possible_bear = pd.Series(False, index=df.index)
+
+    activation = 0.4 if activationThresholdStr == "High" else 0.25 if activationThresholdStr == "Medium" else 0.15
+
     for i in range(len(df)):
-        if ema_val.iloc[i] > ema_prev.iloc[i]:
-            trend_indicator.iloc[i] = 1
-        elif ema_val.iloc[i] < ema_prev.iloc[i]:
-            trend_indicator.iloc[i] = -1
+        if high_pivot.iloc[i] == 1:
+            pivot_values.append(rsi_series.iloc[i])
+            cur_color.iloc[i] = -1
+        elif low_pivot.iloc[i] == 1:
+            pivot_values.append(rsi_series.iloc[i])
+            cur_color.iloc[i] = 1
         else:
-            trend_indicator.iloc[i] = trend_indicator.iloc[i - 1] if i > 0 else 0
-    return trend_indicator
+            cur_color.iloc[i] = np.nan
 
+        recent = pivot_values[-KDELimit:]
+        if recent:
+            probs = kde_probabilities(recent, KDEStep, KDEBandwidth, KDEKernel)
+            current_prob = probs[-1]
+            if current_prob >= activation:
+                if len(recent) > 0:
+                    last_val = recent[-1]
+                    if cur_color.iloc[i] == 1 or (not np.isnan(cur_color.shift(1).iloc[i]) and cur_color.shift(1).iloc[i] == 1):
+                        possible_bull.iloc[i] = True
+                    if cur_color.iloc[i] == -1 or (not np.isnan(cur_color.shift(1).iloc[i]) and cur_color.shift(1).iloc[i] == -1):
+                        possible_bear.iloc[i] = True
 
-def compute_all_pro_v6_signals(df: pd.DataFrame):
-    """
-    Aggregates all systems and returns a dict of signal Series.
-    """
-    pro_up, pro_down = compute_signal_system(df)
-    trail, ex, state, z1, z2, z3, zone_cross = compute_trend_following_zones(df)
-    long_entry, short_entry, strong_buy, strong_sell = compute_trend2_signals(df)
-    pb_pivot, ps_pivot = compute_rsi_kde_pivots(df)
-
-    ts_channel = theil_sen_channel(
-        df[ts_src_field],
-        ts_len,
-        ts_method,
-        ts_numpairs,
-        ts_mult,
-    )
-
-    trend_indicator = compute_trend_ema_dashboard(df)
-
-    signals = {
-        # main requested
-        "pro_signal_up": pro_up,
-        "pro_signal_down": pro_down,
-        "long_entry": long_entry,
-        "short_entry": short_entry,
-        "strong_buy": strong_buy,
-        "strong_sell": strong_sell,
-        "possible_bullish_pivot": pb_pivot,
-        "possible_bearish_pivot": ps_pivot,
-        # zones
-        "z1_long": zone_cross["z1_long"],
-        "z2_long": zone_cross["z2_long"],
-        "z3_long": zone_cross["z3_long"],
-        "z1_short": zone_cross["z1_short"],
-        "z2_short": zone_cross["z2_short"],
-        "z3_short": zone_cross["z3_short"],
-        # Theil-Sen
-        "theil_sen_break": ts_channel["isbroken"],
-        # EMA trend dashboard (trend change)
-        "trend_indicator": trend_indicator,
+    return {
+        "curColor": cur_color,
+        "possible_bullish_pivot": possible_bull,
+        "possible_bearish_pivot": possible_bear,
     }
+
+
+# --- Trend Dashboard (simplified EMA trend cross) ---
+
+def compute_trend_indicator(df: pd.DataFrame) -> pd.Series:
+    ema_fast = ema(df["close"], trend_dashboard_length // 2)
+    ema_slow = ema(df["close"], trend_dashboard_length)
+    indicator = pd.Series(0, index=df.index, dtype=int)
+    indicator = indicator.mask(ema_fast > ema_slow, 1)
+    indicator = indicator.mask(ema_fast < ema_slow, -1)
+    return indicator
+
+
+# =============================================================================
+# Aggregate signal computation
+# =============================================================================
+
+def compute_all_pro_v6_signals(df: pd.DataFrame) -> Dict[str, pd.Series]:
+    signals = {}
+
+    sig_sys = compute_signal_system(df)
+    signals.update({
+        "pro_signal_up": sig_sys["long_signal"],
+        "pro_signal_down": sig_sys["short_signal"],
+    })
+
+    trend = compute_trend_follow(df)
+    signals.update({
+        "z1_long": trend["z1_long"],
+        "z2_long": trend["z2_long"],
+        "z3_long": trend["z3_long"],
+        "z1_short": trend["z1_short"],
+        "z2_short": trend["z2_short"],
+        "z3_short": trend["z3_short"],
+    })
+
+    if enable_theilsen:
+        ts_channel = compute_theil_sen(df)
+        signals["theil_sen_break"] = ts_channel["isbroken"] & ~ts_channel["isbroken"].shift(1).fillna(False)
+    else:
+        signals["theil_sen_break"] = pd.Series(False, index=df.index)
+
+    trend2 = compute_trend2(df)
+    signals.update({
+        "long_entry": trend2["leTrigger"],
+        "short_entry": trend2["seTrigger"],
+        "strong_buy": trend2["strong_buy"],
+        "strong_sell": trend2["strong_sell"],
+    })
+
+    rsi_kde = compute_rsi_kde(df)
+    signals.update({
+        "possible_bullish_pivot": rsi_kde["possible_bullish_pivot"],
+        "possible_bearish_pivot": rsi_kde["possible_bearish_pivot"],
+    })
+
+    signals["trend_indicator"] = compute_trend_indicator(df)
 
     return signals
 
 
 # =============================================================================
-# DATA / SCANNER LAYER (CCXT Binance USDT-M Futures)
+# CCXT layer
 # =============================================================================
 
 def init_exchange():
-    """
-    Initialize ccxt binanceusdm exchange (USDT-M futures).
-    """
     exchange = ccxt.binanceusdm({
         "apiKey": API_KEY,
         "secret": API_SECRET,
@@ -883,86 +713,62 @@ def init_exchange():
 
 
 def resolve_timeframe(exchange, requested: str) -> str:
-    """
-    Mirror Pine's `res = input.timeframe('')` behaviour:
-    - If the Pine input is empty, fall back to BASE_TIMEFRAME (chart timeframe).
-    - If a non-empty timeframe is provided but not offered by ccxt for this
-      exchange, fall back to BASE_TIMEFRAME when available, otherwise pick the
-      first advertised timeframe to avoid fetch_ohlcv errors.
-    """
     tf = (requested or "").strip() or BASE_TIMEFRAME
-
-    # Check against exchange-supported timeframes for safety
     if exchange is not None:
         available = getattr(exchange, "timeframes", None) or {}
         if available and tf not in available:
-            fallback = BASE_TIMEFRAME if BASE_TIMEFRAME in available else next(iter(available.keys()))
-            print(
-                f"[WARN] Requested timeframe '{tf}' not in exchange list; "
-                f"using '{fallback}' instead."
-            )
-            tf = fallback
-
+            tf = BASE_TIMEFRAME if BASE_TIMEFRAME in available else next(iter(available))
     return tf
 
 
-def get_usdtm_symbols(exchange):
+def get_usdtm_symbols(exchange) -> List[str]:
     markets = exchange.markets
-    symbols = [s for s, m in markets.items()
-               if m.get("quote") == "USDT" and m.get("type") == "future"]
+    symbols = []
+    for s, m in markets.items():
+        if m.get("quote") != "USDT":
+            continue
+        if m.get("settle") not in (None, "USDT"):
+            continue
+        m_type = m.get("type")
+        if m.get("contract") or m.get("future") or m_type in ("future", "swap"):
+            symbols.append(s)
     symbols = sorted(set(symbols))
-
     if not USE_ALL_SYMBOLS:
         symbols = [s for s in symbols if s in SYMBOLS_WHITELIST]
-
-    if SCAN_SYMBOL_LIMIT is not None and SCAN_SYMBOL_LIMIT > 0:
+    if SCAN_SYMBOL_LIMIT:
         symbols = symbols[:SCAN_SYMBOL_LIMIT]
-
     return symbols
 
 
-def fetch_ohlcv_df(exchange, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
+def fetch_ohlcv_df(exchange, symbol: str, timeframe: str, limit: int) -> Optional[pd.DataFrame]:
     try:
         raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    except Exception as exc:
+    except Exception as exc:  # pragma: no cover - runtime guard
         print(f"[ERROR] fetch_ohlcv failed for {symbol} ({timeframe}): {exc}")
         return None
-
     if not raw:
         return None
-
-    df = pd.DataFrame(
-        raw,
-        columns=["timestamp", "open", "high", "low", "close", "volume"],
-    )
+    df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     df.sort_values("timestamp", inplace=True)
     df.reset_index(drop=True, inplace=True)
+    df.set_index("timestamp", inplace=True)
     return df
 
 
 def _last_true_index(series: pd.Series, lookback_bars: int):
-    if lookback_bars is not None and lookback_bars > 0:
-        sub = series.iloc[-lookback_bars:]
-        idxs = sub[sub].index
-    else:
-        idxs = series[series].index
-    if len(idxs) == 0:
-        return None
-    return idxs[-1]
+    subset = series.iloc[-lookback_bars:] if lookback_bars and lookback_bars > 0 else series
+    idxs = subset[subset].index
+    return idxs[-1] if len(idxs) else None
 
 
-def print_signals(symbol: str,
-                  timeframe: str,
-                  df: pd.DataFrame,
-                  signals: dict):
+def print_signals(symbol: str, timeframe: str, df: pd.DataFrame, signals: Dict[str, pd.Series]):
     now_utc = datetime.now(timezone.utc)
-    ts_series = df["timestamp"]
-
     min_time = None
     if ALERT_LOOKBACK_MINUTES and ALERT_LOOKBACK_MINUTES > 0:
         min_time = now_utc - timedelta(minutes=ALERT_LOOKBACK_MINUTES)
 
+    ts_series = df.index
     price_series = df["close"]
 
     labels = {
@@ -986,60 +792,64 @@ def print_signals(symbol: str,
 
     for key, series in signals.items():
         if key == "trend_indicator":
-            # trend change alert: compare current vs previous
-            ti = series
-            if len(ti) < 2:
+            if len(series) < 2:
                 continue
-            if ti.iloc[-1] != ti.iloc[-2]:
-                ts_sig = ts_series.iloc[-1]
-                if min_time is not None and ts_sig < min_time:
+            if series.iloc[-1] != series.iloc[-2]:
+                ts_sig = ts_series[-1]
+                if min_time and ts_sig < min_time:
                     continue
-                label = labels[key]
                 price_sig = price_series.iloc[-1]
-                time_str = ts_sig.strftime("%Y-%m-%d %H:%M:%S")
-                trend_str = "Uptrend" if ti.iloc[-1] == 1 else "Downtrend" if ti.iloc[-1] == -1 else "Neutral"
-                print(
-                    f"SYMBOL: {symbol} | TIMEFRAME: {timeframe} | SIGNAL: {label} ({trend_str}) | PRICE: {price_sig:.4f} | TIME: {time_str}"
-                )
+                trend_str = "Uptrend" if series.iloc[-1] == 1 else "Downtrend" if series.iloc[-1] == -1 else "Neutral"
+                print(f"SYMBOL: {symbol} | TIMEFRAME: {timeframe} | SIGNAL: {labels[key]} ({trend_str}) | PRICE: {price_sig:.4f} | TIME: {ts_sig.strftime('%Y-%m-%d %H:%M:%S')}")
             continue
 
         last_idx = _last_true_index(series, ALERT_LOOKBACK_BARS)
         if last_idx is None:
             continue
-
-        ts_sig = ts_series.loc[last_idx]
-        if min_time is not None and ts_sig < min_time:
+        if min_time and last_idx < min_time:
             continue
-
         price_sig = price_series.loc[last_idx]
         label = labels.get(key, key)
-        time_str = ts_sig.strftime("%Y-%m-%d %H:%M:%S")
-        print(
-            f"SYMBOL: {symbol} | TIMEFRAME: {timeframe} | SIGNAL: {label} | PRICE: {price_sig:.4f} | TIME: {time_str}"
-        )
+        print(f"SYMBOL: {symbol} | TIMEFRAME: {timeframe} | SIGNAL: {label} | PRICE: {price_sig:.4f} | TIME: {last_idx.strftime('%Y-%m-%d %H:%M:%S')}")
 
+
+# =============================================================================
+# Test harness for CSV comparison
+# =============================================================================
+
+def run_test_harness(csv_path: str, timeframe: str = BASE_TIMEFRAME):
+    df = pd.read_csv(csv_path)
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        df.set_index("timestamp", inplace=True)
+    signals = compute_all_pro_v6_signals(df)
+    for name, series in signals.items():
+        true_points = series[series].index
+        print(f"{name}: {len(true_points)} signals")
+
+
+# =============================================================================
+# Scanner entry points
+# =============================================================================
 
 def process_symbol(exchange, symbol: str, timeframe: str):
     df = fetch_ohlcv_df(exchange, symbol, timeframe, MAX_HISTORY_BARS)
     if df is None or len(df) < 200:
         return
-
     try:
         signals = compute_all_pro_v6_signals(df)
-    except Exception as exc:
+    except Exception as exc:  # pragma: no cover - runtime guard
         print(f"[ERROR] compute_all_pro_v6_signals failed for {symbol}: {exc}")
         return
-
     print_signals(symbol, timeframe, df, signals)
 
 
 def run_scan_once():
     exchange = init_exchange()
-    symbols = get_usdtm_symbols(exchange)
     timeframe = resolve_timeframe(exchange, INPUT_TIMEFRAME)
+    symbols = get_usdtm_symbols(exchange)
     print(f"[INFO] Scanning {len(symbols)} Binance USDT-M symbols on {timeframe}")
-
-    for i, symbol in enumerate(symbols, start=1):
+    for symbol in symbols:
         process_symbol(exchange, symbol, timeframe)
         time.sleep(SLEEP_BETWEEN_SYMBOLS)
 
@@ -1048,7 +858,7 @@ def main():
     if RUN_CONTINUOUS:
         while True:
             run_scan_once()
-            print(f"[INFO] Sleeping {LOOP_SLEEP_SECONDS} seconds before next scan...")
+            print(f"[INFO] Sleeping {LOOP_SLEEP_SECONDS} seconds before next scan…")
             time.sleep(LOOP_SLEEP_SECONDS)
     else:
         run_scan_once()
