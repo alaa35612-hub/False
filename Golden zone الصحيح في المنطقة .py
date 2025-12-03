@@ -37,7 +37,7 @@ import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 try:
     import ccxt  # type: ignore
@@ -153,7 +153,11 @@ class AlertToggleConfig:
     golden_zone_created: bool = True
     golden_zone_first_touch: bool = True
     idm_ob_created: bool = False
-    ext_ob_created: bool =False
+    ext_ob_created: bool = False
+    ext_ob_first_touch: bool = True
+    idm_ob_first_touch: bool = True
+    hist_ext_ob_first_touch: bool = True
+    hist_idm_ob_first_touch: bool = True
 
 
 DEFAULT_ALERT_TOGGLES = AlertToggleConfig()
@@ -1417,6 +1421,10 @@ class SmartMoneyAlgoProE5:
         "Golden Zone First Touch": "golden_zone_first_touch",
         "IDM OB Zone Created": "idm_ob_created",
         "EXT OB Zone Created": "ext_ob_created",
+        "EXT OB First Touch": "ext_ob_first_touch",
+        "IDM OB First Touch": "idm_ob_first_touch",
+        "Hist EXT OB First Touch": "hist_ext_ob_first_touch",
+        "Hist IDM OB First Touch": "hist_idm_ob_first_touch",
         "Bearish External OB": "bearish_external_ob",
         "Bullish External OB": "bullish_external_ob",
         "Bearish Internal OB": "bearish_internal_ob",
@@ -1649,6 +1657,7 @@ class SmartMoneyAlgoProE5:
         metrics["ext_ob_new"] = _status_total(ext_counter, "new")
         metrics["ext_ob_touched"] = _status_total(ext_counter, "touched", "retest")
         metrics["current_price"] = self.series.get("close")
+        metrics["latest_bar_time"] = self.series.get_time()
         metrics["latest_events"] = self._collect_latest_console_events()
         return metrics
 
@@ -1762,6 +1771,19 @@ class SmartMoneyAlgoProE5:
                 if alert_title:
                     price_range = f"{format_price(box.bottom)} → {format_price(box.top)}"
                     message = f"{{ticker}} {box.text} Created (Untouched), Range: {price_range}"
+                    self.alertcondition(True, alert_title, message)
+            elif status_key == "touched":
+                touch_alerts = {
+                    "EXT_OB": "EXT OB First Touch",
+                    "IDM_OB": "IDM OB First Touch",
+                    "HIST_EXT_OB": "Hist EXT OB First Touch",
+                    "HIST_IDM_OB": "Hist IDM OB First Touch",
+                }
+                alert_title = touch_alerts.get(key)
+                if alert_title:
+                    price_range = f"{format_price(box.bottom)} → {format_price(box.top)}"
+                    close_text = format_price(self.series.get("close"))
+                    message = f"{{ticker}} {box.text} First Touch, Range: {price_range}, Close: {close_text}"
                     self.alertcondition(True, alert_title, message)
 
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
@@ -2307,6 +2329,8 @@ class SmartMoneyAlgoProE5:
         self.demandZoneIsMit = PineArray()
         self.hist_idm_boxes = PineArray()
         self.hist_ext_boxes = PineArray()
+        self._hist_ext_touched_ids: set[int] = set()
+        self._hist_idm_touched_ids: set[int] = set()
         self.arrIdmHigh = PineArray()
         self.arrIdmLow = PineArray()
         self.arrIdmHBar = PineArray()
@@ -6316,6 +6340,36 @@ class SmartMoneyAlgoProE5:
             # إزالة المنطقة بعد أول لمس لضمان عرض المناطق غير الملامسة فقط
             # self._clear_golden_zone()  # مُعطّل لمطابقة Pine
 
+    def _check_historical_ob_first_touch(
+        self,
+        boxes: PineArray,
+        touched_ids: set[int],
+    ) -> None:
+        if not isinstance(boxes, PineArray):
+            return
+        high = self.series.get("high")
+        low = self.series.get("low")
+        time_val = self.series.get_time(0)
+        if not all(isinstance(v, (int, float)) for v in (high, low, time_val)):
+            return
+        if math.isnan(float(high)) or math.isnan(float(low)) or math.isnan(float(time_val)):
+            return
+        for bx in list(boxes.values):
+            if not isinstance(bx, Box):
+                continue
+            box_id = id(bx)
+            if box_id in touched_ids:
+                continue
+            top = bx.get_top()
+            bottom = bx.get_bottom()
+            if math.isnan(top) or math.isnan(bottom):
+                continue
+            zone_min = min(top, bottom)
+            zone_max = max(top, bottom)
+            if low <= zone_max and high >= zone_min:
+                touched_ids.add(box_id)
+                self._register_box_event(bx, status="touched", event_time=time_val)
+
     def _update_golden_zone(self, time_val: int, high: float, low: float) -> None:
         prev_oi1 = None if is_na(self.prev_oi1) else float(self.prev_oi1)
         bounds = self._golden_zone_bounds()
@@ -7412,6 +7466,9 @@ class SmartMoneyAlgoProE5:
             self._update_golden_zone(time_val, high, low)
         else:
             self._clear_golden_zone()
+
+        self._check_historical_ob_first_touch(self.hist_ext_boxes, self._hist_ext_touched_ids)
+        self._check_historical_ob_first_touch(self.hist_idm_boxes, self._hist_idm_touched_ids)
 
         self._sync_state_mirrors()
 
@@ -8949,6 +9006,16 @@ def _is_price_inside_golden_zone(metrics: Dict[str, Any]) -> bool:
 
     gz = latest.get("GOLDEN_ZONE")
     if not isinstance(gz, dict):
+        return False
+
+    if gz.get("status") != "touched":
+        return False
+
+    latest_bar_time = metrics.get("latest_bar_time")
+    gz_time = gz.get("time")
+    if not isinstance(latest_bar_time, (int, float)) or not isinstance(gz_time, (int, float)):
+        return False
+    if int(gz_time) != int(latest_bar_time):
         return False
 
     bounds = gz.get("price")
