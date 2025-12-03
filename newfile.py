@@ -917,6 +917,9 @@ def get_usdtm_symbols(exchange):
 
     if SCAN_SYMBOL_LIMIT is not None and SCAN_SYMBOL_LIMIT > 0:
         symbols = symbols[:SCAN_SYMBOL_LIMIT]
+        print(f"[INFO] Applying SCAN_SYMBOL_LIMIT={SCAN_SYMBOL_LIMIT}; scanning first {len(symbols)} symbols")
+    else:
+        print(f"[INFO] No SCAN_SYMBOL_LIMIT set; scanning full universe of {len(symbols)} symbols")
 
     return symbols
 
