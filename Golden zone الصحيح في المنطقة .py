@@ -37,7 +37,7 @@ import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 try:
     import ccxt  # type: ignore
@@ -153,7 +153,11 @@ class AlertToggleConfig:
     golden_zone_created: bool = True
     golden_zone_first_touch: bool = True
     idm_ob_created: bool = False
-    ext_ob_created: bool =False
+    ext_ob_created: bool = False
+    ext_ob_first_touch: bool = True
+    idm_ob_first_touch: bool = True
+    hist_ext_ob_first_touch: bool = True
+    hist_idm_ob_first_touch: bool = True
 
 
 DEFAULT_ALERT_TOGGLES = AlertToggleConfig()
@@ -1417,6 +1421,10 @@ class SmartMoneyAlgoProE5:
         "Golden Zone First Touch": "golden_zone_first_touch",
         "IDM OB Zone Created": "idm_ob_created",
         "EXT OB Zone Created": "ext_ob_created",
+        "EXT OB First Touch": "ext_ob_first_touch",
+        "IDM OB First Touch": "idm_ob_first_touch",
+        "Hist EXT OB First Touch": "hist_ext_ob_first_touch",
+        "Hist IDM OB First Touch": "hist_idm_ob_first_touch",
         "Bearish External OB": "bearish_external_ob",
         "Bullish External OB": "bullish_external_ob",
         "Bearish Internal OB": "bearish_internal_ob",
@@ -1649,6 +1657,7 @@ class SmartMoneyAlgoProE5:
         metrics["ext_ob_new"] = _status_total(ext_counter, "new")
         metrics["ext_ob_touched"] = _status_total(ext_counter, "touched", "retest")
         metrics["current_price"] = self.series.get("close")
+        metrics["latest_bar_time"] = self.series.get_time()
         metrics["latest_events"] = self._collect_latest_console_events()
         return metrics
 
@@ -1762,6 +1771,19 @@ class SmartMoneyAlgoProE5:
                 if alert_title:
                     price_range = f"{format_price(box.bottom)} → {format_price(box.top)}"
                     message = f"{{ticker}} {box.text} Created (Untouched), Range: {price_range}"
+                    self.alertcondition(True, alert_title, message)
+            elif status_key == "touched":
+                touch_alerts = {
+                    "EXT_OB": "EXT OB First Touch",
+                    "IDM_OB": "IDM OB First Touch",
+                    "HIST_EXT_OB": "Hist EXT OB First Touch",
+                    "HIST_IDM_OB": "Hist IDM OB First Touch",
+                }
+                alert_title = touch_alerts.get(key)
+                if alert_title:
+                    price_range = f"{format_price(box.bottom)} → {format_price(box.top)}"
+                    close_text = format_price(self.series.get("close"))
+                    message = f"{{ticker}} {box.text} First Touch, Range: {price_range}, Close: {close_text}"
                     self.alertcondition(True, alert_title, message)
 
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
@@ -2307,6 +2329,8 @@ class SmartMoneyAlgoProE5:
         self.demandZoneIsMit = PineArray()
         self.hist_idm_boxes = PineArray()
         self.hist_ext_boxes = PineArray()
+        self._hist_ext_touched_ids: set[int] = set()
+        self._hist_idm_touched_ids: set[int] = set()
         self.arrIdmHigh = PineArray()
         self.arrIdmLow = PineArray()
         self.arrIdmHBar = PineArray()
@@ -6316,6 +6340,36 @@ class SmartMoneyAlgoProE5:
             # إزالة المنطقة بعد أول لمس لضمان عرض المناطق غير الملامسة فقط
             # self._clear_golden_zone()  # مُعطّل لمطابقة Pine
 
+    def _check_historical_ob_first_touch(
+        self,
+        boxes: PineArray,
+        touched_ids: set[int],
+    ) -> None:
+        if not isinstance(boxes, PineArray):
+            return
+        high = self.series.get("high")
+        low = self.series.get("low")
+        time_val = self.series.get_time(0)
+        if not all(isinstance(v, (int, float)) for v in (high, low, time_val)):
+            return
+        if math.isnan(float(high)) or math.isnan(float(low)) or math.isnan(float(time_val)):
+            return
+        for bx in list(boxes.values):
+            if not isinstance(bx, Box):
+                continue
+            box_id = id(bx)
+            if box_id in touched_ids:
+                continue
+            top = bx.get_top()
+            bottom = bx.get_bottom()
+            if math.isnan(top) or math.isnan(bottom):
+                continue
+            zone_min = min(top, bottom)
+            zone_max = max(top, bottom)
+            if low <= zone_max and high >= zone_min:
+                touched_ids.add(box_id)
+                self._register_box_event(bx, status="touched", event_time=time_val)
+
     def _update_golden_zone(self, time_val: int, high: float, low: float) -> None:
         prev_oi1 = None if is_na(self.prev_oi1) else float(self.prev_oi1)
         bounds = self._golden_zone_bounds()
@@ -7412,6 +7466,9 @@ class SmartMoneyAlgoProE5:
             self._update_golden_zone(time_val, high, low)
         else:
             self._clear_golden_zone()
+
+        self._check_historical_ob_first_touch(self.hist_ext_boxes, self._hist_ext_touched_ids)
+        self._check_historical_ob_first_touch(self.hist_idm_boxes, self._hist_idm_touched_ids)
 
         self._sync_state_mirrors()
 
@@ -8951,6 +9008,16 @@ def _is_price_inside_golden_zone(metrics: Dict[str, Any]) -> bool:
     if not isinstance(gz, dict):
         return False
 
+    if gz.get("status") != "touched":
+        return False
+
+    latest_bar_time = metrics.get("latest_bar_time")
+    gz_time = gz.get("time")
+    if not isinstance(latest_bar_time, (int, float)) or not isinstance(gz_time, (int, float)):
+        return False
+    if int(gz_time) != int(latest_bar_time):
+        return False
+
     bounds = gz.get("price")
     if not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
         return False
@@ -8980,6 +9047,10 @@ def _collect_recent_event_hits(
     latest_events: Any,
     *,
     bars: int = 2,
+    allowed_keys: Optional[Set[str]] = None,
+    required_status: Optional[str] = None,
+    current_price: Optional[float] = None,
+    require_price_in_range: bool = False,
 ) -> Tuple[List[str], List[int]]:
     """Identify latest-event keys that fall within the most recent candles."""
 
@@ -9000,12 +9071,36 @@ def _collect_recent_event_hits(
         return [], recent_times
 
     hits: List[str] = []
+
+    def _price_is_within(payload: Dict[str, Any]) -> bool:
+        if current_price is None or math.isnan(current_price):
+            return False
+        bounds = payload.get("price")
+        if not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
+            return False
+        try:
+            lo = float(bounds[0])
+            hi = float(bounds[1])
+        except (TypeError, ValueError):
+            return False
+        lower = min(lo, hi)
+        upper = max(lo, hi)
+        return not (math.isnan(lower) or math.isnan(upper)) and lower <= current_price <= upper
+
     for key, payload in latest_events.items():
-        timestamp: Optional[Union[int, float]] = None
+        key_str = str(key)
+        if allowed_keys and key_str not in allowed_keys:
+            continue
         if isinstance(payload, dict):
+            if required_status and payload.get("status") != required_status:
+                continue
+            if require_price_in_range and not _price_is_within(payload):
+                continue
             timestamp = payload.get("time") or payload.get("ts") or payload.get("timestamp")
+        else:
+            timestamp = None
         if isinstance(timestamp, (int, float)) and int(timestamp) in recent_times:
-            hits.append(str(key))
+            hits.append(key_str)
     return hits, recent_times
 
 
@@ -9021,7 +9116,7 @@ def scan_binance(
     recent_window_bars: Optional[int] = None,
     max_symbols: Optional[int] = None,
     symbol_selector: Optional[BinanceSymbolSelectorConfig] = None,
-) -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
+    ) -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
     if ccxt is None:
         raise RuntimeError("ccxt is not available")
     exchange = ccxt.binanceusdm({"enableRateLimit": True})
@@ -9032,6 +9127,18 @@ def scan_binance(
     )
     if max_symbols and max_symbols > 0:
         all_symbols = all_symbols[: int(max_symbols)]
+    try:
+        ticker_map = exchange.fetch_tickers(all_symbols)
+        if not isinstance(ticker_map, dict):
+            ticker_map = {}
+    except Exception as exc:
+        print(
+            f"تعذر جلب tickers مُجمّعة ({exc})، سيتم استخدام fetch_ticker لكل رمز.",
+            file=sys.stderr,
+            flush=True,
+        )
+        ticker_map = {}
+
     summaries: List[Dict[str, Any]] = []
     primary_runtime: Optional[SmartMoneyAlgoProE5] = None
     window = recent_window_bars
@@ -9045,16 +9152,22 @@ def scan_binance(
         else:
             window = 2
     window = max(1, int(window))
-    for idx, symbol in enumerate(all_symbols):
-        try:
-            ticker = exchange.fetch_ticker(symbol)
-        except Exception as exc:
-            print(
-                f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ticker: {exc}",
-                file=sys.stderr,
-                flush=True,
-            )
-            continue
+
+    max_workers = 1 if (tracer and tracer.enabled) else max(1, int(concurrency))
+
+    def _process_symbol(idx: int, symbol: str) -> Optional[Tuple[SmartMoneyAlgoProE5, Dict[str, Any]]]:
+        local_exchange = exchange if max_workers == 1 else ccxt.binanceusdm({"enableRateLimit": True})
+        ticker = ticker_map.get(symbol)
+        if ticker is None:
+            try:
+                ticker = local_exchange.fetch_ticker(symbol)
+            except Exception as exc:
+                print(
+                    f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ticker: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return None
         daily_change = _extract_daily_change_percent(ticker)
         if min_daily_change > 0.0 and daily_change is not None and daily_change <= min_daily_change:
             print(
@@ -9070,15 +9183,22 @@ def scan_binance(
                     change=daily_change,
                     threshold=min_daily_change,
                 )
-            continue
-        candles = fetch_ohlcv(exchange, symbol, timeframe, limit)
+            return None
+        candles = fetch_ohlcv(local_exchange, symbol, timeframe, limit)
         runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
         runtime.console_max_age_bars = max(runtime.console_max_age_bars, window)
         runtime.process(candles)
         metrics = runtime.gather_console_metrics()
         latest_events = metrics.get("latest_events") or {}
+        target_keys = {"GOLDEN_ZONE", "EXT_OB", "IDM_OB", "HIST_EXT_OB", "HIST_IDM_OB"}
         recent_hits, recent_times = _collect_recent_event_hits(
-            runtime.series, latest_events, bars=window
+            runtime.series,
+            latest_events,
+            bars=window,
+            allowed_keys=target_keys,
+            required_status="touched",
+            current_price=metrics.get("current_price"),
+            require_price_in_range=True,
         )
         if not recent_hits:
             print(
@@ -9095,7 +9215,7 @@ def scan_binance(
                     reference_times=recent_times,
                     window=window,
                 )
-            continue
+            return None
 
         metrics["daily_change_percent"] = daily_change
         summaries.append(
@@ -9118,8 +9238,20 @@ def scan_binance(
                 timeframe=timeframe,
                 candles=len(candles),
             )
-        if primary_runtime is None:
-            primary_runtime = runtime
+        return runtime, metrics
+
+    futures: List[Tuple[int, concurrent.futures.Future]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for idx, symbol in enumerate(all_symbols):
+            futures.append((idx, executor.submit(_process_symbol, idx, symbol)))
+        for idx, future in futures:
+            result = future.result()
+            if not result:
+                continue
+            runtime, _metrics = result
+            if primary_runtime is None:
+                primary_runtime = runtime
+
     if primary_runtime is None:
         primary_runtime = SmartMoneyAlgoProE5(inputs=inputs, tracer=tracer)
         primary_runtime.console_max_age_bars = max(primary_runtime.console_max_age_bars, window)
@@ -9918,8 +10050,15 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
 
         metrics = runtime.gather_console_metrics()
         latest = metrics.get("latest_events", {})
+        target_keys = {"GOLDEN_ZONE", "EXT_OB", "IDM_OB", "HIST_EXT_OB", "HIST_IDM_OB"}
         recent_hits, recent_times = _collect_recent_event_hits(
-            runtime.series, latest, bars=recent_window
+            runtime.series,
+            latest,
+            bars=recent_window,
+            allowed_keys=target_keys,
+            required_status="touched",
+            current_price=metrics.get("current_price"),
+            require_price_in_range=True,
         )
         if not recent_hits:
             print(
@@ -10691,17 +10830,16 @@ def _android_cli_entry() -> int:
                     continue
 
                 metrics = runtime.gather_console_metrics()
-                # فلتر: نكمل فقط إذا كان السعر الحالي داخل منطقة Golden Zone
-                if not _is_price_inside_golden_zone(metrics):
-                    if args.verbose:
-                        print(
-                            f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لأن السعر الحالي خارج منطقة Golden Zone",
-                            flush=True,
-                        )
-                    continue
                 latest_events = metrics.get("latest_events") or {}
+                target_keys = {"GOLDEN_ZONE", "EXT_OB", "IDM_OB", "HIST_EXT_OB", "HIST_IDM_OB"}
                 recent_hits, _ = _collect_recent_event_hits(
-                    runtime.series, latest_events, bars=recent_window
+                    runtime.series,
+                    latest_events,
+                    bars=recent_window,
+                    allowed_keys=target_keys,
+                    required_status="touched",
+                    current_price=metrics.get("current_price"),
+                    require_price_in_range=True,
                 )
                 if not recent_hits:
                     if recent_window == 1:
