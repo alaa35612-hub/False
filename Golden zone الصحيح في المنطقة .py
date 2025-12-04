@@ -1904,6 +1904,35 @@ class SmartMoneyAlgoProE5:
         )
         record_box("GOLDEN_ZONE", lambda bx: bx.text == "Golden zone")
 
+
+        # Fallback: استخرج آخر تنبيه نصي لكل حدث إذا لم يتم تسجيله أعلاه
+        label_to_key = {label: key for key, label in EVENT_DISPLAY_ORDER}
+        for name, latest in _last_by_keywords(self.alerts, _LAST_BUCKETS):
+            if not latest:
+                continue
+            ts, title = latest
+            key = label_to_key.get(name)
+            if not key or key in events:
+                continue
+            if not self._console_event_within_age(ts):
+                continue
+
+            price_value: Any = None
+            price_match = re.search(r"@\s*([-+]?\d*\.?\d+)", str(title))
+            if price_match:
+                try:
+                    price_value = float(price_match.group(1))
+                except (TypeError, ValueError):
+                    price_value = price_match.group(1)
+
+            events[key] = {
+                "text": name,
+                "price": price_value,
+                "display": str(title),
+                "time": ts,
+                "time_display": format_timestamp(ts),
+            }
+
         return events
 
     def _sync_state_mirrors(self) -> None:
