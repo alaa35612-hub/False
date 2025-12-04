@@ -152,8 +152,8 @@ class AlertToggleConfig:
     low_liquidity_level_break: bool = False
     golden_zone_created: bool = True
     golden_zone_first_touch: bool = True
-    idm_ob_created: bool = False
-    ext_ob_created: bool = False
+    idm_ob_created: bool = True
+    ext_ob_created: bool = True
     ext_ob_first_touch: bool = True
     idm_ob_first_touch: bool = True
     hist_ext_ob_first_touch: bool = True
@@ -1903,6 +1903,38 @@ class SmartMoneyAlgoProE5:
             sources=(self.hist_ext_boxes, self.boxes),
         )
         record_box("GOLDEN_ZONE", lambda bx: bx.text == "Golden zone")
+
+
+        # Backfill alert-based المفاتيح مباشرة من سجل الأحداث حتى لا نعتمد على نصوص التنبيهات
+        for key, label in EVENT_DISPLAY_ORDER:
+            if not key.startswith("ALERT_") or key in events:
+                continue
+            payload = self.console_event_log.get(key)
+            if not isinstance(payload, dict):
+                continue
+            if not self._console_event_within_age(payload.get("time")):
+                continue
+
+            price_value = payload.get("price")
+            display = payload.get("display") or ""
+            if not display:
+                if isinstance(price_value, (list, tuple)) and len(price_value) == 2:
+                    display = f"{label} {format_price(price_value[0])} → {format_price(price_value[1])}"
+                elif price_value is not None and price_value == price_value:
+                    display = f"{label} @ {format_price(price_value)}"
+                else:
+                    display = label
+
+            events[key] = {
+                "text": payload.get("text") or label,
+                "price": price_value,
+                "display": display,
+                "time": payload.get("time"),
+                "time_display": payload.get("time_display") or format_timestamp(payload.get("time")),
+                "direction": payload.get("direction"),
+                "status": payload.get("status"),
+                "status_display": payload.get("status_display"),
+            }
 
         return events
 
