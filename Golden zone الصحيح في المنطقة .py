@@ -133,6 +133,21 @@ EDITOR_AUTORUN_DEFAULTS = _EditorAutorunDefaults(
 
 
 @dataclass(frozen=True)
+class _StrategyAutorunDefaults:
+    """إعدادات الاستراتيجية القابلة للتعديل من أعلى الملف."""
+
+    enabled: bool = True
+    strategy: str = "ICT 2022"
+    equity: float = 100.0
+    risk_pct: float = 2.0
+    ny_offset: int = -4
+
+
+# ضبط القيم السابقة لتناسب جميع الإطارات الزمنية والتنفيذ الآلي من المحرر.
+STRATEGY_AUTORUN_DEFAULTS = _StrategyAutorunDefaults()
+
+
+@dataclass(frozen=True)
 class AlertToggleConfig:
     bearish_external_ob: bool = True
     bullish_external_ob: bool = True
@@ -10467,6 +10482,35 @@ class Settings:
             parsed_interval = EDITOR_AUTORUN_DEFAULTS.scan_interval
         self.continuous_interval = parsed_interval if parsed_interval >= 0 else 0.0
 
+
+def _run_strategy_autorun(symbol: str, timeframe: str, runtime: Any) -> int:
+    """يشغّل الاستراتيجية المتقدمة ويطبع تنبيهات شراء/بيع في المحرّر."""
+
+    cfg = STRATEGY_AUTORUN_DEFAULTS
+    if not cfg.enabled:
+        return 0
+    try:
+        engine = _StrategyEngine(
+            runtime,
+            symbol,
+            equity=cfg.equity,
+            risk_pct=cfg.risk_pct,
+            ny_offset=cfg.ny_offset,
+        )
+        sig = engine._evaluate(cfg.strategy)
+        if sig:
+            direction = "شراء" if sig.side == "BUY" else "بيع"
+            print(
+                f"[📢 ICT] {symbol} ({timeframe}) — {direction} @ {_fmt(sig.entry)} | "
+                f"SL {_fmt(sig.stop)} — {sig.strategy} — {sig.reason}",
+                flush=True,
+            )
+            return 1
+    except Exception as exc:
+        print(f"[STRATEGY] {symbol}: {exc}", file=sys.stderr)
+    return 0
+
+
 def _parse_args_android():
     import argparse
     p = argparse.ArgumentParser(prog="SMC Binance Scanner (Android single-file)")
@@ -10829,6 +10873,7 @@ def _android_cli_entry() -> int:
                     except Exception:
                         pass
 
+                alerts_total += _run_strategy_autorun(sym, args.timeframe, runtime)
                 if recent_alerts or args.verbose:
                     _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
                     alerts_total += len(recent_alerts)
@@ -10901,10 +10946,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Literal
 
 # -------- إعدادات إفتراضية للتشغيل التلقائي من المحرّر --------
-DEFAULT_STRATEGY: str = "ICT 2022"   # بدّلها إلى أي اسم من القائمة المسموح بها أدناه
-DEFAULT_EQUITY: float = 100.0        # الرصيد بالدولار
-DEFAULT_RISK: float = 2.0            # نسبة المخاطرة لكل صفقة (%)
-DEFAULT_NY_OFFSET: int = -4          # إزاحة نيويورك عن UTC (تقريبية، بدون DST)
+DEFAULT_STRATEGY: str = STRATEGY_AUTORUN_DEFAULTS.strategy   # بدّلها إلى أي اسم من القائمة المسموح بها أدناه
+DEFAULT_EQUITY: float = STRATEGY_AUTORUN_DEFAULTS.equity     # الرصيد بالدولار
+DEFAULT_RISK: float = STRATEGY_AUTORUN_DEFAULTS.risk_pct     # نسبة المخاطرة لكل صفقة (%)
+DEFAULT_NY_OFFSET: int = STRATEGY_AUTORUN_DEFAULTS.ny_offset # إزاحة نيويورك عن UTC (تقريبية، بدون DST)
 DEFAULT_SYMBOLS: str = "BTCUSDT"     # رموز مفصولة بفواصل
 DEFAULT_START: str = "2022-01-01"    # بداية الباكتيست
 DEFAULT_END: str   = "2023-12-31"    # نهاية الباكتيست
