@@ -152,8 +152,8 @@ class AlertToggleConfig:
     low_liquidity_level_break: bool = False
     golden_zone_created: bool = True
     golden_zone_first_touch: bool = True
-    idm_ob_created: bool = False
-    ext_ob_created: bool = False
+    idm_ob_created: bool = True
+    ext_ob_created: bool = True
     ext_ob_first_touch: bool = True
     idm_ob_first_touch: bool = True
     hist_ext_ob_first_touch: bool = True
@@ -1792,8 +1792,11 @@ class SmartMoneyAlgoProE5:
             payload = value.copy()
             if "time" in payload and "time_display" not in payload:
                 payload["time_display"] = format_timestamp(payload.get("time"))
-            if not self._console_event_within_age(payload.get("time")):
+
+            is_alert = isinstance(key, str) and key.startswith("ALERT_")
+            if not is_alert and not self._console_event_within_age(payload.get("time")):
                 continue
+
             events[key] = payload
 
         def record_label(
