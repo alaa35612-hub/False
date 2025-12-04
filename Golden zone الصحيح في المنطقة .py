@@ -1936,6 +1936,66 @@ class SmartMoneyAlgoProE5:
                 "status_display": payload.get("status_display"),
             }
 
+        def _record_latest_from_candidates(
+            target_key: str,
+            label: str,
+            candidates: Sequence[str],
+        ) -> None:
+            if target_key in events:
+                return
+
+            chosen: Optional[Dict[str, Any]] = None
+            for candidate in candidates:
+                payload = events.get(candidate) or self.console_event_log.get(candidate)
+                if not isinstance(payload, dict):
+                    continue
+                ts = payload.get("time")
+                if chosen is None:
+                    chosen = payload
+                    continue
+                prev_ts = chosen.get("time")
+                if isinstance(ts, (int, float)) and isinstance(prev_ts, (int, float)) and ts > prev_ts:
+                    chosen = payload
+            if not chosen:
+                return
+
+            events[target_key] = {
+                "text": chosen.get("text") or label,
+                "price": chosen.get("price"),
+                "display": chosen.get("display") or label,
+                "time": chosen.get("time"),
+                "time_display": chosen.get("time_display") or format_timestamp(chosen.get("time")),
+                "direction": chosen.get("direction"),
+                "status": chosen.get("status"),
+                "status_display": chosen.get("status_display"),
+            }
+
+        _record_latest_from_candidates(
+            "IDM_OB_CREATED",
+            "IDM OB Created",
+            ["IDM_OB", "ALERT_IDM_OB_ZONE_CREATED"],
+        )
+        _record_latest_from_candidates(
+            "EXT_OB_CREATED",
+            "EXT OB Created",
+            ["EXT_OB", "ALERT_EXT_OB_ZONE_CREATED"],
+        )
+        _record_latest_from_candidates(
+            "FVG",
+            "FVG",
+            ["ALERT_BULLISH_FVG", "ALERT_BEARISH_FVG"],
+        )
+        _record_latest_from_candidates(
+            "FVG_BREAK",
+            "FVG Break",
+            ["ALERT_BULLISH_FVG_BREAK", "ALERT_BEARISH_FVG_BREAK"],
+        )
+        _record_latest_from_candidates(
+            "SWEEP",
+            "Sweep",
+            ["ALERT_BULLISH_SWEEP", "ALERT_BEARISH_SWEEP"],
+        )
+
         return events
 
     def _sync_state_mirrors(self) -> None:
@@ -8899,6 +8959,8 @@ EVENT_DISPLAY_ORDER = [
     ("ALERT_GOLDEN_ZONE_CREATED_UNTOUCHED", "Golden Zone Created (Untouched)"),
     ("ALERT_IDM_OB_ZONE_CREATED", "IDM OB Zone Created"),
     ("ALERT_EXT_OB_ZONE_CREATED", "EXT OB Zone Created"),
+    ("IDM_OB_CREATED", "IDM OB Created"),
+    ("EXT_OB_CREATED", "EXT OB Created"),
     ("ALERT_GOLDEN_ZONE_FIRST_TOUCH", "Golden Zone First Touch"),
     ("ALERT_EXT_OB_FIRST_TOUCH", "EXT OB First Touch"),
     ("ALERT_IDM_OB_FIRST_TOUCH", "IDM OB First Touch"),
@@ -8917,10 +8979,13 @@ EVENT_DISPLAY_ORDER = [
     ("ALERT_BEARISH_OB_BREAK", "Bearish OB Break"),
     ("ALERT_BULLISH_SWEEP", "Bullish Sweep"),
     ("ALERT_BEARISH_SWEEP", "Bearish Sweep"),
+    ("SWEEP", "Sweep"),
     ("ALERT_BULLISH_FVG", "Bullish FVG"),
     ("ALERT_BEARISH_FVG", "Bearish FVG"),
+    ("FVG", "FVG"),
     ("ALERT_BULLISH_FVG_BREAK", "Bullish FVG Break"),
     ("ALERT_BEARISH_FVG_BREAK", "Bearish FVG Break"),
+    ("FVG_BREAK", "FVG Break"),
     ("ALERT_HIGH_LIQUIDITY_LEVEL", "High Liquidity Level"),
     ("ALERT_LOW_LIQUIDITY_LEVEL", "Low Liquidity Level"),
     ("ALERT_HIGH_LIQUIDITY_LEVEL_BREAK", "High Liquidity Level Break"),
