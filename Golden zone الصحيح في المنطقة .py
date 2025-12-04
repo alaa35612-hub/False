@@ -8896,6 +8896,41 @@ EVENT_DISPLAY_ORDER = [
 ]
 
 
+EVENT_LABEL_MAP = dict(EVENT_DISPLAY_ORDER)
+
+
+def _format_event_display_with_price(event: Dict[str, Any], fallback_label: str) -> str:
+    """Return a human-friendly event string that always includes name and price."""
+
+    if not isinstance(event, dict):
+        return fallback_label
+
+    name = (event.get("text") or event.get("title") or fallback_label or "").strip()
+    price = event.get("price")
+    price_display = None
+    if isinstance(price, (list, tuple)) and len(price) == 2:
+        price_display = " → ".join(format_price(p) for p in price)
+    elif isinstance(price, (int, float)):
+        price_display = format_price(price)
+    elif isinstance(price, str) and price.strip():
+        price_display = price.strip()
+
+    display_text = (event.get("display") or "").strip()
+    base_display = display_text or name or fallback_label
+
+    if name and name.lower() not in base_display.lower():
+        base_display = f"{name}: {base_display}" if base_display else name
+
+    if price_display and price_display not in base_display:
+        separator = " → " if "→" in price_display else " @ "
+        if "→" in price_display and name:
+            base_display = f"{name}: {price_display}"
+        else:
+            base_display = f"{base_display}{separator}{price_display}".strip()
+
+    return base_display
+
+
 def print_symbol_summary(index: int, symbol: str, timeframe: str, candle_count: int, metrics: Dict[str, Any]) -> None:
     header_color = ANSI_HEADER_COLORS[index % len(ANSI_HEADER_COLORS)]
     symbol_display = _format_symbol(symbol)
@@ -8929,13 +8964,7 @@ def print_symbol_summary(index: int, symbol: str, timeframe: str, candle_count: 
     for key, label in EVENT_DISPLAY_ORDER:
         event = latest_events.get(key)
         if event:
-            display_text = event.get("display")
-            if display_text is None:
-                price = event.get("price")
-                if isinstance(price, tuple):
-                    display_text = " → ".join(format_price(p) for p in price)
-                else:
-                    display_text = format_price(price if isinstance(price, (int, float)) else None)
+            display_text = _format_event_display_with_price(event, label)
             status_display = event.get("status_display")
             if status_display:
                 display_text = f"{display_text} [{status_display}]"
@@ -10086,7 +10115,7 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
         for key in summary_keys:
             if key in latest:
                 evt = latest[key]
-                disp = evt.get("display", "")
+                disp = _format_event_display_with_price(evt, EVENT_LABEL_MAP.get(key, key))
                 status_disp = evt.get("status_display")
                 if status_disp:
                     disp = f"{disp} [{status_disp}]"
