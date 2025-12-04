@@ -9051,10 +9051,11 @@ def _is_price_inside_golden_zone(metrics: Dict[str, Any]) -> bool:
 
     latest_bar_time = metrics.get("latest_bar_time")
     gz_time = gz.get("time")
-    if not isinstance(latest_bar_time, (int, float)) or not isinstance(gz_time, (int, float)):
-        return False
-    if int(gz_time) != int(latest_bar_time):
-        return False
+    if isinstance(latest_bar_time, (int, float)) and isinstance(gz_time, (int, float)):
+        # يُسمَح ببقاء منطقة Golden Zone نشطة بعد الشمعة التي أُنشئت عندها؛
+        # نتحقق فقط من أن زمن المنطقة ليس مستقبليًا.
+        if gz_time > latest_bar_time:
+            return False
 
     bounds = gz.get("price")
     if not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
