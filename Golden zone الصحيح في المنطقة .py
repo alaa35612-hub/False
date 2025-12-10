@@ -9099,6 +9099,57 @@ def _collect_recent_event_hits(
     return hits, recent_times
 
 
+def _detect_area_hotspots(
+    metrics: Dict[str, Any],
+    latest_events: Dict[str, Any],
+    recent_times: Sequence[int],
+) -> List[str]:
+    """Identify symbols sitting inside high-interest regions.
+
+    The scan treats the following as hotspots:
+    - Golden Zone/Equilibrium touches (via :func:`_is_price_inside_golden_zone`).
+    - Mark "X" labels printed in the most recent candles.
+    - Active FVG gaps (bullish or bearish counters).
+    - Visible liquidity levels.
+    - Order Flow boxes (covers both minor/major OF settings).
+    """
+
+    def _has_recent_event(key: str) -> bool:
+        event = latest_events.get(key)
+        timestamp = None
+        if isinstance(event, dict):
+            timestamp = event.get("time") or event.get("ts") or event.get("timestamp")
+        return isinstance(timestamp, (int, float)) and int(timestamp) in set(int(t) for t in recent_times)
+
+    hotspots: List[str] = []
+
+    if _is_price_inside_golden_zone(metrics):
+        hotspots.append("Golden Zone / Equilibrium")
+
+    if _has_recent_event("X"):
+        hotspots.append("Mark X")
+
+    try:
+        if float(metrics.get("bullish_fvg", 0)) > 0 or float(metrics.get("bearish_fvg", 0)) > 0:
+            hotspots.append("FVG")
+    except Exception:
+        pass
+
+    try:
+        if float(metrics.get("liquidity_objects", 0)) > 0:
+            hotspots.append("Liquidity")
+    except Exception:
+        pass
+
+    try:
+        if float(metrics.get("order_flow_boxes", 0)) > 0:
+            hotspots.append("Order Flow (Minor/Major)")
+    except Exception:
+        pass
+
+    return hotspots
+
+
 def scan_binance(
     timeframe: str,
     limit: int,
@@ -10041,9 +10092,10 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
         recent_hits, recent_times = _collect_recent_event_hits(
             runtime.series, latest, bars=recent_window
         )
-        if not recent_hits:
+        area_hits = _detect_area_hotspots(metrics, latest, recent_times)
+        if not recent_hits and not area_hits:
             print(
-                f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال آخر {recent_window} شموع"
+                f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث أو مناطق FVG/سيولة/Order Flow خلال آخر {recent_window} شموع"
             )
             continue
 
@@ -10076,6 +10128,15 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
                         fallback=None,
                     )
                 )
+
+        if area_hits:
+            summary.append(
+                _colorize_directional_text(
+                    " / ".join(area_hits),
+                    direction=None,
+                    fallback=ANSI_VALUE_POS,
+                )
+            )
 
         if recent_alerts or args.verbose:
             _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
@@ -10842,14 +10903,15 @@ def _android_cli_entry() -> int:
                 metrics = runtime.gather_console_metrics()
                 latest_events = metrics.get("latest_events") or {}
                 target_keys = {"GOLDEN_ZONE", "EXT_OB", "IDM_OB", "HIST_EXT_OB", "HIST_IDM_OB"}
-                recent_hits, _ = _collect_recent_event_hits(
+                recent_hits, recent_times = _collect_recent_event_hits(
                     runtime.series,
                     latest_events,
                     bars=recent_window,
                     allowed_keys=target_keys,
                     required_status="touched",
                 )
-                if not recent_hits:
+                area_hits = _detect_area_hotspots(metrics, latest_events, recent_times)
+                if not recent_hits and not area_hits:
                     if recent_window == 1:
                         span_phrase = "آخر شمعة واحدة"
                     elif recent_window == 2:
@@ -10857,7 +10919,7 @@ def _android_cli_entry() -> int:
                     else:
                         span_phrase = f"آخر {recent_window} شموع"
                     print(
-                        f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال {span_phrase}"
+                        f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث أو مناطق FVG/سيولة/Order Flow خلال {span_phrase}"
                     )
                     continue
 
@@ -10874,6 +10936,8 @@ def _android_cli_entry() -> int:
                         pass
 
                 alerts_total += _run_strategy_autorun(sym, args.timeframe, runtime)
+                if area_hits:
+                    print("  •", " / ".join(area_hits))
                 if recent_alerts or args.verbose:
                     _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
                     alerts_total += len(recent_alerts)
