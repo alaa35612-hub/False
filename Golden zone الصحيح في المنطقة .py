@@ -9100,7 +9100,7 @@ def _collect_recent_event_hits(
 
 def _detect_area_hotspots(
     metrics: Dict[str, Any],
-    latest_events: Dict[str, Any],
+    latest_events: Optional[Dict[str, Any]],
     recent_times: Sequence[int],
 ) -> List[str]:
     """Identify symbols sitting inside high-interest regions.
@@ -9113,12 +9113,15 @@ def _detect_area_hotspots(
     - Order Flow boxes (covers both minor/major OF settings).
     """
 
+    latest_events = latest_events or {}
+    recent_int_times: Set[int] = {int(t) for t in recent_times if isinstance(t, (int, float))}
+
     def _has_recent_event(key: str) -> bool:
         event = latest_events.get(key)
         timestamp = None
         if isinstance(event, dict):
             timestamp = event.get("time") or event.get("ts") or event.get("timestamp")
-        return isinstance(timestamp, (int, float)) and int(timestamp) in set(int(t) for t in recent_times)
+        return isinstance(timestamp, (int, float)) and int(timestamp) in recent_int_times
 
     hotspots: List[str] = []
 
