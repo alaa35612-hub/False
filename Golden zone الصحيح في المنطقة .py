@@ -859,7 +859,7 @@ class DemandSupplyInputs:
 
 @dataclass
 class FVGInputs:
-    show_fvg: bool = False
+    show_fvg: bool = True
     i_tf: str = ""
     i_mtf: str = "HTF"
     i_bullishfvgcolor: str = "color.new(color.green,100)"
@@ -886,7 +886,7 @@ class FVGInputs:
 
 @dataclass
 class LiquidityInputs:
-    currentTF: bool = False
+    currentTF: bool = True
     displayLimit: int = 20
     lowLineColorHTF: str = "#00bbf94d"
     highLineColorHTF: str = "#e91e624d"
@@ -907,7 +907,7 @@ class LiquidityInputs:
 
 @dataclass
 class OrderFlowInputs:
-    showMajoinMiner: bool = False
+    showMajoinMiner: bool = True
     showISOB: bool = True
     showMajoinMinerMax: int = 10
     showISOBMax: int = 10
@@ -952,7 +952,7 @@ class StructureInputs:
     showMid: bool = True
     lengMid: int = 40
     showSw: bool = True
-    markX: bool = False
+    markX: bool = True
     colorSweep: str = "color.gray"
     showTP: bool = False
 
@@ -963,7 +963,7 @@ class ICTMarketStructureInputs:
     bosColor1: str = "color.green"
     bosColor2: str = "color.red"
     ms_type: str = "All"
-    show_equal_highlow: bool = False
+    show_equal_highlow: bool = True
     eq_bear_color: str = "#787b86"
     eq_bull_color: str = "#787b86"
     eq_threshold: float = 0.3
@@ -1672,7 +1672,36 @@ class SmartMoneyAlgoProE5:
         metrics["ext_ob_touched"] = _status_total(ext_counter, "touched", "retest")
         metrics["current_price"] = self.series.get("close")
         metrics["latest_bar_time"] = self.series.get_time()
-        metrics["latest_events"] = self._collect_latest_console_events()
+        base_events = self._collect_latest_console_events()
+
+        def _add_hotspot(key: str, label: str) -> None:
+            price_val = self.series.get("close")
+            ts_val = self.series.get_time()
+            display_price = format_price(price_val) if isinstance(price_val, (int, float)) else "N/A"
+            base_events[key] = {
+                "text": label,
+                "price": price_val,
+                "time": ts_val,
+                "time_display": format_timestamp(ts_val),
+                "display": f"{label} @ {display_price}",
+            }
+
+        if (metrics.get("bullish_fvg", 0) or metrics.get("bearish_fvg", 0)):
+            _add_hotspot("FVG", "FVG")
+
+        if metrics.get("liquidity_objects", 0):
+            _add_hotspot("LIQUIDITY", "Liquidity")
+
+        if metrics.get("order_flow_minor_boxes", 0):
+            _add_hotspot("ORDER_FLOW_MINOR", "Order Flow (Minor OF)")
+
+        if metrics.get("order_flow_major_boxes", 0):
+            _add_hotspot("ORDER_FLOW_MAJOR", "Order Flow (Major OF)")
+
+        if _is_price_inside_golden_zone({**metrics, "latest_events": base_events}):
+            _add_hotspot("GOLDEN_ZONE", "Equilibrium")
+
+        metrics["latest_events"] = {k: v for k, v in base_events.items() if k in ALLOWED_HOTSPOT_KEYS}
         return metrics
 
     def _register_label_event(self, label: Label) -> None:
@@ -8846,59 +8875,24 @@ def run_runtime_from_file(
 
 
 METRIC_LABELS = [
-    ("alerts", "عدد التنبيهات"),
-    ("pullback_arrows", "إشارات Pullback"),
-    ("choch_labels", "علامات CHoCH"),
-    ("bos_labels", "علامات BOS"),
-    ("idm_labels", "علامات IDM"),
-    ("demand_zones", "مناطق الطلب"),
-    ("supply_zones", "مناطق العرض"),
-    ("idm_ob_new", "IDM OB تم إنشائها حديثاً"),
-    ("idm_ob_touched", "IDM OB تم ملامستها"),
-    ("ext_ob_new", "EXT OB تم إنشائها حديثاً"),
-    ("ext_ob_touched", "EXT OB تم ملامستها"),
     ("bullish_fvg", "فجوات FVG صاعدة"),
     ("bearish_fvg", "فجوات FVG هابطة"),
-    ("order_flow_boxes", "صناديق Order Flow"),
-    ("liquidity_objects", "مستويات السيولة"),
-    ("scob_colored_bars", "شموع SCOB"),
+    ("liquidity_objects", "مناطق السيولة"),
+    ("order_flow_minor_boxes", "Order Flow (Minor)",),
+    ("order_flow_major_boxes", "Order Flow (Major)",),
 ]
 
 
 EVENT_DISPLAY_ORDER = [
-    ("BOS", "BOS"),
-    ("BOS_PLUS", "BOS+"),
-    ("CHOCH", "CHOCH"),
-    ("MSS_PLUS", "MSS+"),
-    ("MSS", "MSS"),
-    ("IDM", "IDM"),
-    ("IDM_OB", "IDM OB"),
-    ("EXT_OB", "EXT OB"),
-    ("HIST_IDM_OB", "Hist IDM OB"),
-    ("HIST_EXT_OB", "Hist EXT OB"),
-    ("GOLDEN_ZONE", "Golden zone"),
-    ("X", "X"),
-    ("RED_CIRCLE", "الدوائر الحمراء"),
-    ("GREEN_CIRCLE", "الدوائر الخضراء"),
-    ("FUTURE_BOS", "ليبل BOS المستقبلي"),
-    ("FUTURE_CHOCH", "ليبل CHOCH المستقبلي"),
-    ("ALERT_BEARISH_EXTERNAL_OB", "Bearish External OB"),
-    ("ALERT_BULLISH_EXTERNAL_OB", "Bullish External OB"),
-    ("ALERT_BEARISH_INTERNAL_OB", "Bearish Internal OB"),
-    ("ALERT_BULLISH_INTERNAL_OB", "Bullish Internal OB"),
-    ("ALERT_BULLISH_OB_BREAK", "Bullish OB Break"),
-    ("ALERT_BEARISH_OB_BREAK", "Bearish OB Break"),
-    ("ALERT_BULLISH_SWEEP", "Bullish Sweep"),
-    ("ALERT_BEARISH_SWEEP", "Bearish Sweep"),
-    ("ALERT_BULLISH_FVG", "Bullish FVG"),
-    ("ALERT_BEARISH_FVG", "Bearish FVG"),
-    ("ALERT_BULLISH_FVG_BREAK", "Bullish FVG Break"),
-    ("ALERT_BEARISH_FVG_BREAK", "Bearish FVG Break"),
-    ("ALERT_HIGH_LIQUIDITY_LEVEL", "High Liquidity Level"),
-    ("ALERT_LOW_LIQUIDITY_LEVEL", "Low Liquidity Level"),
-    ("ALERT_HIGH_LIQUIDITY_LEVEL_BREAK", "High Liquidity Level Break"),
-    ("ALERT_LOW_LIQUIDITY_LEVEL_BREAK", "Low Liquidity Level Break"),
+    ("GOLDEN_ZONE", "Equilibrium"),
+    ("X", "Mark X"),
+    ("FVG", "FVG"),
+    ("LIQUIDITY", "Liquidity"),
+    ("ORDER_FLOW_MINOR", "Order Flow (Minor OF)"),
+    ("ORDER_FLOW_MAJOR", "Order Flow (Major OF)"),
 ]
+
+ALLOWED_HOTSPOT_KEYS: Set[str] = {key for key, _ in EVENT_DISPLAY_ORDER}
 
 
 def print_symbol_summary(index: int, symbol: str, timeframe: str, candle_count: int, metrics: Dict[str, Any]) -> None:
@@ -9686,7 +9680,7 @@ def _parse_args_android() -> Tuple[_CLISettings, argparse.Namespace]:
     p.add_argument("--show-isob", dest="show_isob", action="store_true")
     p.add_argument("--no-isob", dest="show_isob", action="store_false")
     p.set_defaults(show_isob=None)
-    p.add_argument("--show-major-minor", action="store_true", default=False)
+    p.add_argument("--show-major-minor", action="store_true", default=True)
     p.add_argument("--show-circle-hl", action="store_true", default=True)
     p.add_argument("--no-smc", action="store_true")
     p.add_argument("--leng-smc", type=int, default=40)
@@ -10070,7 +10064,10 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
         demand_supply=ds,
         order_block=ob,
         structure_util=utils,
-        ict_structure=ICTMarketStructureInputs(swingSize=int(cfg.swing_size)),
+        ict_structure=ICTMarketStructureInputs(
+            swingSize=int(cfg.swing_size),
+            show_equal_highlow=bool(getattr(cfg, "show_equilibrium", True)),
+        ),
     )
 
     # Run loop
@@ -10140,7 +10137,7 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
         if area_hits:
             price = metrics.get("current_price")
             if isinstance(price, (int, float)) and not math.isnan(price):
-                price_info = f" @ {price}"
+                price_info = f" @ {format_price(price)}"
             else:
                 price_info = ""
             area_text = " / ".join(area_hits)
@@ -10483,7 +10480,7 @@ class Settings:
         self.showHL = kw.get("showHL", False)
         self.showMn = kw.get("showMn", False)
         self.showISOB = kw.get("showISOB", True)
-        self.showMajoinMiner = kw.get("showMajoinMiner", False)
+        self.showMajoinMiner = kw.get("showMajoinMiner", True)
         self.showCircleHL = kw.get("showCircleHL", True)
         self.showSMC = kw.get("showSMC", True)
         self.lengSMC = kw.get("lengSMC", 40)
@@ -10492,6 +10489,7 @@ class Settings:
         self.show_fvg = kw.get("show_fvg", True)
         self.show_liquidity = kw.get("show_liquidity", True)
         self.liquidity_display_limit = kw.get("liquidity_display_limit", 20)
+        self.show_equilibrium = kw.get("show_equilibrium", True)
         self.bos_confirmation = kw.get("bos_confirmation", "Close")
         self.ob_test_mode = kw.get("ob_test_mode", "CLOSE")
         self.show_brk_ob = kw.get("show_brk_ob", True)
@@ -10604,7 +10602,7 @@ def _parse_args_android():
     p.add_argument("--show-isob", dest="show_isob", action="store_true")
     p.add_argument("--no-isob", dest="show_isob", action="store_false")
     p.set_defaults(show_isob=None)
-    p.add_argument("--show-major-minor", action="store_true", default=False)
+    p.add_argument("--show-major-minor", action="store_true", default=True)
     p.add_argument("--show-circle-hl", action="store_true", default=True)
     p.add_argument("--no-smc", action="store_true")
     p.add_argument("--leng-smc", type=int, default=40)
@@ -10869,7 +10867,10 @@ def _android_cli_entry() -> int:
         markX=cfg.show_mark_x,
         enable_alert_ote_touch=getattr(cfg, "enable_alert_ote_touch", True),
     )
-    ict = ICTMarketStructureInputs(swingSize=int(cfg.swing_size))
+    ict = ICTMarketStructureInputs(
+        swingSize=int(cfg.swing_size),
+        show_equal_highlow=bool(getattr(cfg, "show_equilibrium", True)),
+    )
 
     inputs = IndicatorInputs(
         pullback=pullback, structure=structure, order_flow=order_flow,
