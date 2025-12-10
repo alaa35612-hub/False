@@ -9110,6 +9110,194 @@ def _is_price_inside_golden_zone(metrics: Dict[str, Any]) -> bool:
     return lower <= price <= upper
 
 
+def _event_time(latest_events: Dict[str, Any], keys: Sequence[str]) -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[int]]:
+    """Return the first matching event and its timestamp from ``latest_events``.
+
+    Parameters
+    ----------
+    latest_events:
+        Dictionary produced by ``_collect_latest_console_events``.
+    keys:
+        Ordered list of candidate keys to look for.
+    """
+
+    if not isinstance(latest_events, dict):
+        return None, None, None
+    for key in keys:
+        evt = latest_events.get(key)
+        if not isinstance(evt, dict):
+            continue
+        ts = evt.get("time")
+        if isinstance(ts, (int, float)):
+            return key, evt, int(ts)
+    return None, None, None
+
+
+def _event_matches_direction(evt: Dict[str, Any], direction: str) -> bool:
+    """Check if an event dictionary implies the requested direction."""
+
+    if not isinstance(evt, dict):
+        return False
+    dir_value = str(evt.get("direction", "")).lower()
+    dir_disp = str(evt.get("direction_display", "")).lower()
+    if direction == "bullish":
+        return "bull" in dir_value or "صاعد" in dir_disp
+    if direction == "bearish":
+        return "bear" in dir_value or "هابط" in dir_disp
+    return False
+
+
+def _event_within_recent_bars(series: Any, event_time: Optional[int], bars: int) -> bool:
+    """Validate that ``event_time`` falls within the latest ``bars`` candles."""
+
+    if bars <= 0 or event_time is None:
+        return True
+    try:
+        length = series.length()
+    except Exception:
+        return True
+    if not isinstance(length, int) or length <= 0:
+        return True
+    cutoff_idx = max(0, length - bars)
+    try:
+        cutoff_time = series.get_time(cutoff_idx)
+    except Exception:
+        cutoff_time = None
+    if not isinstance(cutoff_time, (int, float)):
+        return True
+    return int(event_time) >= int(cutoff_time)
+
+
+def is_bullish_sequence(metrics: Dict[str, Any], series: Any = None, recent_bars: int = 0) -> Optional[Dict[str, Any]]:
+    """Return metadata when the bullish five-step sequence is satisfied.
+
+    Steps (must occur in order on the same swing):
+    1) Sell-side liquidity sweep.
+    2) Bullish POI/OB forms after the sweep.
+    3) Bullish CHOCH following the POI.
+    4) Bullish imbalance (FVG) in the new direction.
+    5) Price revisits the imbalance with a reaction (FVG break/retest).
+    """
+
+    latest_events = metrics.get("latest_events") if isinstance(metrics, dict) else None
+    if not isinstance(latest_events, dict):
+        return None
+
+    sweep_key, sweep_evt, sweep_time = _event_time(latest_events, ("ALERT_BULLISH_SWEEP", "BULLISH_SWEEP"))
+    if sweep_evt is None:
+        return None
+
+    poi_key, poi_evt, poi_time = _event_time(
+        latest_events,
+        (
+            "ALERT_BULLISH_EXTERNAL_OB",
+            "ALERT_BULLISH_INTERNAL_OB",
+            "EXT_OB",
+            "IDM_OB",
+            "HIST_EXT_OB",
+            "HIST_IDM_OB",
+        ),
+    )
+    if poi_evt is None or poi_time is None or (sweep_time is not None and poi_time < sweep_time):
+        return None
+
+    choch_key, choch_evt, choch_time = _event_time(latest_events, ("CHOCH",))
+    if choch_evt is None or choch_time is None or not _event_matches_direction(choch_evt, "bullish"):
+        return None
+    if choch_time < poi_time:
+        return None
+
+    imb_key, imb_evt, imb_time = _event_time(latest_events, ("ALERT_BULLISH_FVG", "BULLISH_FVG"))
+    if imb_evt is None or imb_time is None or imb_time < choch_time:
+        return None
+
+    retest_key, retest_evt, retest_time = _event_time(
+        latest_events, ("ALERT_BULLISH_FVG_BREAK", "BULLISH_FVG_BREAK")
+    )
+    if retest_evt is None or retest_time is None or retest_time < imb_time:
+        return None
+
+    if series is not None and not _event_within_recent_bars(series, retest_time, recent_bars):
+        return None
+
+    return {
+        "direction": "bullish",
+        "last_time": retest_time,
+        "events": {
+            "sweep": (sweep_key, sweep_evt),
+            "poi": (poi_key, poi_evt),
+            "choch": (choch_key, choch_evt),
+            "imbalance": (imb_key, imb_evt),
+            "retest": (retest_key, retest_evt),
+        },
+    }
+
+
+def is_bearish_sequence(metrics: Dict[str, Any], series: Any = None, recent_bars: int = 0) -> Optional[Dict[str, Any]]:
+    """Return metadata when the bearish five-step sequence is satisfied.
+
+    Steps (must occur in order on the same swing):
+    1) Buy-side liquidity sweep.
+    2) Bearish POI/OB forms after the sweep.
+    3) Bearish CHOCH following the POI.
+    4) Bearish imbalance (FVG) in the new direction.
+    5) Price revisits the imbalance with a reaction (FVG break/retest).
+    """
+
+    latest_events = metrics.get("latest_events") if isinstance(metrics, dict) else None
+    if not isinstance(latest_events, dict):
+        return None
+
+    sweep_key, sweep_evt, sweep_time = _event_time(latest_events, ("ALERT_BEARISH_SWEEP", "BEARISH_SWEEP"))
+    if sweep_evt is None:
+        return None
+
+    poi_key, poi_evt, poi_time = _event_time(
+        latest_events,
+        (
+            "ALERT_BEARISH_EXTERNAL_OB",
+            "ALERT_BEARISH_INTERNAL_OB",
+            "EXT_OB",
+            "IDM_OB",
+            "HIST_EXT_OB",
+            "HIST_IDM_OB",
+        ),
+    )
+    if poi_evt is None or poi_time is None or (sweep_time is not None and poi_time < sweep_time):
+        return None
+
+    choch_key, choch_evt, choch_time = _event_time(latest_events, ("CHOCH",))
+    if choch_evt is None or choch_time is None or not _event_matches_direction(choch_evt, "bearish"):
+        return None
+    if choch_time < poi_time:
+        return None
+
+    imb_key, imb_evt, imb_time = _event_time(latest_events, ("ALERT_BEARISH_FVG", "BEARISH_FVG"))
+    if imb_evt is None or imb_time is None or imb_time < choch_time:
+        return None
+
+    retest_key, retest_evt, retest_time = _event_time(
+        latest_events, ("ALERT_BEARISH_FVG_BREAK", "BEARISH_FVG_BREAK")
+    )
+    if retest_evt is None or retest_time is None or retest_time < imb_time:
+        return None
+
+    if series is not None and not _event_within_recent_bars(series, retest_time, recent_bars):
+        return None
+
+    return {
+        "direction": "bearish",
+        "last_time": retest_time,
+        "events": {
+            "sweep": (sweep_key, sweep_evt),
+            "poi": (poi_key, poi_evt),
+            "choch": (choch_key, choch_evt),
+            "imbalance": (imb_key, imb_evt),
+            "retest": (retest_key, retest_evt),
+        },
+    }
+
+
 def _collect_recent_event_hits(
     series: Any,
     latest_events: Any,
@@ -9257,30 +9445,20 @@ def scan_binance(
         runtime.console_max_age_bars = max(runtime.console_max_age_bars, window)
         runtime.process(candles)
         metrics = runtime.gather_console_metrics()
-        latest_events = metrics.get("latest_events") or {}
-        target_keys = {"GOLDEN_ZONE", "EXT_OB", "IDM_OB", "HIST_EXT_OB", "HIST_IDM_OB"}
-        recent_hits, recent_times = _collect_recent_event_hits(
-            runtime.series,
-            latest_events,
-            bars=window,
-            allowed_keys=target_keys,
-            required_status="touched",
-            current_price=metrics.get("current_price"),
-            require_price_in_range=True,
-        )
-        if not recent_hits:
+        bull_seq = is_bullish_sequence(metrics, runtime.series, window)
+        bear_seq = is_bearish_sequence(metrics, runtime.series, window)
+        if not (bull_seq or bear_seq):
             print(
-                f"تخطي {_format_symbol(symbol)} لعدم وجود أحداث خلال آخر {window} شموع",
+                f"تخطي {_format_symbol(symbol)} لعدم تحقق تسلسل السيولة → POI → CHOCH → FVG → إعادة اختبار خلال آخر {window} شموع",
                 flush=True,
             )
             if tracer and tracer.enabled:
                 tracer.log(
                     "scan",
-                    "symbol_skipped_stale_events",
+                    "symbol_skipped_missing_sequence",
                     timestamp=runtime.series.get_time(0) or None,
                     symbol=symbol,
                     timeframe=timeframe,
-                    reference_times=recent_times,
                     window=window,
                 )
             return None
@@ -10118,19 +10296,11 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
 
         metrics = runtime.gather_console_metrics()
         latest = metrics.get("latest_events", {})
-        target_keys = {"GOLDEN_ZONE", "EXT_OB", "IDM_OB", "HIST_EXT_OB", "HIST_IDM_OB"}
-        recent_hits, recent_times = _collect_recent_event_hits(
-            runtime.series,
-            latest,
-            bars=recent_window,
-            allowed_keys=target_keys,
-            required_status="touched",
-            current_price=metrics.get("current_price"),
-            require_price_in_range=True,
-        )
-        if not recent_hits:
+        bull_seq = is_bullish_sequence(metrics, runtime.series, recent_window)
+        bear_seq = is_bearish_sequence(metrics, runtime.series, recent_window)
+        if not (bull_seq or bear_seq):
             print(
-                f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال آخر {recent_window} شموع"
+                f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم تحقق تسلسل السيولة → POI → CHOCH → FVG → إعادة اختبار خلال آخر {recent_window} شموع"
             )
             continue
 
