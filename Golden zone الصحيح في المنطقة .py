@@ -9098,11 +9098,11 @@ def _collect_recent_event_hits(
     return hits, recent_times
 
 
-    def _detect_area_hotspots(
-        metrics: Dict[str, Any],
-        latest_events: Dict[str, Any],
-        recent_times: Sequence[int],
-    ) -> List[str]:
+def _detect_area_hotspots(
+    metrics: Dict[str, Any],
+    latest_events: Dict[str, Any],
+    recent_times: Sequence[int],
+) -> List[str]:
     """Identify symbols sitting inside high-interest regions.
 
     The scan treats the following as hotspots:
