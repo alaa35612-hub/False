@@ -11077,18 +11077,11 @@ def _android_cli_entry() -> int:
                     continue
 
                 metrics = runtime.gather_console_metrics()
-                latest_events = metrics.get("latest_events") or {}
-                target_keys = {"GOLDEN_ZONE", "EXT_OB", "IDM_OB", "HIST_EXT_OB", "HIST_IDM_OB"}
-                recent_hits, _ = _collect_recent_event_hits(
-                    runtime.series,
-                    latest_events,
-                    bars=recent_window,
-                    allowed_keys=target_keys,
-                    required_status="touched",
-                    current_price=metrics.get("current_price"),
-                    require_price_in_range=True,
-                )
-                if not recent_hits:
+
+                bull_seq = is_bullish_sequence(metrics, runtime.series, recent_window)
+                bear_seq = is_bearish_sequence(metrics, runtime.series, recent_window)
+
+                if not (bull_seq or bear_seq):
                     if recent_window == 1:
                         span_phrase = "آخر شمعة واحدة"
                     elif recent_window == 2:
@@ -11096,7 +11089,8 @@ def _android_cli_entry() -> int:
                     else:
                         span_phrase = f"آخر {recent_window} شموع"
                     print(
-                        f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال {span_phrase}"
+                        f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} "
+                        f"لعدم تحقق تسلسل السيولة → POI → CHOCH → FVG → إعادة اختبار خلال {span_phrase}"
                     )
                     continue
 
