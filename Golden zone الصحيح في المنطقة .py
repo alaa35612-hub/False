@@ -10304,6 +10304,15 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
             )
             continue
 
+        if bull_seq:
+            print(
+                f"[{i}/{len(symbols)}] {_format_symbol(sym)} ✅ تسلسل صاعد مكتمل (كنس سيولة هابط → POI صاعد → CHOCH صاعد → فجوة صاعدة → إعادة اختبار)"
+            )
+        if bear_seq:
+            print(
+                f"[{i}/{len(symbols)}] {_format_symbol(sym)} ✅ تسلسل هابط مكتمل (كنس سيولة صاعد → POI هابط → CHOCH هابط → فجوة هابطة → إعادة اختبار)"
+            )
+
         recent_alerts = list(runtime.alerts)
         if recent_window > 0 and runtime.series.length() > 0:
             cutoff_idx = max(0, runtime.series.length() - recent_window)
@@ -10334,7 +10343,7 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
                     )
                 )
 
-        if recent_alerts or args.verbose:
+        if args.verbose:
             _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
             if summary:
                 print("  •", " | ".join(summary))
@@ -11103,7 +11112,7 @@ def _android_cli_entry() -> int:
                     except Exception:
                         pass
 
-                if recent_alerts or args.verbose:
+                if args.verbose:
                     _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
                     alerts_total += len(recent_alerts)
 
@@ -11137,7 +11146,6 @@ def __router_main__():
             "-l", str(defaults.candle_limit),
             "--max-symbols", str(defaults.max_symbols),
             "--recent", str(defaults.recent_bars),
-            "--verbose",
         ]
         if defaults.height_threshold is not None:
             sys.argv += ["--min-change", str(defaults.height_threshold)]
