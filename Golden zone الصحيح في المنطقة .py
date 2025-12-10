@@ -149,33 +149,62 @@ STRATEGY_AUTORUN_DEFAULTS = _StrategyAutorunDefaults()
 
 @dataclass(frozen=True)
 class AlertToggleConfig:
-    bearish_external_ob: bool = True
-    bullish_external_ob: bool = True
-    bearish_internal_ob: bool = True
-    bullish_internal_ob: bool = True
-    bullish_ob_break: bool = True
-    bearish_ob_break: bool = True
-    bullish_sweep: bool = True
-    bearish_sweep: bool = True
+    # التنبيهات القديمة (OB / Sweeps / ... ) نغلقها كلها
+    bearish_external_ob: bool = False
+    bullish_external_ob: bool = False
+    bearish_internal_ob: bool = False
+    bullish_internal_ob: bool = False
+    bullish_ob_break: bool = False
+    bearish_ob_break: bool = False
+    bullish_sweep: bool = False
+    bearish_sweep: bool = False
+
+    # نُبقي فقط على FVG و Liquidity (ممكن تستخدم في التنبيه وأيضًا الفلتر)
     bullish_fvg: bool = True
     bearish_fvg: bool = True
-    bullish_fvg_break: bool = True
-    bearish_fvg_break: bool = True
-    high_liquidity_level: bool = False
-    low_liquidity_level: bool = False
+    bullish_fvg_break: bool = False
+    bearish_fvg_break: bool = False
+
+    high_liquidity_level: bool = True
+    low_liquidity_level: bool = True
     high_liquidity_level_break: bool = False
     low_liquidity_level_break: bool = False
-    golden_zone_created: bool = True
-    golden_zone_first_touch: bool = True
+
+    # نغلق كل ما يتعلق بـ Golden zone و OB التاريخي
+    golden_zone_created: bool = False
+    golden_zone_first_touch: bool = False
     idm_ob_created: bool = False
     ext_ob_created: bool = False
-    ext_ob_first_touch: bool = True
-    idm_ob_first_touch: bool = True
-    hist_ext_ob_first_touch: bool = True
-    hist_idm_ob_first_touch: bool = True
+    ext_ob_first_touch: bool = False
+    idm_ob_first_touch: bool = False
+    hist_ext_ob_first_touch: bool = False
+    hist_idm_ob_first_touch: bool = False
+
+    # حقول إضافية خاصة بعرض الكونسول (ليست Pine أصلية)
+    show_fvg_events: bool = True
+    show_liquidity_events: bool = True
+    show_mark_x_events: bool = True          # علامة X
+    show_equilibrium_events: bool = True     # EQH / EQL
+    show_minor_of_events: bool = True        # صناديق Order Flow Minor
+    show_major_of_events: bool = True        # صناديق Order Flow Major
+    show_other_events: bool = False          # أي حدث غير ما سبق → مخفي
 
 
 DEFAULT_ALERT_TOGGLES = AlertToggleConfig()
+
+
+# الأحداث المسموح عرضها في "أحدث الإشارات مع الأسعار"
+ALLOWED_CONSOLE_EVENT_KEYS = {
+    "ALERT_BULLISH_FVG",
+    "ALERT_BEARISH_FVG",
+    "ALERT_HIGH_LIQUIDITY_LEVEL",
+    "ALERT_LOW_LIQUIDITY_LEVEL",
+    "X",
+    "EQH",
+    "EQL",
+    "ORDER_FLOW_MINOR",
+    "ORDER_FLOW_MAJOR",
+}
 
 
 @dataclass(frozen=True)
@@ -1831,7 +1860,42 @@ class SmartMoneyAlgoProE5:
 
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
         events: Dict[str, Dict[str, Any]] = {}
+
+        toggles: AlertToggleConfig = getattr(self, "alert_toggles", DEFAULT_ALERT_TOGGLES)
+
+        def _allowed_console_event(key: str) -> bool:
+            """فلتر موحّد يحدد ما يظهر في الكونسول."""
+            if key in ("ALERT_BULLISH_FVG", "ALERT_BEARISH_FVG", "FVG"):
+                return getattr(toggles, "show_fvg_events", True)
+
+            if key in (
+                "ALERT_HIGH_LIQUIDITY_LEVEL",
+                "ALERT_LOW_LIQUIDITY_LEVEL",
+                "LIQUIDITY_HIGH",
+                "LIQUIDITY_LOW",
+            ):
+                return getattr(toggles, "show_liquidity_events", True)
+
+            if key == "X":
+                return getattr(toggles, "show_mark_x_events", True)
+
+            if key in ("EQH", "EQL"):
+                return getattr(toggles, "show_equilibrium_events", True)
+
+            if key == "ORDER_FLOW_MINOR":
+                return getattr(toggles, "show_minor_of_events", True)
+
+            if key == "ORDER_FLOW_MAJOR":
+                return getattr(toggles, "show_major_of_events", True)
+
+            if key in ALLOWED_CONSOLE_EVENT_KEYS:
+                return True
+
+            return getattr(toggles, "show_other_events", False)
+
         for key, value in self.console_event_log.items():
+            if not _allowed_console_event(key):
+                continue
             payload = value.copy()
             if "time" in payload and "time_display" not in payload:
                 payload["time_display"] = format_timestamp(payload.get("time"))
@@ -1844,6 +1908,8 @@ class SmartMoneyAlgoProE5:
             predicate: Callable[[Label], bool],
             formatter: Optional[Callable[[Label], str]] = None,
         ) -> None:
+            if not _allowed_console_event(key):
+                return
             for lbl in reversed(self.labels):
                 if not isinstance(lbl, Label):
                     continue
@@ -1865,6 +1931,8 @@ class SmartMoneyAlgoProE5:
             predicate: Callable[[Box], bool],
             sources: Optional[Sequence[Iterable[Box]]] = None,
         ) -> None:
+            if not _allowed_console_event(key):
+                return
             iterables = sources or (self.boxes,)
             for source in iterables:
                 if isinstance(source, PineArray):
@@ -1922,6 +1990,8 @@ class SmartMoneyAlgoProE5:
             lambda lbl: lbl.text,
         )
         record_label("X", lambda lbl: lbl.text.strip() == "X")
+        record_label("EQH", lambda lbl: lbl.text.strip() == "EQH")
+        record_label("EQL", lambda lbl: lbl.text.strip() == "EQL")
         record_label(
             "RED_CIRCLE",
             lambda lbl: lbl.style == "label.style_circle" and lbl.color == bear_color,
@@ -1946,6 +2016,22 @@ class SmartMoneyAlgoProE5:
             sources=(self.hist_ext_boxes, self.boxes),
         )
         record_box("GOLDEN_ZONE", lambda bx: bx.text == "Golden zone")
+        record_box(
+            "ORDER_FLOW_MAJOR",
+            lambda bx: True,
+            sources=(
+                getattr(self, "arrOBBullm", PineArray()),
+                getattr(self, "arrOBBearm", PineArray()),
+            ),
+        )
+        record_box(
+            "ORDER_FLOW_MINOR",
+            lambda bx: True,
+            sources=(
+                getattr(self, "arrOBBulls", PineArray()),
+                getattr(self, "arrOBBears", PineArray()),
+            ),
+        )
 
         return events
 
@@ -8884,10 +8970,13 @@ METRIC_LABELS = [
 
 
 EVENT_DISPLAY_ORDER = [
-    ("GOLDEN_ZONE", "Equilibrium"),
-    ("X", "Mark X"),
-    ("FVG", "FVG"),
-    ("LIQUIDITY", "Liquidity"),
+    ("ALERT_BULLISH_FVG", "Bullish FVG"),
+    ("ALERT_BEARISH_FVG", "Bearish FVG"),
+    ("ALERT_HIGH_LIQUIDITY_LEVEL", "High Liquidity Level"),
+    ("ALERT_LOW_LIQUIDITY_LEVEL", "Low Liquidity Level"),
+    ("X", "Market Structure X"),
+    ("EQH", "Equal High (EQH)"),
+    ("EQL", "Equal Low (EQL)"),
     ("ORDER_FLOW_MINOR", "Order Flow (Minor OF)"),
     ("ORDER_FLOW_MAJOR", "Order Flow (Major OF)"),
 ]
