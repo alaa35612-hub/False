@@ -6050,6 +6050,7 @@ class SmartMoneyAlgoProE5:
             self.inputs.structure_util.colorSweep,
             "line.style_dotted",
         )
+        ln.text = "Swing Sweep"
         if self.inputs.structure_util.markX:
             self.label_new(
                 self.textCenter(self.series.get_time(), x),
@@ -9121,6 +9122,48 @@ def _price_inside_box(price: float, box: Box) -> bool:
     return lower <= price <= upper
 
 
+# -----------------------------------------------------------------------------
+# Unified hit detection helpers for scanner cards
+# -----------------------------------------------------------------------------
+
+def _box_hit_detail(label: str, price: float, boxes: Iterable[Box], *, tolerance: float = 0.0) -> Tuple[bool, Optional[str]]:
+    for bx in boxes:
+        if not isinstance(bx, Box):
+            continue
+        lower = min(bx.bottom, bx.top) - tolerance
+        upper = max(bx.bottom, bx.top) + tolerance
+        if lower <= price <= upper:
+            return True, f"{label} {format_price(bx.bottom)} → {format_price(bx.top)}"
+    return False, None
+
+
+def _line_hit_detail(label: str, price: float, lines: Iterable[Line], *, tolerance: float) -> Tuple[bool, Optional[str]]:
+    for ln in lines:
+        if not isinstance(ln, Line):
+            continue
+        target = float(getattr(ln, "y1", getattr(ln, "y2", math.nan)))
+        if math.isnan(target):
+            continue
+        if abs(price - target) <= tolerance:
+            return True, f"{label} near {format_price(target)}"
+    return False, None
+
+
+def _label_hit_detail(label: str, price: float, labels: Iterable[Label], *, tolerance: float) -> Tuple[bool, Optional[str]]:
+    for lbl in labels:
+        if not isinstance(lbl, Label):
+            continue
+        txt = (getattr(lbl, "text", "") or "").strip().lower()
+        if txt != "x":
+            continue
+        target = float(getattr(lbl, "y", math.nan))
+        if math.isnan(target):
+            continue
+        if abs(price - target) <= tolerance:
+            return True, f"X near {format_price(target)}"
+    return False, None
+
+
 def in_order_flow(state: Any) -> Tuple[bool, Optional[str]]:
     price = getattr(getattr(state, "series", None), "get", lambda *_: None)("close")
     if not isinstance(price, (int, float)) or math.isnan(price):
@@ -9225,28 +9268,100 @@ def in_fvg(state: Any) -> Tuple[bool, Optional[str], bool, Optional[str]]:
     return False, None, any_exist, existence_detail
 
 
-def _build_zone_card(symbol: str, timeframe: str, runtime: Any) -> Optional[str]:
-    of_hit, of_detail = in_order_flow(runtime)
-    liq_hit, liq_detail = in_liquidity(runtime)
-    fvg_hit, fvg_detail, fvg_exists, fvg_exist_detail = in_fvg(runtime)
+def check_symbol_hits(state: Any, price: Optional[float] = None) -> Dict[str, Dict[str, Any]]:
+    price_val = price
+    if not isinstance(price_val, (int, float)) or math.isnan(price_val):
+        price_val = getattr(getattr(state, "series", None), "get", lambda *_: float("nan"))("close")
+    if not isinstance(price_val, (int, float)) or math.isnan(price_val):
+        price_val = float("nan")
 
-    if not (of_hit or liq_hit or fvg_hit or fvg_exists):
+    tolerance = _liquidity_tolerance(price_val, state) if isinstance(price_val, (int, float)) and not math.isnan(price_val) else 0.0
+
+    of_hit, of_detail = in_order_flow(state)
+    liq_hit, liq_detail = in_liquidity(state)
+    fvg_hit, fvg_detail, fvg_exists, fvg_exist_detail = in_fvg(state)
+
+    # Golden Zone (active box ``bxf``)
+    gz_box = getattr(state, "bxf", None)
+    gz_hit, gz_detail = _box_hit_detail("Golden Zone", price_val, [gz_box] if isinstance(gz_box, Box) else [], tolerance=tolerance)
+
+    # Current EXT / IDM OB boxes
+    ext_box = getattr(state, "lstBx", None)
+    idm_box = getattr(state, "lstBxIdm", None)
+    ext_hit, ext_detail = _box_hit_detail("EXT OB", price_val, [ext_box] if isinstance(ext_box, Box) else [], tolerance=tolerance)
+    idm_hit, idm_detail = _box_hit_detail("IDM OB", price_val, [idm_box] if isinstance(idm_box, Box) else [], tolerance=tolerance)
+
+    # Historical OB boxes
+    hist_idm_hit, hist_idm_detail = _box_hit_detail(
+        "Hist IDM OB", price_val, _iter_objects(getattr(state, "hist_idm_boxes", PineArray()), Box), tolerance=tolerance
+    )
+    hist_ext_hit, hist_ext_detail = _box_hit_detail(
+        "Hist EXT OB", price_val, _iter_objects(getattr(state, "hist_ext_boxes", PineArray()), Box), tolerance=tolerance
+    )
+
+    # Swing Sweep lines
+    swing_hit, swing_detail = _line_hit_detail(
+        "Swing Sweep",
+        price_val,
+        _iter_objects(getattr(state, "arrBCLine", PineArray()), Line),
+        tolerance=tolerance,
+    )
+
+    # Mark X labels
+    mark_hit, mark_detail = _label_hit_detail("Mark X", price_val, getattr(state, "labels", []), tolerance=tolerance)
+
+    return {
+        "order_flow": {"hit": of_hit, "detail": of_detail},
+        "liquidity": {"hit": liq_hit, "detail": liq_detail},
+        "fvg": {
+            "hit": fvg_hit,
+            "detail": fvg_detail,
+            "exist": fvg_exists,
+            "exist_detail": fvg_exist_detail,
+        },
+        "golden_zone": {"hit": gz_hit, "detail": gz_detail},
+        "ext_ob": {"hit": ext_hit, "detail": ext_detail},
+        "idm_ob": {"hit": idm_hit, "detail": idm_detail},
+        "hist_idm_ob": {"hit": hist_idm_hit, "detail": hist_idm_detail},
+        "hist_ext_ob": {"hit": hist_ext_hit, "detail": hist_ext_detail},
+        "swing_sweep": {"hit": swing_hit, "detail": swing_detail},
+        "mark_x": {"hit": mark_hit, "detail": mark_detail},
+    }
+
+
+def _build_zone_card(symbol: str, timeframe: str, runtime: Any) -> Optional[str]:
+    hits = check_symbol_hits(runtime)
+
+    if not any(entry.get("hit") for entry in hits.values()):
         return None
 
-    def _fmt_line(label: str, hit: bool, detail: Optional[str], extra: Optional[str] = None) -> str:
-        status = "✅" if hit else "❌"
-        parts = [status]
-        if detail:
-            parts.append(detail)
-        if extra:
-            parts.append(extra)
-        return f"{label}: {' '.join(parts)}"
+    def _fmt_line(label: str, entry: Dict[str, Any]) -> str:
+        status = "✅" if entry.get("hit") else "❌"
+        details: List[str] = []
+        if entry.get("detail"):
+            details.append(str(entry["detail"]))
+        if label == "FVG" and entry.get("exist_detail"):
+            details.append(str(entry["exist_detail"]))
+        if not details:
+            return f"{label}: {status}"
+        return f"{label}: {status} {' | '.join(details)}"
+
+    ordered_labels = [
+        ("Order Flow", "order_flow"),
+        ("سيولة", "liquidity"),
+        ("FVG", "fvg"),
+        ("Golden Zone", "golden_zone"),
+        ("EXT OB", "ext_ob"),
+        ("IDM OB", "idm_ob"),
+        ("Hist IDM OB", "hist_idm_ob"),
+        ("Hist EXT OB", "hist_ext_ob"),
+        ("Swing Sweep", "swing_sweep"),
+        ("Mark X", "mark_x"),
+    ]
 
     lines: List[str] = [f"SYMBOL: {_format_symbol(symbol)}"]
-    lines.append(_fmt_line("Order Flow", of_hit, of_detail))
-    lines.append(_fmt_line("سيولة", liq_hit, liq_detail))
-    fvg_extra = fvg_exist_detail or ("FVGs موجودة: ❌" if not fvg_exists else None)
-    lines.append(_fmt_line("FVG", fvg_hit, fvg_detail, fvg_extra))
+    for label, key in ordered_labels:
+        lines.append(_fmt_line(label, hits.get(key, {})))
 
     try:
         ts = runtime.series.get_time()
