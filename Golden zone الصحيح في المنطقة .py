@@ -859,7 +859,7 @@ class DemandSupplyInputs:
 
 @dataclass
 class FVGInputs:
-    show_fvg: bool = False
+    show_fvg: bool = True
     i_tf: str = ""
     i_mtf: str = "HTF"
     i_bullishfvgcolor: str = "color.new(color.green,100)"
@@ -886,7 +886,7 @@ class FVGInputs:
 
 @dataclass
 class LiquidityInputs:
-    currentTF: bool = False
+    currentTF: bool = True
     displayLimit: int = 20
     lowLineColorHTF: str = "#00bbf94d"
     highLineColorHTF: str = "#e91e624d"
@@ -1510,57 +1510,10 @@ class SmartMoneyAlgoProE5:
         self._trace("box.archive", "archive", timestamp=box.right, text=hist_text)
 
     def alertcondition(self, condition: bool, title: str, message: Optional[str] = None) -> None:
-        if not condition:
-            return
-        toggle_key = self.ALERT_TITLE_TOGGLE_MAP.get(title)
-        toggles = getattr(self, "alert_toggles", None)
-        if toggle_key and toggles is not None and not getattr(toggles, toggle_key, True):
-            return
-
-        timestamp = self.series.get_time(0)
-        price_value = self.series.get("close")
-        if isinstance(price_value, (int, float)) and not math.isnan(price_value):
-            price_display = format_price(price_value)
-        else:
-            price_value = NA
-            price_display = "N/A"
-
-        symbol = getattr(self, "symbol", None) or getattr(self.inputs, "symbol", "") or ""
-        when_display = format_timestamp(timestamp)
-
-        resolved_message = message or ""
-        for pattern in ("{ticker}", "{{ticker}}"):
-            resolved_message = resolved_message.replace(pattern, symbol or "")
-        for pattern in ("{close}", "{{close}}"):
-            resolved_message = resolved_message.replace(pattern, price_display)
-        for pattern in ("{time}", "{{time}}"):
-            resolved_message = resolved_message.replace(pattern, when_display)
-
-        title_with_price = f"{title} @ {price_display}" if price_display else title
-        if symbol:
-            title_with_price = f"{symbol} {title_with_price}"
-        display = title_with_price if not resolved_message else f"{title_with_price} :: {resolved_message}"
-
-        self.alerts.append((timestamp, display))
-
-        key = re.sub(r"[^A-Za-z0-9]+", "_", title).strip("_").upper()
-        key = f"ALERT_{key}" if key else "ALERT_GENERIC"
-        self.console_event_log[key] = {
-            "text": title,
-            "price": price_value,
-            "time": timestamp,
-            "time_display": when_display,
-            "display": display,
-            "message": resolved_message,
-            "symbol": symbol,
-        }
-        self._trace(
-            "alertcondition",
-            "trigger",
-            timestamp=timestamp,
-            title=title,
-            alert_message=message,
-        )
+        # Alerts are fully disabled for the console renderer. This stub keeps the
+        # method signature intact for compatibility with the Pine-to-Python
+        # translation while ensuring no alert side-effects are recorded or used.
+        return None
 
     def _eval_condition(
         self,
@@ -9150,6 +9103,169 @@ def _detect_area_hotspots(
     return hotspots
 
 
+def _iter_objects(container: Any, cls: Any) -> Iterable[Any]:
+    if isinstance(container, PineArray):
+        seq = container.values
+    elif isinstance(container, list):
+        seq = container
+    else:
+        seq = []
+    for obj in seq:
+        if isinstance(obj, cls):
+            yield obj
+
+
+def _price_inside_box(price: float, box: Box) -> bool:
+    lower = min(box.bottom, box.top)
+    upper = max(box.bottom, box.top)
+    return lower <= price <= upper
+
+
+def in_order_flow(state: Any) -> Tuple[bool, Optional[str]]:
+    price = getattr(getattr(state, "series", None), "get", lambda *_: None)("close")
+    if not isinstance(price, (int, float)) or math.isnan(price):
+        return False, None
+
+    candidates: List[Tuple[str, str, PineArray]] = [
+        ("Major Bullish", "bullish", getattr(state, "arrOBBullm", PineArray())),
+        ("Minor Bullish", "bullish", getattr(state, "arrOBBulls", PineArray())),
+        ("Major Bearish", "bearish", getattr(state, "arrOBBearm", PineArray())),
+        ("Minor Bearish", "bearish", getattr(state, "arrOBBears", PineArray())),
+    ]
+    for label, direction, container in candidates:
+        for bx in _iter_objects(container, Box):
+            if _price_inside_box(price, bx):
+                rng = f"{format_price(bx.bottom)} → {format_price(bx.top)}"
+                detail = f"{label} ({direction}) {rng}"
+                return True, detail
+    return False, None
+
+
+def _liquidity_tolerance(price: float, state: Any) -> float:
+    liq = getattr(getattr(state, "inputs", None), "liquidity", None)
+    try:
+        width = float(getattr(liq, "box_width", 0.0))
+    except Exception:
+        width = 0.0
+    base = abs(price) * max(width, 0.1) / 10_000.0
+    # Allow a wider buffer (≈0.05% of price) when box width is small so nearby
+    # touches are not missed.
+    adaptive = abs(price) * 0.0005
+    return max(base, adaptive, 1e-9)
+
+
+def in_liquidity(state: Any) -> Tuple[bool, Optional[str]]:
+    price = getattr(getattr(state, "series", None), "get", lambda *_: None)("close")
+    if not isinstance(price, (int, float)) or math.isnan(price):
+        return False, None
+
+    tolerance = _liquidity_tolerance(price, state)
+    boxes = [
+        ("High Liquidity", getattr(state, "liquidity_high_boxes", PineArray())),
+        ("Low Liquidity", getattr(state, "liquidity_low_boxes", PineArray())),
+    ]
+    for name, container in boxes:
+        for bx in _iter_objects(container, Box):
+            lower = min(bx.bottom, bx.top) - tolerance
+            upper = max(bx.bottom, bx.top) + tolerance
+            if lower <= price <= upper:
+                detail = f"{name} {format_price(bx.bottom)} → {format_price(bx.top)}"
+                return True, detail
+
+    lines = [
+        ("High Liquidity", getattr(state, "liquidity_high_lines", PineArray())),
+        ("Low Liquidity", getattr(state, "liquidity_low_lines", PineArray())),
+    ]
+    for name, container in lines:
+        for ln in _iter_objects(container, Line):
+            target = float(getattr(ln, "y1", getattr(ln, "y2", math.nan)))
+            if math.isnan(target):
+                continue
+            if abs(price - target) <= tolerance:
+                detail = f"{name} near {format_price(target)}"
+                return True, detail
+    return False, None
+
+
+def in_fvg(state: Any) -> Tuple[bool, Optional[str], bool, Optional[str]]:
+    price = getattr(getattr(state, "series", None), "get", lambda *_: None)("close")
+    if not isinstance(price, (int, float)) or math.isnan(price):
+        return False, None, False, None
+
+    holders = [
+        ("Bullish FVG", getattr(state, "bullish_gap_holder", PineArray())),
+        ("Bearish FVG", getattr(state, "bearish_gap_holder", PineArray())),
+    ]
+
+    any_exist = False
+    last_box: Optional[Box] = None
+    for _, container in holders:
+        for bx in _iter_objects(container, Box):
+            any_exist = True
+            last_box = bx
+
+    for name, container in holders:
+        for bx in _iter_objects(container, Box):
+            if _price_inside_box(price, bx):
+                detail = f"{name} {format_price(bx.bottom)} → {format_price(bx.top)}"
+                existence_detail = None
+                if any_exist:
+                    existence_detail = (
+                        f"FVGs موجودة: ✅ (آخر {format_price(last_box.bottom)} → {format_price(last_box.top)})"
+                        if last_box else "FVGs موجودة: ✅"
+                    )
+                return True, detail, True, existence_detail
+
+    existence_detail = None
+    if any_exist and last_box:
+        existence_detail = f"FVGs موجودة: ✅ (آخر {format_price(last_box.bottom)} → {format_price(last_box.top)})"
+    elif any_exist:
+        existence_detail = "FVGs موجودة: ✅"
+
+    return False, None, any_exist, existence_detail
+
+
+def _build_zone_card(symbol: str, timeframe: str, runtime: Any) -> Optional[str]:
+    of_hit, of_detail = in_order_flow(runtime)
+    liq_hit, liq_detail = in_liquidity(runtime)
+    fvg_hit, fvg_detail, fvg_exists, fvg_exist_detail = in_fvg(runtime)
+
+    if not (of_hit or liq_hit or fvg_hit or fvg_exists):
+        return None
+
+    def _fmt_line(label: str, hit: bool, detail: Optional[str], extra: Optional[str] = None) -> str:
+        status = "✅" if hit else "❌"
+        parts = [status]
+        if detail:
+            parts.append(detail)
+        if extra:
+            parts.append(extra)
+        return f"{label}: {' '.join(parts)}"
+
+    lines: List[str] = [f"SYMBOL: {_format_symbol(symbol)}"]
+    lines.append(_fmt_line("Order Flow", of_hit, of_detail))
+    lines.append(_fmt_line("سيولة", liq_hit, liq_detail))
+    fvg_extra = fvg_exist_detail or ("FVGs موجودة: ❌" if not fvg_exists else None)
+    lines.append(_fmt_line("FVG", fvg_hit, fvg_detail, fvg_extra))
+
+    try:
+        ts = runtime.series.get_time()
+        ts_display = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts / 1000)) if ts else "—"
+    except Exception:
+        ts_display = "—"
+    try:
+        price_val = runtime.series.get("close")
+        price_display = format_price(price_val)
+    except Exception:
+        price_display = "NaN"
+
+    lines.append(f"Time: {ts_display} UTC")
+    lines.append(f"Timeframe: {timeframe}")
+    lines.append(f"Price: {price_display}")
+    lines.append("--------------------------------")
+    return "\n".join(lines)
+
+
 def scan_binance(
     timeframe: str,
     limit: int,
@@ -10067,7 +10183,6 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
 
     # Run loop
     ex = _build_exchange(cfg.market)
-    alerts_total = 0
     symbols = symbols[:int(cfg.max_scan)]
     for i, sym in enumerate(symbols, 1):
         try:
@@ -10087,69 +10202,14 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
                 )
             continue
 
-        metrics = runtime.gather_console_metrics()
-        latest = metrics.get("latest_events", {})
-        recent_hits, recent_times = _collect_recent_event_hits(
-            runtime.series, latest, bars=recent_window
-        )
-        area_hits = _detect_area_hotspots(metrics, latest, recent_times)
-        if not recent_hits and not area_hits:
-            print(
-                f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث أو مناطق FVG/سيولة/Order Flow خلال آخر {recent_window} شموع"
-            )
+        card = _build_zone_card(sym, args.timeframe, runtime)
+        if not card:
             continue
 
-        recent_alerts = list(runtime.alerts)
-        if recent_window > 0 and runtime.series.length() > 0:
-            cutoff_idx = max(0, runtime.series.length() - recent_window)
-            cutoff_time = runtime.series.get_time(cutoff_idx)
-            recent_alerts = [(ts, title) for ts, title in recent_alerts if ts >= cutoff_time]
-
-        summary = []
-        summary_keys = [key for key, _ in EVENT_DISPLAY_ORDER]
-        for key in summary_keys:
-            if key in latest:
-                evt = latest[key]
-                disp = evt.get("display", "")
-                status_disp = evt.get("status_display")
-                if status_disp:
-                    disp = f"{disp} [{status_disp}]"
-                direction_hint = _resolve_direction(
-                    evt.get("direction"),
-                    evt.get("direction_display"),
-                    evt.get("status"),
-                    evt.get("text"),
-                    disp,
-                )
-                summary.append(
-                    _colorize_directional_text(
-                        disp,
-                        direction=direction_hint,
-                        fallback=None,
-                    )
-                )
-
-        if area_hits:
-            summary.append(
-                _colorize_directional_text(
-                    " / ".join(area_hits),
-                    direction=None,
-                    fallback=ANSI_VALUE_POS,
-                )
-            )
-
-        if recent_alerts or args.verbose:
-            _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
-            if summary:
-                print("  •", " | ".join(summary))
-            for ts, title in recent_alerts[-10:]:
-                ts_s = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(ts/1000))
-                colored_title = _colorize_directional_text(title)
-                print(f"  - {ts_s} :: {colored_title}")
-            alerts_total += len(recent_alerts)
+        print(card)
 
     if args.verbose:
-        print(f"\nDone. Symbols scanned: {len(symbols)}, alerts: {alerts_total}")
+        print(f"\nDone. Symbols scanned: {len(symbols)}")
     return 0
 
 
@@ -10879,8 +10939,6 @@ def _android_cli_entry() -> int:
                     symbols = symbols[: int(cfg.max_scan)]
                 except Exception:
                     pass
-            alerts_total = 0
-
             for i, sym in enumerate(symbols, 1):
                 try:
                     candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
@@ -10900,50 +10958,15 @@ def _android_cli_entry() -> int:
                     )
                     continue
 
-                metrics = runtime.gather_console_metrics()
-                latest_events = metrics.get("latest_events") or {}
-                target_keys = {"GOLDEN_ZONE", "EXT_OB", "IDM_OB", "HIST_EXT_OB", "HIST_IDM_OB"}
-                recent_hits, recent_times = _collect_recent_event_hits(
-                    runtime.series,
-                    latest_events,
-                    bars=recent_window,
-                    allowed_keys=target_keys,
-                    required_status="touched",
-                )
-                area_hits = _detect_area_hotspots(metrics, latest_events, recent_times)
-                if not recent_hits and not area_hits:
-                    if recent_window == 1:
-                        span_phrase = "آخر شمعة واحدة"
-                    elif recent_window == 2:
-                        span_phrase = "آخر شمعتين"
-                    else:
-                        span_phrase = f"آخر {recent_window} شموع"
-                    print(
-                        f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث أو مناطق FVG/سيولة/Order Flow خلال {span_phrase}"
-                    )
+                card = _build_zone_card(sym, args.timeframe, runtime)
+                if not card:
                     continue
 
-                recent_alerts = list(getattr(runtime, "alerts", []))
-                if recent_window > 0 and hasattr(runtime, "series") and runtime.series.length() > 0:
-                    try:
-                        cutoff_idx = max(0, runtime.series.length() - recent_window)
-                        cutoff_time = runtime.series.get_time(cutoff_idx)
-                        if cutoff_time:
-                            recent_alerts = [
-                                (ts, title) for ts, title in recent_alerts if ts >= cutoff_time
-                            ]
-                    except Exception:
-                        pass
-
-                alerts_total += _run_strategy_autorun(sym, args.timeframe, runtime)
-                if area_hits:
-                    print("  •", " / ".join(area_hits))
-                if recent_alerts or args.verbose:
-                    _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
-                    alerts_total += len(recent_alerts)
+                print(card)
+                _run_strategy_autorun(sym, args.timeframe, runtime)
 
             if args.verbose:
-                print(f"\nتم. عدد الرموز: {len(symbols)}  |  عدد التنبيهات: {alerts_total}")
+                print(f"\nتم. عدد الرموز: {len(symbols)}")
 
             if not cfg.continuous_scan:
                 print(
@@ -10987,10 +11010,6 @@ def __router_main__():
         if defaults.scan_interval > 0:
             sys.argv += ["--continuous-interval", str(defaults.scan_interval)]
     return _android_cli_entry()
-
-# ---------- Main ----------
-if __name__ == "__main__":
-    __router_main__()
 
 
 # ============================================================================
@@ -11538,5 +11557,6 @@ def _main(argv: Optional[List[str]] = None) -> None:
 
 if __name__ == "__main__":
     # تشغيل تلقائي من المحرر بالقيم الإفتراضية أعلاه.
+    __router_main__()
     _main()
 # ============================ End of Integration ============================
