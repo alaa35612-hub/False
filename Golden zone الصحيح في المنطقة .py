@@ -31,11 +31,12 @@ import inspect
 import json
 import math
 import os
+import queue
 import re
 import sys
 import textwrap
 import time
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
@@ -177,6 +178,134 @@ def _set_rate_limits_from_cfg(cfg: Any) -> None:
         retry_count=retry_count,
         backoff_base=backoff_base,
     )
+
+
+# ----------------------------------------------------------------------------
+# Telegram notifier settings (configurable from the top of the file)
+# ----------------------------------------------------------------------------
+
+TELEGRAM_ENABLED: bool = False
+TELEGRAM_BOT_TOKEN: str = "PUT_TOKEN_HERE"
+TELEGRAM_CHAT_ID: str = "PUT_CHAT_ID_HERE"
+TELEGRAM_MAX_MSG_PER_MIN: int = 20
+TELEGRAM_RETRY_COUNT: int = 3
+TELEGRAM_BACKOFF_BASE_SEC: float = 1.5
+
+_telegram_warning_emitted = False
+
+
+class TelegramNotifier:
+    """Async Telegram sender with simple rate limiting and retries."""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        bot_token: str,
+        chat_id: str,
+        max_per_min: int,
+        retry_count: int,
+        backoff_base: float,
+    ) -> None:
+        self.bot_token = bot_token.strip() if isinstance(bot_token, str) else ""
+        self.chat_id = chat_id.strip() if isinstance(chat_id, str) else ""
+        self.max_per_min = max(1, int(max_per_min))
+        self.retry_count = max(0, int(retry_count))
+        self.backoff_base = max(0.0, float(backoff_base))
+        self.enabled = bool(enabled and requests and self.bot_token and self.chat_id)
+        self._queue: "queue.Queue[str]" = queue.Queue()
+        self._timestamps: deque[float] = deque()
+        self._worker: Optional[threading.Thread] = None
+        self._session: Optional[Any] = None
+        if self.enabled:
+            self._session = requests.Session()
+            if HTTPAdapter and Retry:
+                adapter = HTTPAdapter(max_retries=Retry(total=3, backoff_factor=self.backoff_base))
+                self._session.mount("http://", adapter)
+                self._session.mount("https://", adapter)
+            self._worker = threading.Thread(target=self._run, daemon=True)
+            self._worker.start()
+
+    def _run(self) -> None:
+        while True:
+            text = self._queue.get()
+            if text is None:  # type: ignore
+                break
+            try:
+                self._send(text)
+            except Exception as exc:  # pragma: no cover - network dependent
+                print(f"فشل إرسال تيليجرام: {exc}", file=sys.stderr)
+            finally:
+                self._queue.task_done()
+
+    def stop(self) -> None:
+        if not self.enabled:
+            return
+        self._queue.put(None)  # type: ignore
+        if self._worker:
+            self._worker.join(timeout=1.0)
+
+    def _sleep_for_rate(self) -> None:
+        now = time.monotonic()
+        while self._timestamps and (now - self._timestamps[0]) > 60.0:
+            self._timestamps.popleft()
+        if len(self._timestamps) >= self.max_per_min:
+            wait = 60.0 - (now - self._timestamps[0])
+            if wait > 0:
+                time.sleep(wait)
+        self._timestamps.append(time.monotonic())
+
+    def _send(self, text: str) -> None:
+        if not self.enabled or not self._session:
+            return
+        self._sleep_for_rate()
+        url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+        payload = {
+            "chat_id": self.chat_id,
+            "text": text,
+            "disable_web_page_preview": True,
+        }
+        for attempt in range(self.retry_count + 1):
+            try:
+                resp = self._session.post(url, json=payload, timeout=10)
+            except Exception:
+                resp = None
+            if resp is not None and resp.status_code == 200:
+                return
+            status = resp.status_code if resp is not None else None
+            if status == 429 or (status and status >= 500 and attempt < self.retry_count):
+                backoff = self.backoff_base * (2 ** attempt)
+                if backoff:
+                    time.sleep(backoff)
+                continue
+            break
+
+    def send(self, text: str) -> None:
+        if not self.enabled or not text:
+            return
+        self._queue.put(text)
+
+
+def _resolve_telegram_enabled() -> bool:
+    global _telegram_warning_emitted
+    if not TELEGRAM_ENABLED or requests is None:
+        return False
+    if TELEGRAM_BOT_TOKEN.strip() and TELEGRAM_CHAT_ID.strip():
+        return True
+    if not _telegram_warning_emitted:
+        print("Telegram disabled: missing token/chat id", file=sys.stderr)
+        _telegram_warning_emitted = True
+    return False
+
+
+_TELEGRAM_NOTIFIER = TelegramNotifier(
+    enabled=_resolve_telegram_enabled(),
+    bot_token=TELEGRAM_BOT_TOKEN,
+    chat_id=TELEGRAM_CHAT_ID,
+    max_per_min=TELEGRAM_MAX_MSG_PER_MIN,
+    retry_count=TELEGRAM_RETRY_COUNT,
+    backoff_base=TELEGRAM_BACKOFF_BASE_SEC,
+)
 
 
 @dataclass(frozen=True)
@@ -9565,8 +9694,126 @@ def check_symbol_hits(state: Any, price: Optional[float] = None) -> Dict[str, Di
     }
 
 
-def _build_zone_card(symbol: str, timeframe: str, runtime: Any) -> Optional[str]:
-    hits = check_symbol_hits(runtime)
+ZONE_LABELS: List[Tuple[str, str]] = [
+    ("Order Flow", "order_flow"),
+    ("سيولة", "liquidity"),
+    ("FVG", "fvg"),
+    ("Golden Zone", "golden_zone"),
+    ("EXT OB", "ext_ob"),
+    ("IDM OB", "idm_ob"),
+    ("Hist IDM OB", "hist_idm_ob"),
+    ("Hist EXT OB", "hist_ext_ob"),
+    ("Swing Sweep", "swing_sweep"),
+    ("Mark X", "mark_x"),
+]
+
+
+_INSIDE_STATE: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+
+def _safe_candle_time(runtime: Any) -> Optional[int]:
+    try:
+        return getattr(runtime, "series", None).get_time(0)  # type: ignore
+    except Exception:
+        try:
+            return getattr(runtime, "series", None).get_time()  # type: ignore
+        except Exception:
+            return None
+
+
+def _inside_hits(hits: Dict[str, Dict[str, Any]]) -> List[Tuple[str, Dict[str, Any]]]:
+    out: List[Tuple[str, Dict[str, Any]]] = []
+    for label, key in ZONE_LABELS:
+        entry = hits.get(key, {})
+        if entry.get("status") == "inside":
+            out.append((label, entry))
+    return out
+
+
+def _entry_signature(symbol: str, timeframe: str, candle_time: Optional[int], hits: Dict[str, Dict[str, Any]]) -> str:
+    parts: List[str] = []
+    for label, entry in _inside_hits(hits):
+        detail = entry.get("detail") or ""
+        ts_val = entry.get("time") or ""
+        parts.append(f"{label}|{detail}|{ts_val}")
+    base = f"{symbol}|{timeframe}|{candle_time or ''}|{'|'.join(sorted(parts))}"
+    return str(abs(hash(base)))
+
+
+def _format_telegram_entry_message(
+    symbol: str,
+    timeframe: str,
+    price: Any,
+    price_source: str,
+    candle_time: Optional[int],
+    hits: Dict[str, Dict[str, Any]],
+) -> Optional[str]:
+    inside_list = _inside_hits(hits)
+    if not inside_list:
+        return None
+    ts_display = "—"
+    if isinstance(candle_time, (int, float)):
+        try:
+            ts_display = time.strftime("%Y-%m-%d %H:%M", time.gmtime(candle_time / 1000))
+        except Exception:
+            ts_display = "—"
+    msg_lines = [
+        "🚨 ENTRY INSIDE ZONE",
+        f"SYMBOL: {symbol} ({timeframe})",
+        f"Price(source={price_source}): {format_price(price)}",
+        f"Candle(UTC): {ts_display}",
+        "Hits (INSIDE):",
+    ]
+    trimmed = inside_list[:5]
+    for label, entry in trimmed:
+        detail = entry.get("detail") or label
+        ts_part = ""
+        ts_val = entry.get("time")
+        if isinstance(ts_val, (int, float)):
+            try:
+                ts_part = f" @ {time.strftime(' %Y-%m-%d %H:%M', time.gmtime(ts_val / 1000)).strip()}"
+            except Exception:
+                ts_part = ""
+        msg_lines.append(f" - {label}: {detail}{ts_part}")
+    if len(inside_list) > len(trimmed):
+        msg_lines.append(" - …")
+    msg_lines.append("---")
+    return "\n".join(msg_lines)
+
+
+def _handle_telegram_entry(symbol: str, timeframe: str, runtime: Any, hits: Dict[str, Dict[str, Any]]) -> None:
+    if not _TELEGRAM_NOTIFIER.enabled:
+        return
+    inside_list = _inside_hits(hits)
+    key = (symbol, timeframe)
+    state = _INSIDE_STATE.get(key, {"was_inside": False, "last_inside_candle_time": None, "last_hit_signature": None})
+    if not inside_list:
+        state.update({"was_inside": False, "last_inside_candle_time": None, "last_hit_signature": None})
+        _INSIDE_STATE[key] = state
+        return
+
+    candle_time = _safe_candle_time(runtime)
+    signature = _entry_signature(symbol, timeframe, candle_time, hits)
+    if state.get("was_inside"):
+        _INSIDE_STATE[key] = {"was_inside": True, "last_inside_candle_time": candle_time, "last_hit_signature": signature}
+        return
+
+    price_val = getattr(getattr(runtime, "series", None), "get", lambda *_: float("nan"))("close")
+    msg = _format_telegram_entry_message(
+        symbol,
+        timeframe,
+        price_val,
+        "closed_close",
+        candle_time,
+        hits,
+    )
+    if msg:
+        _TELEGRAM_NOTIFIER.send(msg)
+    _INSIDE_STATE[key] = {"was_inside": True, "last_inside_candle_time": candle_time, "last_hit_signature": signature}
+
+
+def _build_zone_card(symbol: str, timeframe: str, runtime: Any, *, hits: Optional[Dict[str, Dict[str, Any]]] = None) -> Optional[str]:
+    hits = hits or check_symbol_hits(runtime)
 
     inside_any = any(entry.get("status") == "inside" for entry in hits.values())
     near_any = any(entry.get("status") == "near" for entry in hits.values())
@@ -9596,26 +9843,13 @@ def _build_zone_card(symbol: str, timeframe: str, runtime: Any) -> Optional[str]
             return f"{label}: {icon}"
         return f"{label}: {icon} {' | '.join(details)}"
 
-    ordered_labels = [
-        ("Order Flow", "order_flow"),
-        ("سيولة", "liquidity"),
-        ("FVG", "fvg"),
-        ("Golden Zone", "golden_zone"),
-        ("EXT OB", "ext_ob"),
-        ("IDM OB", "idm_ob"),
-        ("Hist IDM OB", "hist_idm_ob"),
-        ("Hist EXT OB", "hist_ext_ob"),
-        ("Swing Sweep", "swing_sweep"),
-        ("Mark X", "mark_x"),
-    ]
-
     symbol_color = "\033[93m" if inside_any else "\033[94m"
     symbol_display = f"{symbol_color}{_format_symbol(symbol)}{ANSI_RESET}"
     status_line = "INSIDE" if inside_any else "NEAR"
 
     lines: List[str] = [f"SYMBOL: {symbol_display}"]
     lines.append(f"Status: {status_line}")
-    for label, key in ordered_labels:
+    for label, key in ZONE_LABELS:
         lines.append(_fmt_line(label, hits.get(key, {})))
 
     try:
@@ -10565,7 +10799,9 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
                 )
             continue
 
-        card = _build_zone_card(sym, args.timeframe, runtime)
+        hits = check_symbol_hits(runtime)
+        _handle_telegram_entry(sym, args.timeframe, runtime, hits)
+        card = _build_zone_card(sym, args.timeframe, runtime, hits=hits)
         if not card:
             continue
 
@@ -11354,7 +11590,9 @@ def _android_cli_entry() -> int:
                     )
                     continue
 
-                card = _build_zone_card(sym, args.timeframe, runtime)
+                hits = check_symbol_hits(runtime)
+                _handle_telegram_entry(sym, args.timeframe, runtime, hits)
+                card = _build_zone_card(sym, args.timeframe, runtime, hits=hits)
                 if not card:
                     continue
 
