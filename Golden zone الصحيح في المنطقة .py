@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import threading
 import bisect
 import dataclasses
 import datetime
@@ -107,12 +108,84 @@ ANSI_HEADER_COLORS = [
 ]
 
 
+class RateLimiter:
+    """Simple thread-safe limiter to keep ccxt requests within safe bounds."""
+
+    def __init__(self, *, max_per_sec: float = 5.0, max_concurrent: int = 3, delay_ms: int = 0,
+                 retry_count: int = 2, backoff_base: float = 0.5) -> None:
+        self.min_interval = 1.0 / max(max_per_sec, 0.1)
+        self.semaphore = threading.Semaphore(max(1, int(max_concurrent)))
+        self.delay = max(0.0, delay_ms) / 1000.0
+        self.retry_count = max(0, int(retry_count))
+        self.backoff_base = max(0.0, float(backoff_base))
+        self._lock = threading.Lock()
+        self._last_ts = 0.0
+
+    def _sleep_for_rate(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            wait = self.min_interval - (now - self._last_ts)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_ts = time.monotonic()
+
+    def run(self, func: Callable, *args: Any, **kwargs: Any):
+        with self.semaphore:
+            for attempt in range(self.retry_count + 1):
+                self._sleep_for_rate()
+                if self.delay:
+                    time.sleep(self.delay)
+                try:
+                    return func(*args, **kwargs)
+                except Exception as exc:  # pragma: no cover - network dependent
+                    # Only retry for transient HTTP/ccxt codes
+                    code = getattr(exc, "status", getattr(exc, "code", None))
+                    if attempt >= self.retry_count or code not in {418, 429, 500, 502, 503, 504}:
+                        raise
+                    backoff = self.backoff_base * (2 ** attempt)
+                    if backoff:
+                        time.sleep(backoff)
+        raise RuntimeError("RateLimiter failed without returning")
+
+
+# Shared limiter instance configured from CLI settings when available
+_GLOBAL_RATE_LIMITER = RateLimiter()
+
+
+def _set_rate_limits_from_cfg(cfg: Any) -> None:
+    global _GLOBAL_RATE_LIMITER
+    try:
+        max_concurrent = int(getattr(cfg, "max_concurrent_requests", 3))
+    except Exception:
+        max_concurrent = 3
+    try:
+        delay_ms = int(getattr(cfg, "request_delay_ms", 0))
+    except Exception:
+        delay_ms = 0
+    try:
+        retry_count = int(getattr(cfg, "retry_count", 2))
+    except Exception:
+        retry_count = 2
+    try:
+        backoff_base = float(getattr(cfg, "retry_backoff_base", 0.5))
+    except Exception:
+        backoff_base = 0.5
+    _GLOBAL_RATE_LIMITER = RateLimiter(
+        max_per_sec=float(max_concurrent) if max_concurrent > 0 else 5.0,
+        max_concurrent=max_concurrent or 1,
+        delay_ms=delay_ms,
+        retry_count=retry_count,
+        backoff_base=backoff_base,
+    )
+
+
 @dataclass(frozen=True)
 class _EditorAutorunDefaults:
     timeframe: str = "15m"
     candle_limit: int = 500
     max_symbols: int = 600
-    recent_bars: int = 2
+    recent_bars: int = 50
+    near_threshold_pct: float = 0.2
     continuous_scan: bool = False
     scan_interval: float = 0.0
     height_metric: str = "percentage"
@@ -7935,57 +8008,28 @@ def fetch_binance_usdtm_symbols(
 
 
 def fetch_ohlcv(exchange: Any, symbol: str, timeframe: str, limit: int) -> List[Dict[str, float]]:
-    """Fetch OHLCV data while preserving full history for structural parity.
+    """Rate-limited OHLCV fetch constrained to the most recent window."""
 
-    Binance USDT-M returns at most 1500 candles per request.  TradingView keeps
-    indicator state across the entire available history, so requesting only the
-    latest ``limit`` bars leads to structural mismatches (missing legacy
-    pullbacks/ChoCh/OB states).  To replicate the indicator faithfully we walk
-    the history from the earliest candle and keep the trailing slice when the
-    caller specifies ``limit``.  Passing ``limit<=0`` fetches the entire
-    available history.
-    """
+    target = max(EDITOR_AUTORUN_DEFAULTS.recent_bars, int(limit) if limit and limit > 0 else 0)
+    target = max(1, target)
 
-    timeframe_seconds = _parse_timeframe_to_seconds(timeframe, None) or 60
-    timeframe_ms = timeframe_seconds * 1000
-    max_batch = 1500
-    since = 0
+    def _call():
+        return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=target)
+
+    raw = _GLOBAL_RATE_LIMITER.run(_call)
     candles: List[Dict[str, float]] = []
-    target = limit if limit > 0 else None
-
-    while True:
-        request_limit = max_batch
-        if target is not None and target < max_batch and not candles:
-            # first batch can be trimmed if the caller only needs a small window
-            request_limit = target
-        raw: List[List[float]]
-        if since <= 0:
-            raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=request_limit, since=since)
-        else:
-            raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=request_limit, since=since)
-        if not raw:
-            break
-        for entry in raw:
-            candles.append(
-                {
-                    "time": entry[0],
-                    "open": entry[1],
-                    "high": entry[2],
-                    "low": entry[3],
-                    "close": entry[4],
-                    "volume": entry[5],
-                }
-            )
-        if target is not None and len(candles) > target:
-            candles = candles[-target:]
-        last_open = raw[-1][0]
-        next_since = last_open + timeframe_ms
-        if len(raw) < request_limit:
-            break
-        if next_since <= since:
-            next_since = since + timeframe_ms
-        since = next_since
-    return candles
+    for entry in raw or []:
+        candles.append(
+            {
+                "time": entry[0],
+                "open": entry[1],
+                "high": entry[2],
+                "low": entry[3],
+                "close": entry[4],
+                "volume": entry[5] if len(entry) > 5 else float("nan"),
+            }
+        )
+    return candles[-target:]
 
 
 def _split_arguments(argument_string: str) -> List[str]:
@@ -9116,6 +9160,44 @@ def _iter_objects(container: Any, cls: Any) -> Iterable[Any]:
             yield obj
 
 
+def _current_bar_index(state: Any) -> Optional[int]:
+    series = getattr(state, "series", None)
+    try:
+        length = series.length()
+    except Exception:
+        return None
+    return max(0, length - 1) if isinstance(length, int) else None
+
+
+def _object_bar_index(obj: Any) -> Optional[int]:
+    for attr in ("right", "x2", "x1", "left", "x"):
+        value = getattr(obj, attr, None)
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def _object_time(series: Any, index: Optional[int]) -> Optional[int]:
+    if index is None:
+        return None
+    try:
+        values = getattr(series, "time", [])
+        if isinstance(values, list) and 0 <= index < len(values):
+            return int(values[index])
+    except Exception:
+        pass
+    return None
+
+
+def _is_recent(obj: Any, current_index: Optional[int], recent_bars: int) -> bool:
+    if current_index is None:
+        return True
+    idx = _object_bar_index(obj)
+    if idx is None:
+        return True
+    return current_index - idx <= max(0, recent_bars - 1)
+
+
 def _price_inside_box(price: float, box: Box) -> bool:
     lower = min(box.bottom, box.top)
     upper = max(box.bottom, box.top)
@@ -9126,32 +9208,79 @@ def _price_inside_box(price: float, box: Box) -> bool:
 # Unified hit detection helpers for scanner cards
 # -----------------------------------------------------------------------------
 
-def _box_hit_detail(label: str, price: float, boxes: Iterable[Box], *, tolerance: float = 0.0) -> Tuple[bool, Optional[str]]:
+def _box_hit_detail(
+    label: str,
+    price: float,
+    boxes: Iterable[Box],
+    *,
+    tolerance: float = 0.0,
+    near_limit: float = 0.0,
+    current_index: Optional[int] = None,
+    recent_bars: int = 1,
+    series: Any = None,
+) -> Tuple[str, Optional[str], Optional[int]]:
+    best_near: Tuple[str, Optional[str], Optional[int]] = ("miss", None, None)
     for bx in boxes:
         if not isinstance(bx, Box):
             continue
+        if not _is_recent(bx, current_index, recent_bars):
+            continue
         lower = min(bx.bottom, bx.top) - tolerance
         upper = max(bx.bottom, bx.top) + tolerance
+        ts = _object_time(series, _object_bar_index(bx)) if series is not None else None
+        rng = f"{format_price(bx.bottom)} → {format_price(bx.top)}"
         if lower <= price <= upper:
-            return True, f"{label} {format_price(bx.bottom)} → {format_price(bx.top)}"
-    return False, None
+            return "inside", f"{label} {rng}", ts
+        distance = min(abs(price - lower), abs(price - upper))
+        if near_limit > 0 and distance <= near_limit:
+            best_near = ("near", f"{label} near {rng}", ts)
+    return best_near
 
 
-def _line_hit_detail(label: str, price: float, lines: Iterable[Line], *, tolerance: float) -> Tuple[bool, Optional[str]]:
+def _line_hit_detail(
+    label: str,
+    price: float,
+    lines: Iterable[Line],
+    *,
+    tolerance: float,
+    near_limit: float,
+    current_index: Optional[int],
+    recent_bars: int,
+    series: Any,
+) -> Tuple[str, Optional[str], Optional[int]]:
+    best_near: Tuple[str, Optional[str], Optional[int]] = ("miss", None, None)
     for ln in lines:
         if not isinstance(ln, Line):
+            continue
+        if not _is_recent(ln, current_index, recent_bars):
             continue
         target = float(getattr(ln, "y1", getattr(ln, "y2", math.nan)))
         if math.isnan(target):
             continue
+        ts = _object_time(series, _object_bar_index(ln))
         if abs(price - target) <= tolerance:
-            return True, f"{label} near {format_price(target)}"
-    return False, None
+            return "inside", f"{label} {format_price(target)}", ts
+        if near_limit > 0 and abs(price - target) <= near_limit:
+            best_near = ("near", f"{label} near {format_price(target)}", ts)
+    return best_near
 
 
-def _label_hit_detail(label: str, price: float, labels: Iterable[Label], *, tolerance: float) -> Tuple[bool, Optional[str]]:
+def _label_hit_detail(
+    label: str,
+    price: float,
+    labels: Iterable[Label],
+    *,
+    tolerance: float,
+    near_limit: float,
+    current_index: Optional[int],
+    recent_bars: int,
+    series: Any,
+) -> Tuple[str, Optional[str], Optional[int]]:
+    best_near: Tuple[str, Optional[str], Optional[int]] = ("miss", None, None)
     for lbl in labels:
         if not isinstance(lbl, Label):
+            continue
+        if not _is_recent(lbl, current_index, recent_bars):
             continue
         txt = (getattr(lbl, "text", "") or "").strip().lower()
         if txt != "x":
@@ -9159,29 +9288,42 @@ def _label_hit_detail(label: str, price: float, labels: Iterable[Label], *, tole
         target = float(getattr(lbl, "y", math.nan))
         if math.isnan(target):
             continue
+        ts = _object_time(series, _object_bar_index(lbl))
         if abs(price - target) <= tolerance:
-            return True, f"X near {format_price(target)}"
-    return False, None
+            return "inside", f"X near {format_price(target)}", ts
+        if near_limit > 0 and abs(price - target) <= near_limit:
+            best_near = ("near", f"X near {format_price(target)}", ts)
+    return best_near
 
 
-def in_order_flow(state: Any) -> Tuple[bool, Optional[str]]:
-    price = getattr(getattr(state, "series", None), "get", lambda *_: None)("close")
-    if not isinstance(price, (int, float)) or math.isnan(price):
-        return False, None
-
+def in_order_flow(
+    state: Any,
+    *,
+    price: float,
+    near_limit: float,
+    recent_bars: int,
+    current_index: Optional[int],
+    series: Any,
+) -> Tuple[str, Optional[str], Optional[int]]:
     candidates: List[Tuple[str, str, PineArray]] = [
         ("Major Bullish", "bullish", getattr(state, "arrOBBullm", PineArray())),
         ("Minor Bullish", "bullish", getattr(state, "arrOBBulls", PineArray())),
         ("Major Bearish", "bearish", getattr(state, "arrOBBearm", PineArray())),
         ("Minor Bearish", "bearish", getattr(state, "arrOBBears", PineArray())),
     ]
+    best_near: Tuple[str, Optional[str], Optional[int]] = ("miss", None, None)
     for label, direction, container in candidates:
         for bx in _iter_objects(container, Box):
+            if not _is_recent(bx, current_index, recent_bars):
+                continue
+            rng = f"{format_price(bx.bottom)} → {format_price(bx.top)}"
+            ts = _object_time(series, _object_bar_index(bx))
             if _price_inside_box(price, bx):
-                rng = f"{format_price(bx.bottom)} → {format_price(bx.top)}"
-                detail = f"{label} ({direction}) {rng}"
-                return True, detail
-    return False, None
+                return "inside", f"{label} ({direction}) {rng}", ts
+            dist = min(abs(price - bx.bottom), abs(price - bx.top))
+            if near_limit > 0 and dist <= near_limit:
+                best_near = ("near", f"{label} ({direction}) near {rng}", ts)
+    return best_near
 
 
 def _liquidity_tolerance(price: float, state: Any) -> float:
@@ -9197,23 +9339,34 @@ def _liquidity_tolerance(price: float, state: Any) -> float:
     return max(base, adaptive, 1e-9)
 
 
-def in_liquidity(state: Any) -> Tuple[bool, Optional[str]]:
-    price = getattr(getattr(state, "series", None), "get", lambda *_: None)("close")
-    if not isinstance(price, (int, float)) or math.isnan(price):
-        return False, None
-
-    tolerance = _liquidity_tolerance(price, state)
+def in_liquidity(
+    state: Any,
+    *,
+    price: float,
+    tolerance: float,
+    near_limit: float,
+    recent_bars: int,
+    current_index: Optional[int],
+    series: Any,
+) -> Tuple[str, Optional[str], Optional[int]]:
     boxes = [
         ("High Liquidity", getattr(state, "liquidity_high_boxes", PineArray())),
         ("Low Liquidity", getattr(state, "liquidity_low_boxes", PineArray())),
     ]
+    best_near: Tuple[str, Optional[str], Optional[int]] = ("miss", None, None)
     for name, container in boxes:
         for bx in _iter_objects(container, Box):
+            if not _is_recent(bx, current_index, recent_bars):
+                continue
             lower = min(bx.bottom, bx.top) - tolerance
             upper = max(bx.bottom, bx.top) + tolerance
+            ts = _object_time(series, _object_bar_index(bx))
+            detail = f"{name} {format_price(bx.bottom)} → {format_price(bx.top)}"
             if lower <= price <= upper:
-                detail = f"{name} {format_price(bx.bottom)} → {format_price(bx.top)}"
-                return True, detail
+                return "inside", detail, ts
+            distance = min(abs(price - lower), abs(price - upper))
+            if near_limit > 0 and distance <= near_limit:
+                best_near = ("near", f"{name} near {format_price(lower)} → {format_price(upper)}", ts)
 
     lines = [
         ("High Liquidity", getattr(state, "liquidity_high_lines", PineArray())),
@@ -9221,20 +9374,28 @@ def in_liquidity(state: Any) -> Tuple[bool, Optional[str]]:
     ]
     for name, container in lines:
         for ln in _iter_objects(container, Line):
+            if not _is_recent(ln, current_index, recent_bars):
+                continue
             target = float(getattr(ln, "y1", getattr(ln, "y2", math.nan)))
             if math.isnan(target):
                 continue
+            ts = _object_time(series, _object_bar_index(ln))
             if abs(price - target) <= tolerance:
-                detail = f"{name} near {format_price(target)}"
-                return True, detail
-    return False, None
+                return "inside", f"{name} near {format_price(target)}", ts
+            if near_limit > 0 and abs(price - target) <= near_limit:
+                best_near = ("near", f"{name} close to {format_price(target)}", ts)
+    return best_near
 
 
-def in_fvg(state: Any) -> Tuple[bool, Optional[str], bool, Optional[str]]:
-    price = getattr(getattr(state, "series", None), "get", lambda *_: None)("close")
-    if not isinstance(price, (int, float)) or math.isnan(price):
-        return False, None, False, None
-
+def in_fvg(
+    state: Any,
+    *,
+    price: float,
+    near_limit: float,
+    recent_bars: int,
+    current_index: Optional[int],
+    series: Any,
+) -> Tuple[str, Optional[str], bool, Optional[str], Optional[int]]:
     holders = [
         ("Bullish FVG", getattr(state, "bullish_gap_holder", PineArray())),
         ("Bearish FVG", getattr(state, "bearish_gap_holder", PineArray())),
@@ -9242,13 +9403,20 @@ def in_fvg(state: Any) -> Tuple[bool, Optional[str], bool, Optional[str]]:
 
     any_exist = False
     last_box: Optional[Box] = None
+    last_ts: Optional[int] = None
+    best_near: Tuple[str, Optional[str], Optional[int]] = ("miss", None, None)
     for _, container in holders:
         for bx in _iter_objects(container, Box):
+            if not _is_recent(bx, current_index, recent_bars):
+                continue
             any_exist = True
             last_box = bx
+            last_ts = _object_time(series, _object_bar_index(bx)) or last_ts
 
     for name, container in holders:
         for bx in _iter_objects(container, Box):
+            if not _is_recent(bx, current_index, recent_bars):
+                continue
             if _price_inside_box(price, bx):
                 detail = f"{name} {format_price(bx.bottom)} → {format_price(bx.top)}"
                 existence_detail = None
@@ -9257,7 +9425,10 @@ def in_fvg(state: Any) -> Tuple[bool, Optional[str], bool, Optional[str]]:
                         f"FVGs موجودة: ✅ (آخر {format_price(last_box.bottom)} → {format_price(last_box.top)})"
                         if last_box else "FVGs موجودة: ✅"
                     )
-                return True, detail, True, existence_detail
+                return "inside", detail, True, existence_detail, _object_time(series, _object_bar_index(bx))
+            distance = min(abs(price - bx.bottom), abs(price - bx.top))
+            if near_limit > 0 and distance <= near_limit:
+                best_near = ("near", f"{name} near {format_price(bx.bottom)} → {format_price(bx.top)}", _object_time(series, _object_bar_index(bx)))
 
     existence_detail = None
     if any_exist and last_box:
@@ -9265,7 +9436,7 @@ def in_fvg(state: Any) -> Tuple[bool, Optional[str], bool, Optional[str]]:
     elif any_exist:
         existence_detail = "FVGs موجودة: ✅"
 
-    return False, None, any_exist, existence_detail
+    return best_near[0], best_near[1], any_exist, existence_detail, best_near[2] or last_ts
 
 
 def check_symbol_hits(state: Any, price: Optional[float] = None) -> Dict[str, Dict[str, Any]]:
@@ -9275,76 +9446,155 @@ def check_symbol_hits(state: Any, price: Optional[float] = None) -> Dict[str, Di
     if not isinstance(price_val, (int, float)) or math.isnan(price_val):
         price_val = float("nan")
 
+    recent_bars = int(getattr(state, "scan_recent_bars", getattr(state, "console_max_age_bars", EDITOR_AUTORUN_DEFAULTS.recent_bars)))
+    recent_bars = max(1, recent_bars)
+    near_pct = float(getattr(state, "near_threshold_pct", EDITOR_AUTORUN_DEFAULTS.near_threshold_pct))
+    near_limit = abs(price_val) * near_pct / 100 if isinstance(price_val, (int, float)) and not math.isnan(price_val) else 0.0
+
+    series = getattr(state, "series", None)
+    current_index = _current_bar_index(state)
     tolerance = _liquidity_tolerance(price_val, state) if isinstance(price_val, (int, float)) and not math.isnan(price_val) else 0.0
 
-    of_hit, of_detail = in_order_flow(state)
-    liq_hit, liq_detail = in_liquidity(state)
-    fvg_hit, fvg_detail, fvg_exists, fvg_exist_detail = in_fvg(state)
+    of_status, of_detail, of_ts = in_order_flow(
+        state,
+        price=price_val,
+        near_limit=near_limit,
+        recent_bars=recent_bars,
+        current_index=current_index,
+        series=series,
+    )
+    liq_status, liq_detail, liq_ts = in_liquidity(
+        state,
+        price=price_val,
+        tolerance=tolerance,
+        near_limit=near_limit,
+        recent_bars=recent_bars,
+        current_index=current_index,
+        series=series,
+    )
+    fvg_status, fvg_detail, fvg_exists, fvg_exist_detail, fvg_ts = in_fvg(
+        state,
+        price=price_val,
+        near_limit=near_limit,
+        recent_bars=recent_bars,
+        current_index=current_index,
+        series=series,
+    )
+
+    def _box_entry(label: str, container: Iterable[Box]) -> Tuple[str, Optional[str], Optional[int]]:
+        return _box_hit_detail(
+            label,
+            price_val,
+            container,
+            tolerance=tolerance,
+            near_limit=near_limit,
+            current_index=current_index,
+            recent_bars=recent_bars,
+            series=series,
+        )
 
     # Golden Zone (active box ``bxf``)
     gz_box = getattr(state, "bxf", None)
-    gz_hit, gz_detail = _box_hit_detail("Golden Zone", price_val, [gz_box] if isinstance(gz_box, Box) else [], tolerance=tolerance)
+    gz_status, gz_detail, gz_ts = _box_entry("Golden Zone", [gz_box] if isinstance(gz_box, Box) else [])
 
     # Current EXT / IDM OB boxes
     ext_box = getattr(state, "lstBx", None)
     idm_box = getattr(state, "lstBxIdm", None)
-    ext_hit, ext_detail = _box_hit_detail("EXT OB", price_val, [ext_box] if isinstance(ext_box, Box) else [], tolerance=tolerance)
-    idm_hit, idm_detail = _box_hit_detail("IDM OB", price_val, [idm_box] if isinstance(idm_box, Box) else [], tolerance=tolerance)
+    ext_status, ext_detail, ext_ts = _box_entry("EXT OB", [ext_box] if isinstance(ext_box, Box) else [])
+    idm_status, idm_detail, idm_ts = _box_entry("IDM OB", [idm_box] if isinstance(idm_box, Box) else [])
 
     # Historical OB boxes
-    hist_idm_hit, hist_idm_detail = _box_hit_detail(
-        "Hist IDM OB", price_val, _iter_objects(getattr(state, "hist_idm_boxes", PineArray()), Box), tolerance=tolerance
+    hist_idm_status, hist_idm_detail, hist_idm_ts = _box_entry(
+        "Hist IDM OB", _iter_objects(getattr(state, "hist_idm_boxes", PineArray()), Box)
     )
-    hist_ext_hit, hist_ext_detail = _box_hit_detail(
-        "Hist EXT OB", price_val, _iter_objects(getattr(state, "hist_ext_boxes", PineArray()), Box), tolerance=tolerance
+    hist_ext_status, hist_ext_detail, hist_ext_ts = _box_entry(
+        "Hist EXT OB", _iter_objects(getattr(state, "hist_ext_boxes", PineArray()), Box)
     )
 
     # Swing Sweep lines
-    swing_hit, swing_detail = _line_hit_detail(
+    swing_status, swing_detail, swing_ts = _line_hit_detail(
         "Swing Sweep",
         price_val,
         _iter_objects(getattr(state, "arrBCLine", PineArray()), Line),
         tolerance=tolerance,
+        near_limit=near_limit,
+        current_index=current_index,
+        recent_bars=recent_bars,
+        series=series,
     )
 
     # Mark X labels
-    mark_hit, mark_detail = _label_hit_detail("Mark X", price_val, getattr(state, "labels", []), tolerance=tolerance)
+    mark_status, mark_detail, mark_ts = _label_hit_detail(
+        "Mark X",
+        price_val,
+        getattr(state, "labels", []),
+        tolerance=tolerance,
+        near_limit=near_limit,
+        current_index=current_index,
+        recent_bars=recent_bars,
+        series=series,
+    )
+
+    def _entry(status: str, detail: Optional[str], ts: Optional[int], extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        payload = {
+            "hit": status in {"inside", "near"},
+            "status": status,
+            "detail": detail,
+            "time": ts,
+        }
+        if extra:
+            payload.update(extra)
+        return payload
 
     return {
-        "order_flow": {"hit": of_hit, "detail": of_detail},
-        "liquidity": {"hit": liq_hit, "detail": liq_detail},
-        "fvg": {
-            "hit": fvg_hit,
-            "detail": fvg_detail,
-            "exist": fvg_exists,
-            "exist_detail": fvg_exist_detail,
-        },
-        "golden_zone": {"hit": gz_hit, "detail": gz_detail},
-        "ext_ob": {"hit": ext_hit, "detail": ext_detail},
-        "idm_ob": {"hit": idm_hit, "detail": idm_detail},
-        "hist_idm_ob": {"hit": hist_idm_hit, "detail": hist_idm_detail},
-        "hist_ext_ob": {"hit": hist_ext_hit, "detail": hist_ext_detail},
-        "swing_sweep": {"hit": swing_hit, "detail": swing_detail},
-        "mark_x": {"hit": mark_hit, "detail": mark_detail},
+        "order_flow": _entry(of_status, of_detail, of_ts),
+        "liquidity": _entry(liq_status, liq_detail, liq_ts),
+        "fvg": _entry(
+            fvg_status,
+            fvg_detail,
+            fvg_ts,
+            {"exist": fvg_exists, "exist_detail": fvg_exist_detail},
+        ),
+        "golden_zone": _entry(gz_status, gz_detail, gz_ts),
+        "ext_ob": _entry(ext_status, ext_detail, ext_ts),
+        "idm_ob": _entry(idm_status, idm_detail, idm_ts),
+        "hist_idm_ob": _entry(hist_idm_status, hist_idm_detail, hist_idm_ts),
+        "hist_ext_ob": _entry(hist_ext_status, hist_ext_detail, hist_ext_ts),
+        "swing_sweep": _entry(swing_status, swing_detail, swing_ts),
+        "mark_x": _entry(mark_status, mark_detail, mark_ts),
     }
 
 
 def _build_zone_card(symbol: str, timeframe: str, runtime: Any) -> Optional[str]:
     hits = check_symbol_hits(runtime)
 
-    if not any(entry.get("hit") for entry in hits.values()):
+    inside_any = any(entry.get("status") == "inside" for entry in hits.values())
+    near_any = any(entry.get("status") == "near" for entry in hits.values())
+    if not (inside_any or near_any):
         return None
 
+    def _fmt_ts(ts: Optional[int]) -> str:
+        if not isinstance(ts, (int, float)):
+            return "—"
+        try:
+            return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts / 1000))
+        except Exception:
+            return "—"
+
     def _fmt_line(label: str, entry: Dict[str, Any]) -> str:
-        status = "✅" if entry.get("hit") else "❌"
+        status_key = entry.get("status")
+        icon = "✅" if status_key == "inside" else "🔵" if status_key == "near" else "❌"
         details: List[str] = []
         if entry.get("detail"):
-            details.append(str(entry["detail"]))
+            ts_part = ""
+            if entry.get("time"):
+                ts_part = f" @ {_fmt_ts(entry['time'])}"
+            details.append(f"{entry['detail']}{ts_part}")
         if label == "FVG" and entry.get("exist_detail"):
             details.append(str(entry["exist_detail"]))
         if not details:
-            return f"{label}: {status}"
-        return f"{label}: {status} {' | '.join(details)}"
+            return f"{label}: {icon}"
+        return f"{label}: {icon} {' | '.join(details)}"
 
     ordered_labels = [
         ("Order Flow", "order_flow"),
@@ -9359,7 +9609,12 @@ def _build_zone_card(symbol: str, timeframe: str, runtime: Any) -> Optional[str]
         ("Mark X", "mark_x"),
     ]
 
-    lines: List[str] = [f"SYMBOL: {_format_symbol(symbol)}"]
+    symbol_color = "\033[93m" if inside_any else "\033[94m"
+    symbol_display = f"{symbol_color}{_format_symbol(symbol)}{ANSI_RESET}"
+    status_line = "INSIDE" if inside_any else "NEAR"
+
+    lines: List[str] = [f"SYMBOL: {symbol_display}"]
+    lines.append(f"Status: {status_line}")
     for label, key in ordered_labels:
         lines.append(_fmt_line(label, hits.get(key, {})))
 
@@ -9405,7 +9660,7 @@ def scan_binance(
     if max_symbols and max_symbols > 0:
         all_symbols = all_symbols[: int(max_symbols)]
     try:
-        ticker_map = exchange.fetch_tickers(all_symbols)
+        ticker_map = _GLOBAL_RATE_LIMITER.run(exchange.fetch_tickers, all_symbols)
         if not isinstance(ticker_map, dict):
             ticker_map = {}
     except Exception as exc:
@@ -9420,14 +9675,7 @@ def scan_binance(
     primary_runtime: Optional[SmartMoneyAlgoProE5] = None
     window = recent_window_bars
     if window is None:
-        console_inputs = getattr(inputs, "console", None) if inputs else None
-        if console_inputs is not None and getattr(console_inputs, "max_age_bars", None) is not None:
-            try:
-                window = int(console_inputs.max_age_bars) + 1
-            except Exception:
-                window = 2
-        else:
-            window = 2
+        window = EDITOR_AUTORUN_DEFAULTS.recent_bars
     window = max(1, int(window))
 
     max_workers = 1 if (tracer and tracer.enabled) else max(1, int(concurrency))
@@ -9437,7 +9685,7 @@ def scan_binance(
         ticker = ticker_map.get(symbol)
         if ticker is None:
             try:
-                ticker = local_exchange.fetch_ticker(symbol)
+                ticker = _GLOBAL_RATE_LIMITER.run(local_exchange.fetch_ticker, symbol)
             except Exception as exc:
                 print(
                     f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ticker: {exc}",
@@ -9461,32 +9709,13 @@ def scan_binance(
                     threshold=min_daily_change,
                 )
             return None
-        candles = fetch_ohlcv(local_exchange, symbol, timeframe, limit)
+        candles = fetch_ohlcv(local_exchange, symbol, timeframe, max(limit, window))
         runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
         runtime.console_max_age_bars = max(runtime.console_max_age_bars, window)
+        runtime.scan_recent_bars = window
+        runtime.near_threshold_pct = getattr(inputs, "near_threshold_pct", EDITOR_AUTORUN_DEFAULTS.near_threshold_pct)
         runtime.process(candles)
         metrics = runtime.gather_console_metrics()
-        latest_events = metrics.get("latest_events") or {}
-        recent_hits, recent_times = _collect_recent_event_hits(
-            runtime.series, latest_events, bars=window
-        )
-        if not recent_hits:
-            print(
-                f"تخطي {_format_symbol(symbol)} لعدم وجود أحداث خلال آخر {window} شموع",
-                flush=True,
-            )
-            if tracer and tracer.enabled:
-                tracer.log(
-                    "scan",
-                    "symbol_skipped_stale_events",
-                    timestamp=runtime.series.get_time(0) or None,
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    reference_times=recent_times,
-                    window=window,
-                )
-            return None
-
         metrics["daily_change_percent"] = daily_change
         summaries.append(
             {
@@ -9802,6 +10031,7 @@ class _CLISettings:
     showSMC: bool = True
     lengSMC: int = 40
     swing_size: int = 10
+    near_threshold_pct: float = EDITOR_AUTORUN_DEFAULTS.near_threshold_pct
     show_fvg: bool = True
     show_liquidity: bool = True
     liquidity_display_limit: int = 20
@@ -9823,6 +10053,11 @@ class _CLISettings:
     exclude_symbols: str = ""
     exclude_patterns: str = _DEFAULT_EXCLUDE_PATTERNS
     include_only: str = ""
+    max_workers: int = 3
+    max_concurrent_requests: int = 3
+    request_delay_ms: int = 0
+    retry_count: int = 2
+    retry_backoff_base: float = 0.5
 
 def _get_secret(name: str) -> Optional[str]:
     return os.environ.get(name)
@@ -9934,7 +10169,12 @@ def _parse_args_android() -> Tuple[_CLISettings, argparse.Namespace]:
     p.add_argument("--exclude-patterns", default=_DEFAULT_EXCLUDE_PATTERNS)
     p.add_argument("--include-only", default="")
     # misc
-    p.add_argument("--recent", type=int, default=2)
+    p.add_argument("--recent", type=int, default=EDITOR_AUTORUN_DEFAULTS.recent_bars)
+    p.add_argument("--near-pct", type=float, default=EDITOR_AUTORUN_DEFAULTS.near_threshold_pct)
+    p.add_argument("--max-concurrent", type=int, default=3)
+    p.add_argument("--request-delay-ms", type=int, default=0)
+    p.add_argument("--retry-count", type=int, default=2)
+    p.add_argument("--retry-backoff", type=float, default=0.5)
     p.add_argument("--verbose", "-v", action="store_true", default=False)
     p.add_argument("--debug", action="store_true", default=False)
     p.add_argument("--tg", action="store_true", default=False)
@@ -9965,6 +10205,12 @@ def _parse_args_android() -> Tuple[_CLISettings, argparse.Namespace]:
         exclude_patterns=args.exclude_patterns,
         include_only=args.include_only,
         drop_last_incomplete=args.drop_last,
+        near_threshold_pct=args.near_pct,
+        max_workers=args.max_concurrent,
+        max_concurrent_requests=args.max_concurrent,
+        request_delay_ms=args.request_delay_ms,
+        retry_count=args.retry_count,
+        retry_backoff_base=args.retry_backoff,
     )
     return cfg, args
 
@@ -9975,7 +10221,7 @@ def _should_route_android(argv: List[str]) -> bool:
         "--leng-smc","--swing-size","--no-fvg","--no-liquidity","--liquidity-limit",
         "--mitigation","--bos-confirmation","--no-bos-plus","--no-ob-break","--no-ote","--no-ote-alert","--no-mark-x",
         "--min-change","--min-volume","--max-scan","--allow-meme","--exclude-symbols","--exclude-patterns","--include-only",
-        "--recent","--verbose","-v","--debug","--tg"
+        "--recent","--near-pct","--max-concurrent","--request-delay-ms","--retry-count","--retry-backoff","--verbose","-v","--debug","--tg"
     }
     return any(a in knobs for a in argv)
 
@@ -10246,6 +10492,7 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
         return 2
     cfg, args = _parse_args_android()
     recent_window = max(1, args.recent)
+    _set_rate_limits_from_cfg(cfg)
 
     # Build symbols first with strong filters
     symbols = _pick_symbols(cfg, symbol_override=(args.symbol or None), max_symbols_hint=args.max_symbols)
@@ -10295,6 +10542,7 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
         structure_util=utils,
         ict_structure=ICTMarketStructureInputs(swingSize=int(cfg.swing_size)),
     )
+    inputs.near_threshold_pct = float(getattr(cfg, "near_threshold_pct", EDITOR_AUTORUN_DEFAULTS.near_threshold_pct))
 
     # Run loop
     ex = _build_exchange(cfg.market)
@@ -10632,7 +10880,14 @@ def _build_exchange(_market_forced_usdtm:str="usdtm"):
 
 def fetch_ohlcv(ex, symbol, timeframe, limit):
     ex.load_markets()
-    return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    target = max(EDITOR_AUTORUN_DEFAULTS.recent_bars, int(limit) if limit and limit > 0 else 0)
+    target = max(1, target)
+
+    def _call():
+        return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=target)
+
+    raw = _GLOBAL_RATE_LIMITER.run(_call)
+    return raw[-target:] if raw else []
 
 # ---------- Settings & argument parsing ----------
 class Settings:
@@ -10650,6 +10905,7 @@ class Settings:
         self.lengSMC = kw.get("lengSMC", 40)
         self.swing_size = kw.get("swing_size", 10)
         self.swing_length = kw.get("swing_length", 50)
+        self.near_threshold_pct = kw.get("near_threshold_pct", EDITOR_AUTORUN_DEFAULTS.near_threshold_pct)
         self.show_fvg = kw.get("show_fvg", True)
         self.show_liquidity = kw.get("show_liquidity", True)
         self.liquidity_display_limit = kw.get("liquidity_display_limit", 20)
@@ -10669,6 +10925,11 @@ class Settings:
         self.structure_requires_wick = kw.get("structure_requires_wick", False)
         self.mtf_lookahead = kw.get("mtf_lookahead", False)
         self.zone_type = kw.get("zone_type", "Mother Bar")
+        self.max_workers = kw.get("max_workers", 3)
+        self.max_concurrent_requests = kw.get("max_concurrent_requests", 3)
+        self.request_delay_ms = kw.get("request_delay_ms", 0)
+        self.retry_count = kw.get("retry_count", 2)
+        self.retry_backoff_base = kw.get("retry_backoff_base", 0.5)
         raw_threshold = kw.get("min_change", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_threshold)
         try:
             self.min_change = float(raw_threshold) if raw_threshold is not None else None
@@ -10722,6 +10983,9 @@ class Settings:
 def _run_strategy_autorun(symbol: str, timeframe: str, runtime: Any) -> int:
     """يشغّل الاستراتيجية المتقدمة ويطبع تنبيهات شراء/بيع في المحرّر."""
 
+    if "_StrategyEngine" not in globals():
+        return 0
+
     cfg = STRATEGY_AUTORUN_DEFAULTS
     if not cfg.enabled:
         return 0
@@ -10758,6 +11022,11 @@ def _parse_args_android():
     p.add_argument("--symbol", "-s", default="")
     p.add_argument("--verbose", "-v", action="store_true", default=False)
     p.add_argument("--recent", type=int, default=EDITOR_AUTORUN_DEFAULTS.recent_bars)
+    p.add_argument("--near-pct", type=float, default=EDITOR_AUTORUN_DEFAULTS.near_threshold_pct)
+    p.add_argument("--max-concurrent", type=int, default=3)
+    p.add_argument("--request-delay-ms", type=int, default=0)
+    p.add_argument("--retry-count", type=int, default=2)
+    p.add_argument("--retry-backoff", type=float, default=0.5)
     p.add_argument("--drop-last", action="store_true", default=False)
     p.add_argument("--debug", action="store_true", default=False)
     p.add_argument("--show-hl", action="store_true", default=False)
@@ -10925,6 +11194,12 @@ def _parse_args_android():
         height_metric=height_metric,
         continuous_scan=args.continuous,
         continuous_interval=args.continuous_interval,
+        near_threshold_pct=args.near_pct,
+        max_workers=args.max_concurrent,
+        max_concurrent_requests=args.max_concurrent,
+        request_delay_ms=args.request_delay_ms,
+        retry_count=args.retry_count,
+        retry_backoff_base=args.retry_backoff,
     )
     return cfg, args
 
@@ -10999,6 +11274,8 @@ def _android_cli_entry() -> int:
     cfg, args = _parse_args_android()
     recent_window = max(1, args.recent)
 
+    _set_rate_limits_from_cfg(cfg)
+
     ex = _build_exchange(getattr(cfg, "market", 'usdtm'))
 
     try:
@@ -11037,6 +11314,7 @@ def _android_cli_entry() -> int:
         fvg=fvg, liquidity=liq, demand_supply=ds, order_block=ob,
         structure_util=utils, ict_structure=ict,
     )
+    inputs.near_threshold_pct = float(getattr(cfg, "near_threshold_pct", EDITOR_AUTORUN_DEFAULTS.near_threshold_pct))
     inputs.console.max_age_bars = max(1, recent_window - 1)
 
     symbol_override = args.symbol or None
@@ -11056,12 +11334,15 @@ def _android_cli_entry() -> int:
                     pass
             for i, sym in enumerate(symbols, 1):
                 try:
-                    candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
+                    candles = fetch_ohlcv(ex, sym, args.timeframe, max(args.limit, recent_window))
                     if cfg.drop_last_incomplete and candles:
                         candles = candles[:-1]
                     runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
                     runtime._bos_break_source = cfg.bos_confirmation
                     runtime._strict_close_for_break = cfg.strict_close_for_break
+                    runtime.console_max_age_bars = max(runtime.console_max_age_bars, recent_window)
+                    runtime.scan_recent_bars = recent_window
+                    runtime.near_threshold_pct = getattr(inputs, "near_threshold_pct", EDITOR_AUTORUN_DEFAULTS.near_threshold_pct)
                     runtime.process([
                         {"time": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5] if len(c)>5 else float('nan')}
                         for c in candles
