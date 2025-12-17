@@ -190,6 +190,10 @@ TELEGRAM_CHAT_ID: str = "119055277"
 TELEGRAM_MAX_MSG_PER_MIN: int = 20
 TELEGRAM_RETRY_COUNT: int = 3
 TELEGRAM_BACKOFF_BASE_SEC: float = 1.5
+# Golden Zone first-touch notifications / filters
+GOLDEN_ZONE_ALERT_ENABLED: bool = True
+GOLDEN_ZONE_FIRST_TOUCH_MAX_AGE_BARS: int = 240
+GOLDEN_ZONE_TIMEFRAME_FILTERS: Tuple[str, ...] = ()
 # Enable/disable Telegram alerts per zone concept (all default to True)
 TELEGRAM_ZONE_TOGGLES: Dict[str, bool] = {
     "order_flow": False,
@@ -1608,6 +1612,7 @@ class SmartMoneyAlgoProE5:
             except (TypeError, ValueError):
                 max_age = 1
         self.console_max_age_bars = max(1, max_age)
+        self.golden_zone_max_age_bars = max(1, int(GOLDEN_ZONE_FIRST_TOUCH_MAX_AGE_BARS))
         self.alert_toggles: AlertToggleConfig = getattr(self.inputs, "alert_toggles", DEFAULT_ALERT_TOGGLES)
 
         # Mirrors for Pine ``var``/``array`` state ---------------------------
@@ -1634,6 +1639,7 @@ class SmartMoneyAlgoProE5:
         self.bullish_OB_Break: bool = False
         self.bearish_OB_Break: bool = False
         self.isb_history: List[bool] = []
+        self.golden_zone_first_touch_time: Optional[int] = None
 
     # ------------------------------------------------------------------
     # Pine primitive wrappers
@@ -1771,6 +1777,14 @@ class SmartMoneyAlgoProE5:
         if bars_ago is None:
             return True
         return bars_ago <= self.console_max_age_bars
+
+    def _golden_zone_event_within_age(self, timestamp: Any) -> bool:
+        if self.golden_zone_max_age_bars <= 0:
+            return True
+        bars_ago = self._bars_ago_from_time(timestamp)
+        if bars_ago is None:
+            return True
+        return bars_ago <= self.golden_zone_max_age_bars
 
     def gather_console_metrics(self) -> Dict[str, Any]:
         """Aggregate runtime metrics for console presentation."""
@@ -1975,7 +1989,10 @@ class SmartMoneyAlgoProE5:
             payload = value.copy()
             if "time" in payload and "time_display" not in payload:
                 payload["time_display"] = format_timestamp(payload.get("time"))
-            if not self._console_event_within_age(payload.get("time")):
+            if key == "GOLDEN_ZONE":
+                if not self._golden_zone_event_within_age(payload.get("time")):
+                    continue
+            elif not self._console_event_within_age(payload.get("time")):
                 continue
             events[key] = payload
 
@@ -2016,7 +2033,10 @@ class SmartMoneyAlgoProE5:
                 for bx in reversed(seq):
                     if not isinstance(bx, Box):
                         continue
-                    if key != 'GOLDEN_ZONE' and not self._console_event_within_age(bx.left):
+                    if key == 'GOLDEN_ZONE':
+                        if not self._golden_zone_event_within_age(bx.left):
+                            continue
+                    elif not self._console_event_within_age(bx.left):
                         continue
                     if predicate(bx):
                         events[key] = {
@@ -6461,6 +6481,7 @@ class SmartMoneyAlgoProE5:
         self.bxf = None
         self.bxty = 0
         self.bxf_touched = False
+        self.golden_zone_first_touch_time = None
 
     def _golden_zone_bounds(self) -> Optional[Tuple[float, float]]:
         if not isinstance(self.bxf, Box):
@@ -6515,7 +6536,9 @@ class SmartMoneyAlgoProE5:
             return
         if low <= zone_max and high >= zone_min:
             self.bxf_touched = True
-            self._register_box_event(self.bxf, status="touched", event_time=self.series.get_time(0))
+            touch_time = self.series.get_time(0)
+            self.golden_zone_first_touch_time = touch_time if isinstance(touch_time, (int, float)) else None
+            self._register_box_event(self.bxf, status="touched", event_time=touch_time)
             if getattr(self.inputs.structure_util, "enable_alert_ote_touch", True):
                 price_range = f"{format_price(zone_min)} → {format_price(zone_max)}"
                 close_text = format_price(self.series.get("close"))
@@ -9346,6 +9369,26 @@ def _price_inside_box(price: float, box: Box) -> bool:
     return lower <= price <= upper
 
 
+def _golden_zone_bounds(state: Any) -> Optional[Tuple[float, float]]:
+    try:
+        if hasattr(state, "_golden_zone_bounds"):
+            return state._golden_zone_bounds()  # type: ignore
+    except Exception:
+        pass
+    try:
+        bx = getattr(state, "bxf", None)
+        if isinstance(bx, Box):
+            top = bx.get_top()
+            bottom = bx.get_bottom()
+            if not (math.isnan(top) or math.isnan(bottom)):
+                lower = min(top, bottom)
+                upper = max(top, bottom)
+                return lower, upper
+    except Exception:
+        return None
+    return None
+
+
 # -----------------------------------------------------------------------------
 # Unified hit detection helpers for scanner cards
 # -----------------------------------------------------------------------------
@@ -9597,6 +9640,34 @@ def check_symbol_hits(state: Any, price: Optional[float] = None) -> Dict[str, Di
     current_index = _current_bar_index(state)
     tolerance = _liquidity_tolerance(price_val, state) if isinstance(price_val, (int, float)) and not math.isnan(price_val) else 0.0
 
+    def _bars_ago_from_runtime(ts: Any) -> Optional[int]:
+        if not isinstance(ts, (int, float)):
+            return None
+        try:
+            if hasattr(state, "_bars_ago_from_time"):
+                return state._bars_ago_from_time(ts)  # type: ignore
+        except Exception:
+            pass
+        series_obj = getattr(state, "series", None)
+        try:
+            times = getattr(series_obj, "time", [])
+            if isinstance(times, list) and times:
+                idx = bisect.bisect_right(times, ts) - 1
+                if 0 <= idx < len(times):
+                    return (len(times) - 1) - idx
+        except Exception:
+            return None
+        return None
+
+    def _recent_golden_touch(ts: Any) -> bool:
+        max_age = getattr(state, "golden_zone_max_age_bars", GOLDEN_ZONE_FIRST_TOUCH_MAX_AGE_BARS)
+        if max_age <= 0:
+            return True
+        bars_ago = _bars_ago_from_runtime(ts)
+        if bars_ago is None:
+            return True
+        return bars_ago <= max_age
+
     of_status, of_detail, of_ts = in_order_flow(
         state,
         price=price_val,
@@ -9638,6 +9709,19 @@ def check_symbol_hits(state: Any, price: Optional[float] = None) -> Dict[str, Di
     # Golden Zone (active box ``bxf``)
     gz_box = getattr(state, "bxf", None)
     gz_status, gz_detail, gz_ts = _box_entry("Golden Zone", [gz_box] if isinstance(gz_box, Box) else [])
+    gz_touch_ts = getattr(state, "golden_zone_first_touch_time", None)
+    gz_first_touch = bool(getattr(state, "bxf_touched", False) and _recent_golden_touch(gz_touch_ts))
+    if gz_first_touch:
+        bounds = _golden_zone_bounds(state)
+        price_range = None
+        if bounds is not None:
+            price_range = f"{format_price(bounds[0])} → {format_price(bounds[1])}"
+        gz_status = "inside"
+        gz_ts = gz_touch_ts if isinstance(gz_touch_ts, (int, float)) else gz_ts
+        if price_range:
+            gz_detail = f"Golden Zone First Touch {price_range}"
+        else:
+            gz_detail = gz_detail or "Golden Zone First Touch"
 
     # Current EXT / IDM OB boxes
     ext_box = getattr(state, "lstBx", None)
@@ -9688,6 +9772,8 @@ def check_symbol_hits(state: Any, price: Optional[float] = None) -> Dict[str, Di
             payload.update(extra)
         return payload
 
+    gz_extra = {"first_touch": gz_first_touch, "first_touch_time": gz_touch_ts}
+
     return {
         "order_flow": _entry(of_status, of_detail, of_ts),
         "liquidity": _entry(liq_status, liq_detail, liq_ts),
@@ -9697,7 +9783,7 @@ def check_symbol_hits(state: Any, price: Optional[float] = None) -> Dict[str, Di
             fvg_ts,
             {"exist": fvg_exists, "exist_detail": fvg_exist_detail},
         ),
-        "golden_zone": _entry(gz_status, gz_detail, gz_ts),
+        "golden_zone": _entry(gz_status, gz_detail, gz_ts, gz_extra),
         "ext_ob": _entry(ext_status, ext_detail, ext_ts),
         "idm_ob": _entry(idm_status, idm_detail, idm_ts),
         "hist_idm_ob": _entry(hist_idm_status, hist_idm_detail, hist_idm_ts),
@@ -9722,6 +9808,7 @@ ZONE_LABELS: List[Tuple[str, str]] = [
 
 
 _INSIDE_STATE: Dict[Tuple[str, str], Dict[str, Any]] = {}
+_GZ_FIRST_TOUCH_STATE: Dict[Tuple[str, str], Optional[int]] = {}
 
 
 def _telegram_allowed_zone_keys() -> Set[str]:
@@ -9729,6 +9816,15 @@ def _telegram_allowed_zone_keys() -> Set[str]:
         return {key for key, enabled in TELEGRAM_ZONE_TOGGLES.items() if enabled}
     except Exception:
         return set()
+
+
+def _golden_zone_timeframe_allowed(timeframe: str) -> bool:
+    if not GOLDEN_ZONE_TIMEFRAME_FILTERS:
+        return True
+    try:
+        return timeframe.lower() in {tf.lower() for tf in GOLDEN_ZONE_TIMEFRAME_FILTERS}
+    except Exception:
+        return False
 
 
 def _safe_candle_time(runtime: Any) -> Optional[int]:
@@ -9845,6 +9941,42 @@ def _handle_telegram_entry(symbol: str, timeframe: str, runtime: Any, hits: Dict
     if msg:
         _TELEGRAM_NOTIFIER.send(msg)
     _INSIDE_STATE[key] = {"was_inside": True, "last_inside_candle_time": candle_time, "last_hit_signature": signature}
+
+
+def _handle_telegram_golden_first_touch(symbol: str, timeframe: str, runtime: Any, hits: Dict[str, Dict[str, Any]]) -> None:
+    if not (GOLDEN_ZONE_ALERT_ENABLED and _TELEGRAM_NOTIFIER.enabled):
+        return
+    if not TELEGRAM_ZONE_TOGGLES.get("golden_zone", True):
+        return
+    if not _golden_zone_timeframe_allowed(timeframe):
+        return
+
+    entry = hits.get("golden_zone", {})
+    if not entry.get("first_touch"):
+        return
+
+    ts = entry.get("first_touch_time") or entry.get("time")
+    key = (symbol, timeframe)
+    if _GZ_FIRST_TOUCH_STATE.get(key) == ts:
+        return
+
+    price_val = getattr(getattr(runtime, "series", None), "get", lambda *_: float("nan"))("close")
+    ts_display = "—"
+    if isinstance(ts, (int, float)):
+        try:
+            ts_display = time.strftime("%Y-%m-%d %H:%M", time.gmtime(ts / 1000))
+        except Exception:
+            ts_display = "—"
+    detail = entry.get("detail") or "Golden Zone First Touch"
+    msg_lines = [
+        "🚨 GOLDEN ZONE FIRST TOUCH",
+        f"SYMBOL: {symbol} ({timeframe})",
+        f"Detail: {detail}",
+        f"Price: {format_price(price_val)}",
+        f"Candle: {ts_display}",
+    ]
+    _TELEGRAM_NOTIFIER.send("\n".join(msg_lines))
+    _GZ_FIRST_TOUCH_STATE[key] = ts
 
 
 def _build_zone_card(symbol: str, timeframe: str, runtime: Any, *, hits: Optional[Dict[str, Dict[str, Any]]] = None) -> Optional[str]:
@@ -10836,6 +10968,7 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
 
         hits = check_symbol_hits(runtime)
         _handle_telegram_entry(sym, args.timeframe, runtime, hits)
+        _handle_telegram_golden_first_touch(sym, args.timeframe, runtime, hits)
         card = _build_zone_card(sym, args.timeframe, runtime, hits=hits)
         if not card:
             continue
@@ -11627,6 +11760,7 @@ def _android_cli_entry() -> int:
 
                 hits = check_symbol_hits(runtime)
                 _handle_telegram_entry(sym, args.timeframe, runtime, hits)
+                _handle_telegram_golden_first_touch(sym, args.timeframe, runtime, hits)
                 card = _build_zone_card(sym, args.timeframe, runtime, hits=hits)
                 if not card:
                     continue
