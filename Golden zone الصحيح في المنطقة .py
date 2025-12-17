@@ -9556,6 +9556,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--data", type=Path, help="JSON file with OHLCV candles", required=False)
     parser.add_argument("--outfile", type=Path, default=Path("FINAL_REPORT_SMART_MONEY_ANALYSIS.md"))
     parser.add_argument("--timeframe", type=str, default="1h", help="Timeframe used when scanning Binance")
+    parser.add_argument(
+        "--timeframes",
+        type=str,
+        default="",
+        help="Comma-separated list of timeframes to scan (overrides SCAN_TIMEFRAMES)",
+    )
     parser.add_argument("--analysis-timeframe", type=str, default="", help="Override base timeframe when using --data or --no-scan")
     parser.add_argument(
         "--lookback",
@@ -9693,6 +9699,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     manual_symbols = [s.strip() for s in args.symbols.split(",") if s.strip()] or None
+    cli_timeframes = _parse_timeframe_list(args.timeframes)
+    active_timeframes = cli_timeframes or list(SCAN_TIMEFRAMES) or [args.timeframe]
 
     iteration = 0
     try:
@@ -9702,21 +9710,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             start = time.time()
             if args.continuous_scan and iteration > 1:
                 print(f"\nإعادة تشغيل المسح (الدورة {iteration})", flush=True)
-            log("Foundation")
-            log("Inventory")
-            log("Timeline")
-            runtime, summaries = scan_binance(
-                args.timeframe,
-                args.lookback,
-                manual_symbols,
-                args.concurrency,
-                tracer,
-                min_daily_change=args.min_daily_change,
-                inputs=indicator_inputs,
-            )
+            primary_runtime: Optional[SmartMoneyAlgoProE5] = None
+            combined_summaries: List[Dict[str, Any]] = []
+            for timeframe in active_timeframes:
+                log("Foundation")
+                log("Inventory")
+                log("Timeline")
+                runtime, summaries = scan_binance(
+                    timeframe,
+                    args.lookback,
+                    manual_symbols,
+                    args.concurrency,
+                    tracer,
+                    min_daily_change=args.min_daily_change,
+                    inputs=indicator_inputs,
+                )
+                if primary_runtime is None:
+                    primary_runtime = runtime
+                combined_summaries.extend(summaries)
             perform_comparison()
             log("Rendering")
-            render_report(runtime, args.outfile, summaries)
+            render_report(primary_runtime or runtime, args.outfile, combined_summaries)
             elapsed = time.time() - start
             log(f"Coverage ({elapsed:.2f}s)")
             tracer.emit()
@@ -9781,6 +9795,12 @@ def _normalize_list(csv_like: str) -> List[str]:
     if not csv_like:
         return []
     return [x.strip().upper() for x in csv_like.split(",") if x.strip()]
+
+
+def _parse_timeframe_list(value: str) -> List[str]:
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 def _parse_bool_token(token: str) -> bool:
@@ -10821,6 +10841,12 @@ def _parse_args_android():
     import argparse
     p = argparse.ArgumentParser(prog="SMC Binance Scanner (Android single-file)")
     p.add_argument("--timeframe", "-t", default=EDITOR_AUTORUN_DEFAULTS.timeframe)
+    p.add_argument(
+        "--timeframes",
+        type=str,
+        default="",
+        help="قائمة فواصل زمنية مفصولة بفواصل لتجاوز الإعدادات الافتراضية",
+    )
     p.add_argument("--limit", "-l", type=int, default=EDITOR_AUTORUN_DEFAULTS.candle_limit)
     p.add_argument("--max-symbols", "-n", type=int, default=EDITOR_AUTORUN_DEFAULTS.max_symbols)
     p.add_argument("--mitigation", choices=["WICK","CLOSE"], default="CLOSE")
@@ -11068,6 +11094,7 @@ def _android_cli_entry() -> int:
         return 2
     cfg, args = _parse_args_android()
     recent_window = max(1, args.recent)
+    active_timeframes = _parse_timeframe_list(getattr(args, "timeframes", "")) or list(SCAN_TIMEFRAMES) or [args.timeframe]
 
     ex = _build_exchange(getattr(cfg, "market", 'usdtm'))
 
@@ -11130,34 +11157,35 @@ def _android_cli_entry() -> int:
                     run_golden_zone_first_touch_scan(symbols, candle_limit=args.limit)
                 except Exception as exc:
                     print(f"[GoldenScan] فشل مسح Golden Zone: {exc}", file=sys.stderr)
-            for i, sym in enumerate(symbols, 1):
-                try:
-                    candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
-                    if cfg.drop_last_incomplete and candles:
-                        candles = candles[:-1]
-                    runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
-                    runtime._bos_break_source = cfg.bos_confirmation
-                    runtime._strict_close_for_break = cfg.strict_close_for_break
-                    runtime.process([
-                        {"time": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5] if len(c)>5 else float('nan')}
-                        for c in candles
-                    ])
-                except Exception as e:
-                    print(
-                        f"[{i}/{len(symbols)}] {_format_symbol(sym)}: error {e}",
-                        file=sys.stderr,
-                    )
-                    continue
+            for timeframe in active_timeframes:
+                for i, sym in enumerate(symbols, 1):
+                    try:
+                        candles = fetch_ohlcv(ex, sym, timeframe, args.limit)
+                        if cfg.drop_last_incomplete and candles:
+                            candles = candles[:-1]
+                        runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe)
+                        runtime._bos_break_source = cfg.bos_confirmation
+                        runtime._strict_close_for_break = cfg.strict_close_for_break
+                        runtime.process([
+                            {"time": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5] if len(c)>5 else float('nan')}
+                            for c in candles
+                        ])
+                    except Exception as e:
+                        print(
+                            f"[{i}/{len(symbols)}] {_format_symbol(sym)} @ {timeframe}: error {e}",
+                            file=sys.stderr,
+                        )
+                        continue
 
-                card = _build_zone_card(sym, args.timeframe, runtime)
-                if not card:
-                    continue
+                    card = _build_zone_card(sym, timeframe, runtime)
+                    if not card:
+                        continue
 
-                print(card)
-                _run_strategy_autorun(sym, args.timeframe, runtime)
+                    print(card)
+                    _run_strategy_autorun(sym, timeframe, runtime)
 
             if args.verbose:
-                print(f"\nتم. عدد الرموز: {len(symbols)}")
+                print(f"\nتم. عدد الرموز: {len(symbols)} | الإطارات: {', '.join(active_timeframes)}")
 
             if not cfg.continuous_scan:
                 print(
