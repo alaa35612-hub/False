@@ -190,6 +190,19 @@ TELEGRAM_CHAT_ID: str = "PUT_CHAT_ID_HERE"
 TELEGRAM_MAX_MSG_PER_MIN: int = 20
 TELEGRAM_RETRY_COUNT: int = 3
 TELEGRAM_BACKOFF_BASE_SEC: float = 1.5
+# Enable/disable Telegram alerts per zone concept (all default to True)
+TELEGRAM_ZONE_TOGGLES: Dict[str, bool] = {
+    "order_flow": True,
+    "liquidity": True,
+    "fvg": True,
+    "golden_zone": True,
+    "ext_ob": True,
+    "idm_ob": True,
+    "hist_idm_ob": True,
+    "hist_ext_ob": True,
+    "swing_sweep": True,
+    "mark_x": True,
+}
 
 _telegram_warning_emitted = False
 
@@ -9711,6 +9724,13 @@ ZONE_LABELS: List[Tuple[str, str]] = [
 _INSIDE_STATE: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
 
+def _telegram_allowed_zone_keys() -> Set[str]:
+    try:
+        return {key for key, enabled in TELEGRAM_ZONE_TOGGLES.items() if enabled}
+    except Exception:
+        return set()
+
+
 def _safe_candle_time(runtime: Any) -> Optional[int]:
     try:
         return getattr(runtime, "series", None).get_time(0)  # type: ignore
@@ -9721,18 +9741,29 @@ def _safe_candle_time(runtime: Any) -> Optional[int]:
             return None
 
 
-def _inside_hits(hits: Dict[str, Dict[str, Any]]) -> List[Tuple[str, Dict[str, Any]]]:
+def _inside_hits(
+    hits: Dict[str, Dict[str, Any]], *, allowed_keys: Optional[Set[str]] = None
+) -> List[Tuple[str, Dict[str, Any]]]:
     out: List[Tuple[str, Dict[str, Any]]] = []
     for label, key in ZONE_LABELS:
+        if allowed_keys is not None and key not in allowed_keys:
+            continue
         entry = hits.get(key, {})
         if entry.get("status") == "inside":
             out.append((label, entry))
     return out
 
 
-def _entry_signature(symbol: str, timeframe: str, candle_time: Optional[int], hits: Dict[str, Dict[str, Any]]) -> str:
+def _entry_signature(
+    symbol: str,
+    timeframe: str,
+    candle_time: Optional[int],
+    hits: Dict[str, Dict[str, Any]],
+    *,
+    allowed_keys: Optional[Set[str]] = None,
+) -> str:
     parts: List[str] = []
-    for label, entry in _inside_hits(hits):
+    for label, entry in _inside_hits(hits, allowed_keys=allowed_keys):
         detail = entry.get("detail") or ""
         ts_val = entry.get("time") or ""
         parts.append(f"{label}|{detail}|{ts_val}")
@@ -9747,8 +9778,10 @@ def _format_telegram_entry_message(
     price_source: str,
     candle_time: Optional[int],
     hits: Dict[str, Dict[str, Any]],
+    *,
+    allowed_keys: Optional[Set[str]] = None,
 ) -> Optional[str]:
-    inside_list = _inside_hits(hits)
+    inside_list = _inside_hits(hits, allowed_keys=allowed_keys)
     if not inside_list:
         return None
     ts_display = "—"
@@ -9784,7 +9817,8 @@ def _format_telegram_entry_message(
 def _handle_telegram_entry(symbol: str, timeframe: str, runtime: Any, hits: Dict[str, Dict[str, Any]]) -> None:
     if not _TELEGRAM_NOTIFIER.enabled:
         return
-    inside_list = _inside_hits(hits)
+    allowed_keys = _telegram_allowed_zone_keys()
+    inside_list = _inside_hits(hits, allowed_keys=allowed_keys)
     key = (symbol, timeframe)
     state = _INSIDE_STATE.get(key, {"was_inside": False, "last_inside_candle_time": None, "last_hit_signature": None})
     if not inside_list:
@@ -9793,7 +9827,7 @@ def _handle_telegram_entry(symbol: str, timeframe: str, runtime: Any, hits: Dict
         return
 
     candle_time = _safe_candle_time(runtime)
-    signature = _entry_signature(symbol, timeframe, candle_time, hits)
+    signature = _entry_signature(symbol, timeframe, candle_time, hits, allowed_keys=allowed_keys)
     if state.get("was_inside"):
         _INSIDE_STATE[key] = {"was_inside": True, "last_inside_candle_time": candle_time, "last_hit_signature": signature}
         return
@@ -9806,6 +9840,7 @@ def _handle_telegram_entry(symbol: str, timeframe: str, runtime: Any, hits: Dict
         "closed_close",
         candle_time,
         hits,
+        allowed_keys=allowed_keys,
     )
     if msg:
         _TELEGRAM_NOTIFIER.send(msg)
