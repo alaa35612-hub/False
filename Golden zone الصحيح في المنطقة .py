@@ -11683,21 +11683,59 @@ def _android_cli_entry() -> int:
                     symbols = symbols[: int(cfg.max_scan)]
                 except Exception:
                     pass
+            candle_window = max(args.limit, recent_window)
+            try:
+                bulk_candles = _bulk_fetch_recent_ohlcv(ex, symbols, args.timeframe, candle_window) or {}
+            except Exception as e:
+                print(f"فشل الجلب المجمع للشموع: {e}", file=sys.stderr)
+                bulk_candles = {}
+
             for i, sym in enumerate(symbols, 1):
                 try:
-                    candles = fetch_ohlcv(ex, sym, args.timeframe, max(args.limit, recent_window))
+                    raw_candles = list(bulk_candles.get(sym) or [])
+                    if candle_window and len(raw_candles) > candle_window:
+                        candles = raw_candles[-candle_window:]
+                    else:
+                        candles = raw_candles
                     if cfg.drop_last_incomplete and candles:
                         candles = candles[:-1]
+
+                    normalized: List[Dict[str, float]] = []
+                    for c in candles:
+                        if isinstance(c, dict):
+                            if {"time", "open", "high", "low", "close"}.issubset(c):
+                                normalized.append({
+                                    "time": int(c.get("time", 0)),
+                                    "open": float(c.get("open", float("nan"))),
+                                    "high": float(c.get("high", float("nan"))),
+                                    "low": float(c.get("low", float("nan"))),
+                                    "close": float(c.get("close", float("nan"))),
+                                    "volume": float(c.get("volume", c.get("vol", float("nan")))),
+                                })
+                        elif isinstance(c, (list, tuple)) and len(c) >= 5:
+                            normalized.append({
+                                "time": int(c[0]),
+                                "open": float(c[1]),
+                                "high": float(c[2]),
+                                "low": float(c[3]),
+                                "close": float(c[4]),
+                                "volume": float(c[5]) if len(c) > 5 else float("nan"),
+                            })
+
+                    if not normalized:
+                        print(
+                            f"[{i}/{len(symbols)}] {_format_symbol(sym)}: no candle data after bulk fetch",
+                            file=sys.stderr,
+                        )
+                        continue
+
                     runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
                     runtime._bos_break_source = cfg.bos_confirmation
                     runtime._strict_close_for_break = cfg.strict_close_for_break
                     runtime.console_max_age_bars = max(runtime.console_max_age_bars, recent_window)
                     runtime.scan_recent_bars = recent_window
                     runtime.near_threshold_pct = getattr(inputs, "near_threshold_pct", EDITOR_AUTORUN_DEFAULTS.near_threshold_pct)
-                    runtime.process([
-                        {"time": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5] if len(c)>5 else float('nan')}
-                        for c in candles
-                    ])
+                    runtime.process(normalized)
                 except Exception as e:
                     print(
                         f"[{i}/{len(symbols)}] {_format_symbol(sym)}: error {e}",
