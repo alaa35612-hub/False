@@ -204,6 +204,9 @@ TELEGRAM_ZONE_TOGGLES: Dict[str, bool] = {
     "mark_x": True,
 }
 
+# Global recency window (in bars) to filter old zones/events from output
+RECENT_EVENT_BARS_DEFAULT: int = 50
+
 _telegram_warning_emitted = False
 
 
@@ -326,7 +329,7 @@ class _EditorAutorunDefaults:
     timeframe: str = "15m"
     candle_limit: int = 500
     max_symbols: int = 600
-    recent_bars: int = 50
+    recent_bars: int = RECENT_EVENT_BARS_DEFAULT
     near_threshold_pct: float = 0.2
     continuous_scan: bool = False
     scan_interval: float = 0.0
@@ -1601,13 +1604,14 @@ class SmartMoneyAlgoProE5:
         self.console_box_status_tally: Dict[str, Counter[str]] = defaultdict(Counter)
         console_inputs = getattr(self.inputs, "console", None)
         if console_inputs is None:
-            max_age = 1
+            max_age = RECENT_EVENT_BARS_DEFAULT
         else:
             try:
-                max_age = int(getattr(console_inputs, "max_age_bars", 1) or 1)
+                max_age = int(getattr(console_inputs, "max_age_bars", RECENT_EVENT_BARS_DEFAULT) or RECENT_EVENT_BARS_DEFAULT)
             except (TypeError, ValueError):
-                max_age = 1
+                max_age = RECENT_EVENT_BARS_DEFAULT
         self.console_max_age_bars = max(1, max_age)
+        self.scan_recent_bars: int = max(1, RECENT_EVENT_BARS_DEFAULT)
         self.alert_toggles: AlertToggleConfig = getattr(self.inputs, "alert_toggles", DEFAULT_ALERT_TOGGLES)
 
         # Mirrors for Pine ``var``/``array`` state ---------------------------
@@ -10133,7 +10137,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--max-age-bars",
         type=int,
-        default=1,
+        default=RECENT_EVENT_BARS_DEFAULT,
         help="Ignore console events older than this many completed bars (minimum 1)",
     )
     parser.add_argument(
