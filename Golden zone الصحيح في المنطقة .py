@@ -1895,7 +1895,12 @@ class SmartMoneyAlgoProE5:
             payload = value.copy()
             if "time" in payload and "time_display" not in payload:
                 payload["time_display"] = format_timestamp(payload.get("time"))
-            if not self._console_event_within_age(payload.get("time")):
+            event_time = payload.get("time")
+            if not isinstance(event_time, (int, float)) or event_time <= 0:
+                if DEBUG_LOGS:
+                    print(f"[DBG] Skipping event {key} due to invalid time: {event_time}", file=sys.stderr)
+                continue
+            if not self._console_event_within_age(event_time):
                 continue
             events[key] = payload
 
@@ -9006,6 +9011,32 @@ EVENT_DISPLAY_ORDER = [
     ("ALERT_HIGH_LIQUIDITY_LEVEL_BREAK", "High Liquidity Level Break"),
     ("ALERT_LOW_LIQUIDITY_LEVEL_BREAK", "Low Liquidity Level Break"),
 ]
+EVENT_TOGGLE_KEY_MAP = {
+    "ALERT_BEARISH_EXTERNAL_OB": "bearish_external_ob",
+    "ALERT_BULLISH_EXTERNAL_OB": "bullish_external_ob",
+    "ALERT_BEARISH_INTERNAL_OB": "bearish_internal_ob",
+    "ALERT_BULLISH_INTERNAL_OB": "bullish_internal_ob",
+    "ALERT_BULLISH_OB_BREAK": "bullish_ob_break",
+    "ALERT_BEARISH_OB_BREAK": "bearish_ob_break",
+    "ALERT_BULLISH_SWEEP": "bullish_sweep",
+    "ALERT_BEARISH_SWEEP": "bearish_sweep",
+    "ALERT_BULLISH_FVG": "bullish_fvg",
+    "ALERT_BEARISH_FVG": "bearish_fvg",
+    "ALERT_BULLISH_FVG_BREAK": "bullish_fvg_break",
+    "ALERT_BEARISH_FVG_BREAK": "bearish_fvg_break",
+    "ALERT_HIGH_LIQUIDITY_LEVEL": "high_liquidity_level",
+    "ALERT_LOW_LIQUIDITY_LEVEL": "low_liquidity_level",
+    "ALERT_HIGH_LIQUIDITY_LEVEL_BREAK": "high_liquidity_level_break",
+    "ALERT_LOW_LIQUIDITY_LEVEL_BREAK": "low_liquidity_level_break",
+    "GOLDEN_ZONE_CREATED": "golden_zone_created",
+    "GOLDEN_ZONE_FIRST_TOUCH": "golden_zone_first_touch",
+    "IDM_OB_CREATED": "idm_ob_created",
+    "EXT_OB_CREATED": "ext_ob_created",
+    "EXT_OB_FIRST_TOUCH": "ext_ob_first_touch",
+    "IDM_OB_FIRST_TOUCH": "idm_ob_first_touch",
+    "HIST_EXT_OB_FIRST_TOUCH": "hist_ext_ob_first_touch",
+    "HIST_IDM_OB_FIRST_TOUCH": "hist_idm_ob_first_touch",
+}
 
 
 def print_symbol_summary(index: int, symbol: str, timeframe: str, candle_count: int, metrics: Dict[str, Any]) -> None:
@@ -9039,6 +9070,9 @@ def print_symbol_summary(index: int, symbol: str, timeframe: str, candle_count: 
     latest_events = metrics.get("latest_events") or {}
     print(f"{ANSI_BOLD}أحدث الإشارات مع الأسعار{ANSI_RESET}", flush=False)
     for key, label in EVENT_DISPLAY_ORDER:
+        toggle_key = EVENT_TOGGLE_KEY_MAP.get(key)
+        if toggle_key and not getattr(DEFAULT_ALERT_TOGGLES, toggle_key, True):
+            continue
         event = latest_events.get(key)
         if event:
             display_text = event.get("display")
@@ -9306,18 +9340,26 @@ def _build_event_alert_lines(symbol: str, timeframe: str, metrics: Dict[str, Any
     lines: List[str] = []
     for event_key, label, toggle in EVENT_ALERT_DEFINITIONS:
         if toggle and not getattr(DEFAULT_ALERT_TOGGLES, toggle, True):
+            if DEBUG_LOGS and event_key in latest_events:
+                print(f"[DBG] Skipping {event_key} due to toggle off", file=sys.stderr)
             continue
         event = latest_events.get(event_key)
         if not isinstance(event, dict):
             continue
         event_time = event.get("time") or event.get("ts") or event.get("timestamp")
-        if not _event_within_age(event_time, timeframe, metrics):
+        if not isinstance(event_time, (int, float)) or event_time <= 0:
+            if DEBUG_LOGS:
+                print(f"[DBG] Skipping {event_key} due to invalid time: {event_time}", file=sys.stderr)
             continue
-        if not isinstance(event_time, (int, float)):
+        if not _event_within_age(event_time, timeframe, metrics):
+            if DEBUG_LOGS:
+                print(f"[DBG] Skipping {event_key} due to stale time: {event_time}", file=sys.stderr)
             continue
         event_ts = int(event_time)
         memory_key = (symbol.upper(), timeframe, event_key, event_ts)
         if use_memory and memory_key in _EVENT_ALERT_MEMORY:
+            if DEBUG_LOGS:
+                print(f"[DBG] Skipping {event_key} due to duplicate memory hit", file=sys.stderr)
             continue
         if use_memory:
             _EVENT_ALERT_MEMORY.add(memory_key)
@@ -11469,13 +11511,11 @@ def _android_cli_entry() -> int:
                         continue
 
                     metrics = runtime.gather_console_metrics()
-                    event_lines = _build_event_alert_lines(sym, timeframe, metrics, use_memory=False)
+                    event_lines = _build_event_alert_lines(sym, timeframe, metrics, use_memory=True)
                     if event_lines:
                         for line in event_lines:
                             print(line)
-                        telegram_lines.extend(
-                            _build_event_alert_lines(sym, timeframe, metrics, use_memory=True)
-                        )
+                        telegram_lines.extend(event_lines)
                     card = _build_zone_card(sym, timeframe, runtime)
                     if not card:
                         continue
