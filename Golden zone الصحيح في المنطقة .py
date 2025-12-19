@@ -45,7 +45,8 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set,
 # SCAN_TIMEFRAMES: قائمة الإطارات الزمنية التي سيتم مسحها للبحث عن أول ملامسة
 #                  لمنطقة الـ Golden Zone (افتراضيًا جميع الإطارات المطلوبة).
 # MAX_EVENT_AGE_BARS: أقصى عدد شموع يُعتبر الحدث ضمنه حديثًا لكل إطار زمني.
-#                     أي حدث أقدم من هذا العدد يتم تجاهله في التنبيهات.
+#                     يطبّق على جميع المفاهيم عند عرض/التقاط اللمسات
+#                     (mark_x, hist_ext_ob, hist_idm_ob, idm_ob, ext_ob, golden_zone).
 # TELEGRAM_ENABLED: تفعيل/تعطيل إرسال التنبيهات لتليجرام.
 # TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID: يمكن ضبطهما هنا بدل المتغيرات البيئية.
 # ALERT_ONLY_FOR_GOLDEN_ZONE: عند تفعيلها لن تُرسل تنبيهات إلا للمسات Golden Zone.
@@ -1859,7 +1860,7 @@ class SmartMoneyAlgoProE5:
                 for bx in reversed(seq):
                     if not isinstance(bx, Box):
                         continue
-                    if key != 'GOLDEN_ZONE' and not self._console_event_within_age(bx.left):
+                    if not self._console_event_within_age(bx.left):
                         continue
                     if predicate(bx):
                         events[key] = {
@@ -9786,6 +9787,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             primary_runtime: Optional[SmartMoneyAlgoProE5] = None
             combined_summaries: List[Dict[str, Any]] = []
             for timeframe in active_timeframes:
+                window = MAX_EVENT_AGE_BARS.get(timeframe, args.max_age_bars)
+                if window and window > 0:
+                    indicator_inputs.console.max_age_bars = max(
+                        args.max_age_bars, int(window)
+                    )
                 log("Foundation")
                 log("Inventory")
                 log("Timeline")
@@ -9797,6 +9803,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     tracer,
                     min_daily_change=args.min_daily_change,
                     inputs=indicator_inputs,
+                    recent_window_bars=max(1, int(window)) if window else None,
                 )
                 if primary_runtime is None:
                     primary_runtime = runtime
