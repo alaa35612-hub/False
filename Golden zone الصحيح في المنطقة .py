@@ -52,6 +52,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set,
 # ALERT_ONLY_FOR_GOLDEN_ZONE: عند تفعيلها لن تُرسل تنبيهات إلا للمسات Golden Zone.
 # ALERT_TOGGLES: مفاتيح تشغيل/إيقاف التنبيهات التفصيلية لكل مفهوم (الأحداث المطلوبة).
 # DEBUG_LOGS: طباعة رسائل تتبع إضافية أثناء المسح والتنبيه.
+# DEBUG_EVENTS: طباعة ملخص آخر 20 تنبيه مُسجّل (للتأكد من المطابقة).
 # SCAN_CANDLE_LIMIT: عدد الشموع المطلوبة لكل رمز أثناء المسح الآلي.
 # EVENT_MEMORY_FILE: ملف التخزين الدائم لمنع تكرار الأحداث بين التشغيلات.
 # EVENT_MEMORY_TTL_DAYS: حذف الأحداث الأقدم من هذه الأيام لتجنب تضخم الملف.
@@ -69,8 +70,9 @@ MAX_EVENT_AGE_BARS: Dict[str, int] = {
 TELEGRAM_ENABLED: bool = True
 TELEGRAM_BOT_TOKEN: str = ""
 TELEGRAM_CHAT_ID: str = ""
-ALERT_ONLY_FOR_GOLDEN_ZONE: bool = True
+ALERT_ONLY_FOR_GOLDEN_ZONE: bool = False
 DEBUG_LOGS: bool = False
+DEBUG_EVENTS: bool = False
 SCAN_CANDLE_LIMIT: int = 800
 EVENT_MEMORY_FILE: str = "alert_memory.json"
 EVENT_MEMORY_TTL_DAYS: int = 7
@@ -234,8 +236,8 @@ class AlertToggleConfig:
     low_liquidity_level_break: bool = False
     golden_zone_created: bool = True
     golden_zone_first_touch: bool = True
-    idm_ob_created: bool = False
-    ext_ob_created: bool = False
+    idm_ob_created: bool = True
+    ext_ob_created: bool = True
     ext_ob_first_touch: bool = True
     idm_ob_first_touch: bool = True
     hist_ext_ob_first_touch: bool = True
@@ -1514,6 +1516,7 @@ class SmartMoneyAlgoProE5:
         self.lines: List[Line] = []
         self.boxes: List[Box] = []
         self.alerts: List[Tuple[int, str]] = []
+        self.alert_history: List[Tuple[int, str, Optional[str]]] = []
         self.bar_colors: List[Tuple[int, str]] = []
         self.console_event_log: Dict[str, Dict[str, Any]] = {}
         self.console_box_status_tally: Dict[str, Counter[str]] = defaultdict(Counter)
@@ -1685,6 +1688,7 @@ class SmartMoneyAlgoProE5:
         except Exception:
             event_ts = 0
         self.alerts.append((event_ts, title))
+        self.alert_history.append((event_ts, title, message))
         event_key = self.ALERT_TITLE_EVENT_KEY_MAP.get(title)
         if not event_key:
             return None
@@ -9447,6 +9451,23 @@ def _build_event_alert_lines(symbol: str, timeframe: str, metrics: Dict[str, Any
     return lines
 
 
+def _group_event_lines(lines: Sequence[str]) -> Dict[Tuple[str, str], List[str]]:
+    grouped: Dict[Tuple[str, str], List[str]] = {}
+    for line in lines:
+        parts = str(line).split(" | ", 2)
+        if not parts:
+            continue
+        left = parts[0].strip()
+        if not left:
+            continue
+        if " " not in left:
+            continue
+        symbol, timeframe = left.rsplit(" ", 1)
+        key = (symbol, timeframe)
+        grouped.setdefault(key, []).append(line)
+    return grouped
+
+
 def _detect_golden_zone_first_touch(symbol: str, timeframe: str, metrics: Dict[str, Any]) -> Optional[str]:
     if not isinstance(metrics, dict):
         return None
@@ -9788,6 +9809,13 @@ def scan_binance(
         runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
         runtime.console_max_age_bars = max(runtime.console_max_age_bars, window)
         runtime.process(candles)
+        if DEBUG_EVENTS:
+            recent_alerts = runtime.alert_history[-20:]
+            print(f"[DBG] Alerts: {len(runtime.alert_history)}", flush=True)
+            for ts_val, title, message in recent_alerts:
+                stamp = format_timestamp(ts_val)
+                msg = message or ""
+                print(f"[DBG] {stamp} | {title} | {msg}", flush=True)
         metrics = runtime.gather_console_metrics()
         latest_events = metrics.get("latest_events") or {}
         recent_hits, recent_times = _collect_recent_event_hits(
@@ -9858,7 +9886,10 @@ def scan_binance(
                     print(line)
                 telegram_lines.extend(event_lines)
         if telegram_lines:
-            _send_telegram_lines(telegram_lines)
+            grouped = _group_event_lines(telegram_lines)
+            for (sym, tf), lines in grouped.items():
+                payload = [f"{sym} {tf}"] + list(lines)
+                _send_telegram_lines(payload)
     return primary_runtime, summaries
 
 
@@ -11586,6 +11617,13 @@ def _android_cli_entry() -> int:
                             {"time": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5] if len(c)>5 else float('nan')}
                             for c in candles
                         ])
+                        if DEBUG_EVENTS:
+                            recent_alerts = runtime.alert_history[-20:]
+                            print(f"[DBG] Alerts: {len(runtime.alert_history)}", flush=True)
+                            for ts_val, title, message in recent_alerts:
+                                stamp = format_timestamp(ts_val)
+                                msg = message or ""
+                                print(f"[DBG] {stamp} | {title} | {msg}", flush=True)
                     except Exception as e:
                         print(
                             f"[{i}/{len(symbols)}] {_format_symbol(sym)} @ {timeframe}: error {e}",
@@ -11606,7 +11644,10 @@ def _android_cli_entry() -> int:
                     print(card)
                     _run_strategy_autorun(sym, timeframe, runtime)
             if cfg.tg_enable and telegram_lines:
-                _send_tg(cfg, telegram_lines)
+                grouped = _group_event_lines(telegram_lines)
+                for (sym, tf), lines in grouped.items():
+                    payload = [f"{sym} {tf}"] + list(lines)
+                    _send_tg(cfg, payload)
 
             if args.verbose:
                 print(f"\nتم. عدد الرموز: {len(symbols)} | الإطارات: {', '.join(active_timeframes)}")
