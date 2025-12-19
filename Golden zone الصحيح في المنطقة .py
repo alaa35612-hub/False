@@ -53,6 +53,8 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set,
 # ALERT_TOGGLES: مفاتيح تشغيل/إيقاف التنبيهات التفصيلية لكل مفهوم (الأحداث المطلوبة).
 # DEBUG_LOGS: طباعة رسائل تتبع إضافية أثناء المسح والتنبيه.
 # SCAN_CANDLE_LIMIT: عدد الشموع المطلوبة لكل رمز أثناء المسح الآلي.
+# EVENT_MEMORY_FILE: ملف التخزين الدائم لمنع تكرار الأحداث بين التشغيلات.
+# EVENT_MEMORY_TTL_DAYS: حذف الأحداث الأقدم من هذه الأيام لتجنب تضخم الملف.
 SCAN_TIMEFRAMES: List[str] = ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d"]
 MAX_EVENT_AGE_BARS: Dict[str, int] = {
     "1m": 120,
@@ -70,6 +72,8 @@ TELEGRAM_CHAT_ID: str = ""
 ALERT_ONLY_FOR_GOLDEN_ZONE: bool = True
 DEBUG_LOGS: bool = False
 SCAN_CANDLE_LIMIT: int = 800
+EVENT_MEMORY_FILE: str = "alert_memory.json"
+EVENT_MEMORY_TTL_DAYS: int = 7
 ALERT_TOGGLES: Dict[str, bool] = {
     "bearish_external_ob": True,
     "bullish_external_ob": True,
@@ -100,6 +104,7 @@ ALERT_TOGGLES: Dict[str, bool] = {
 # مخزن لمنع تكرار التنبيهات لنفس (الرمز، الإطار، الطابع الزمني للمنطقة).
 _GOLDEN_ZONE_ALERT_MEMORY: Set[Tuple[str, str, int]] = set()
 _EVENT_ALERT_MEMORY: Set[Tuple[str, str, str, int]] = set()
+_EVENT_ALERT_MEMORY_PATH = Path(EVENT_MEMORY_FILE)
 
 try:
     import ccxt  # type: ignore
@@ -259,6 +264,72 @@ class BinanceSymbolSelectorConfig:
 DEFAULT_BINANCE_SYMBOL_SELECTOR = BinanceSymbolSelectorConfig(
     prioritize_top_gainers=False
 )
+
+
+def _event_memory_key(symbol: str, timeframe: str, event_key: str, event_ts: int) -> Tuple[str, str, str, int]:
+    return (symbol.upper(), timeframe, event_key, int(event_ts))
+
+
+def _load_event_memory() -> None:
+    if not _EVENT_ALERT_MEMORY_PATH.exists():
+        return
+    try:
+        raw = json.loads(_EVENT_ALERT_MEMORY_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if not isinstance(raw, dict):
+        return
+    now = int(time.time())
+    ttl_seconds = max(1, int(EVENT_MEMORY_TTL_DAYS)) * 86400
+    pruned: Dict[str, int] = {}
+    for key, ts in raw.items():
+        try:
+            ts_val = int(ts)
+        except Exception:
+            continue
+        if now - ts_val <= ttl_seconds:
+            pruned[key] = ts_val
+            parts = key.split("|")
+            if len(parts) == 4:
+                sym, tf, ev, ts_str = parts
+                try:
+                    _EVENT_ALERT_MEMORY.add((sym, tf, ev, int(ts_str)))
+                except Exception:
+                    continue
+    if len(pruned) != len(raw):
+        try:
+            _EVENT_ALERT_MEMORY_PATH.write_text(json.dumps(pruned, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+
+def _save_event_memory() -> None:
+    now = int(time.time())
+    ttl_seconds = max(1, int(EVENT_MEMORY_TTL_DAYS)) * 86400
+    payload: Dict[str, int] = {}
+    for sym, tf, ev, ts in _EVENT_ALERT_MEMORY:
+        try:
+            ts_val = int(ts)
+        except Exception:
+            continue
+        if now - ts_val <= ttl_seconds:
+            payload[f"{sym}|{tf}|{ev}|{ts_val}"] = ts_val
+    try:
+        _EVENT_ALERT_MEMORY_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _remember_event(symbol: str, timeframe: str, event_key: str, event_ts: int) -> bool:
+    key = _event_memory_key(symbol, timeframe, event_key, event_ts)
+    if key in _EVENT_ALERT_MEMORY:
+        return False
+    _EVENT_ALERT_MEMORY.add(key)
+    _save_event_memory()
+    return True
+
+
+_load_event_memory()
 
 
 def _normalize_direction(value: Any) -> Optional[str]:
@@ -921,7 +992,7 @@ class DemandSupplyInputs:
 
 @dataclass
 class FVGInputs:
-    show_fvg: bool = False
+    show_fvg: bool = True
     i_tf: str = ""
     i_mtf: str = "HTF"
     i_bullishfvgcolor: str = "color.new(color.green,100)"
@@ -1512,6 +1583,8 @@ class SmartMoneyAlgoProE5:
         "Bearish Sweep": "bearish_sweep",
         "Bullish FVG": "bullish_fvg",
         "Bearish FVG": "bearish_fvg",
+        "Bullish FVG Touch": "bullish_fvg",
+        "Bearish FVG Touch": "bearish_fvg",
         "Bullish FVG Break": "bullish_fvg_break",
         "Bearish FVG Break": "bearish_fvg_break",
         "High Liquidity Level": "high_liquidity_level",
@@ -1530,6 +1603,8 @@ class SmartMoneyAlgoProE5:
         "Bearish Sweep": "ALERT_BEARISH_SWEEP",
         "Bullish FVG": "ALERT_BULLISH_FVG",
         "Bearish FVG": "ALERT_BEARISH_FVG",
+        "Bullish FVG Touch": "BULLISH_FVG_TOUCH",
+        "Bearish FVG Touch": "BEARISH_FVG_TOUCH",
         "Bullish FVG Break": "ALERT_BULLISH_FVG_BREAK",
         "Bearish FVG Break": "ALERT_BEARISH_FVG_BREAK",
         "High Liquidity Level": "ALERT_HIGH_LIQUIDITY_LEVEL",
@@ -9004,6 +9079,8 @@ EVENT_DISPLAY_ORDER = [
     ("ALERT_BEARISH_SWEEP", "Bearish Sweep"),
     ("ALERT_BULLISH_FVG", "Bullish FVG"),
     ("ALERT_BEARISH_FVG", "Bearish FVG"),
+    ("BULLISH_FVG_TOUCH", "Bullish FVG Touch"),
+    ("BEARISH_FVG_TOUCH", "Bearish FVG Touch"),
     ("ALERT_BULLISH_FVG_BREAK", "Bullish FVG Break"),
     ("ALERT_BEARISH_FVG_BREAK", "Bearish FVG Break"),
     ("ALERT_HIGH_LIQUIDITY_LEVEL", "High Liquidity Level"),
@@ -9022,6 +9099,8 @@ EVENT_TOGGLE_KEY_MAP = {
     "ALERT_BEARISH_SWEEP": "bearish_sweep",
     "ALERT_BULLISH_FVG": "bullish_fvg",
     "ALERT_BEARISH_FVG": "bearish_fvg",
+    "BULLISH_FVG_TOUCH": "bullish_fvg",
+    "BEARISH_FVG_TOUCH": "bearish_fvg",
     "ALERT_BULLISH_FVG_BREAK": "bullish_fvg_break",
     "ALERT_BEARISH_FVG_BREAK": "bearish_fvg_break",
     "ALERT_HIGH_LIQUIDITY_LEVEL": "high_liquidity_level",
@@ -9277,6 +9356,8 @@ EVENT_ALERT_DEFINITIONS: Sequence[Tuple[str, str, str]] = (
     ("ALERT_BEARISH_SWEEP", "Bearish Sweep", "bearish_sweep"),
     ("ALERT_BULLISH_FVG", "Bullish FVG", "bullish_fvg"),
     ("ALERT_BEARISH_FVG", "Bearish FVG", "bearish_fvg"),
+    ("BULLISH_FVG_TOUCH", "Bullish FVG Touch", "bullish_fvg"),
+    ("BEARISH_FVG_TOUCH", "Bearish FVG Touch", "bearish_fvg"),
     ("ALERT_BULLISH_FVG_BREAK", "Bullish FVG Break", "bullish_fvg_break"),
     ("ALERT_BEARISH_FVG_BREAK", "Bearish FVG Break", "bearish_fvg_break"),
     ("ALERT_HIGH_LIQUIDITY_LEVEL", "High Liquidity Level", "high_liquidity_level"),
@@ -9356,13 +9437,11 @@ def _build_event_alert_lines(symbol: str, timeframe: str, metrics: Dict[str, Any
                 print(f"[DBG] Skipping {event_key} due to stale time: {event_time}", file=sys.stderr)
             continue
         event_ts = int(event_time)
-        memory_key = (symbol.upper(), timeframe, event_key, event_ts)
-        if use_memory and memory_key in _EVENT_ALERT_MEMORY:
-            if DEBUG_LOGS:
-                print(f"[DBG] Skipping {event_key} due to duplicate memory hit", file=sys.stderr)
-            continue
         if use_memory:
-            _EVENT_ALERT_MEMORY.add(memory_key)
+            if not _remember_event(symbol, timeframe, event_key, event_ts):
+                if DEBUG_LOGS:
+                    print(f"[DBG] Skipping {event_key} due to duplicate memory hit", file=sys.stderr)
+                continue
         display = _format_event_display(event)
         lines.append(f"{symbol} {timeframe} | {label} | {display}")
     return lines
@@ -9399,6 +9478,8 @@ def _detect_golden_zone_first_touch(symbol: str, timeframe: str, metrics: Dict[s
     if alert_key in _GOLDEN_ZONE_ALERT_MEMORY:
         return None
     _GOLDEN_ZONE_ALERT_MEMORY.add(alert_key)
+    if not _remember_event(symbol, timeframe, "GOLDEN_ZONE_FIRST_TOUCH", zone_ts):
+        return None
     return _build_golden_zone_alert_line(symbol, timeframe, event, metrics)
 
 
@@ -9771,9 +9852,11 @@ def scan_binance(
     if send_alerts:
         telegram_lines: List[str] = []
         for row in summaries:
-            telegram_lines.extend(
-                _build_event_alert_lines(row.get("symbol", ""), timeframe, row.get("metrics", {}))
-            )
+            event_lines = _build_event_alert_lines(row.get("symbol", ""), timeframe, row.get("metrics", {}))
+            if event_lines:
+                for line in event_lines:
+                    print(line)
+                telegram_lines.extend(event_lines)
         if telegram_lines:
             _send_telegram_lines(telegram_lines)
     return primary_runtime, summaries
