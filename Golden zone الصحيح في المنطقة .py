@@ -1787,6 +1787,31 @@ class SmartMoneyAlgoProE5:
                     message = f"{{ticker}} {box.text} First Touch, Range: {price_range}, Close: {close_text}"
                     self.alertcondition(True, alert_title, message)
 
+    def _register_fvg_touch_event(self, box: Box, *, bullish: bool, event_time: Optional[int] = None) -> None:
+        key = "BULLISH_FVG_TOUCH" if bullish else "BEARISH_FVG_TOUCH"
+        label = "Bullish FVG" if bullish else "Bearish FVG"
+        ts = event_time if isinstance(event_time, int) else self.series.get_time()
+        price_range = f"{format_price(box.bottom)} → {format_price(box.top)}"
+        self.console_event_log[key] = {
+            "text": label,
+            "price": (box.bottom, box.top),
+            "time": ts,
+            "time_display": format_timestamp(ts),
+            "display": f"{label} {price_range}",
+            "status": "touched",
+            "zone_time": box.left,
+        }
+        self._trace(
+            "box",
+            "register",
+            timestamp=box.right,
+            key=key,
+            text=label,
+            top=box.top,
+            bottom=box.bottom,
+            status="touched",
+        )
+
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
         events: Dict[str, Dict[str, Any]] = {}
         for key, value in self.console_event_log.items():
@@ -5037,6 +5062,11 @@ class SmartMoneyAlgoProE5:
                     triggered = True
                 if triggered:
                     removed_flag = 1
+                    self._register_fvg_touch_event(box_obj, bullish=True, event_time=self.series.get_time())
+                    price_range = f"{format_price(box_obj.bottom)} → {format_price(box_obj.top)}"
+                    close_text = format_price(self.series.get("close"))
+                    message = f"{{ticker}} Bullish FVG Touch, Range: {price_range}, Close: {close_text}"
+                    self.alertcondition(True, "Bullish FVG Touch", message)
                     self._fvg_delete(
                         i,
                         holder,
@@ -5069,6 +5099,11 @@ class SmartMoneyAlgoProE5:
                     triggered = True
                 if triggered:
                     removed_flag = -1
+                    self._register_fvg_touch_event(box_obj, bullish=False, event_time=self.series.get_time())
+                    price_range = f"{format_price(box_obj.bottom)} → {format_price(box_obj.top)}"
+                    close_text = format_price(self.series.get("close"))
+                    message = f"{{ticker}} Bearish FVG Touch, Range: {price_range}, Close: {close_text}"
+                    self.alertcondition(True, "Bearish FVG Touch", message)
                     self._fvg_delete(
                         i,
                         holder,
@@ -9099,8 +9134,7 @@ def _event_bars_ago_from_metrics(event_time: Any, metrics: Dict[str, Any], timef
         return 0
     return diff_ms // int(seconds * 1000)
 
-
-def _golden_zone_event_within_age(event_time: Any, timeframe: str, metrics: Dict[str, Any]) -> bool:
+def _event_within_age(event_time: Any, timeframe: str, metrics: Dict[str, Any]) -> bool:
     max_age = MAX_EVENT_AGE_BARS.get(timeframe)
     if max_age is None or max_age <= 0:
         return True
@@ -9108,6 +9142,10 @@ def _golden_zone_event_within_age(event_time: Any, timeframe: str, metrics: Dict
     if bars_ago is None:
         return True
     return bars_ago <= max_age
+
+
+def _golden_zone_event_within_age(event_time: Any, timeframe: str, metrics: Dict[str, Any]) -> bool:
+    return _event_within_age(event_time, timeframe, metrics)
 
 
 def _build_golden_zone_alert_line(symbol: str, timeframe: str, event: Dict[str, Any], metrics: Dict[str, Any]) -> str:
@@ -9311,11 +9349,46 @@ def in_fvg(state: Any) -> Tuple[bool, Optional[str]]:
     return False, None
 
 
+def _recent_fvg_touch(runtime: Any, timeframe: str) -> Tuple[bool, Optional[str]]:
+    in_now, detail = in_fvg(runtime)
+    if in_now:
+        return True, detail
+    if not hasattr(runtime, "gather_console_metrics"):
+        return False, None
+    try:
+        metrics = runtime.gather_console_metrics() or {}
+    except Exception:
+        return False, None
+    latest_events = metrics.get("latest_events") or {}
+    if not isinstance(latest_events, dict):
+        return False, None
+    for key in ("BULLISH_FVG_TOUCH", "BEARISH_FVG_TOUCH"):
+        event = latest_events.get(key)
+        if not isinstance(event, dict):
+            continue
+        if event.get("status") != "touched":
+            continue
+        event_time = event.get("time")
+        if not _event_within_age(event_time, timeframe, metrics):
+            continue
+        detail = event.get("display")
+        if not detail:
+            bounds = event.get("price") or (None, None)
+            try:
+                lower, upper = bounds
+            except Exception:
+                lower, upper = (None, None)
+            label = event.get("text") or "FVG"
+            detail = f"{label} {format_price(lower)} → {format_price(upper)}"
+        return True, detail
+    return False, None
+
+
 def _build_zone_card(symbol: str, timeframe: str, runtime: Any) -> Optional[str]:
     checks = [
         ("Order Flow", in_order_flow(runtime)),
         ("سيولة", in_liquidity(runtime)),
-        ("FVG", in_fvg(runtime)),
+        ("FVG", _recent_fvg_touch(runtime, timeframe)),
     ]
 
     hits: List[Tuple[str, Optional[str]]] = []
@@ -10067,8 +10140,8 @@ _AR_KEYS = {
     "IDM"     : ["idm"],
     "DEMAND"  : ["demand", "طلب"],
     "SUPPLY"  : ["supply", "عرض"],
-    "FVG_UP"  : ["fvg up", "fvg صاعدة", "fvg↑"],
-    "FVG_DN"  : ["fvg down", "fvg هابطة", "fvg↓"],
+    "FVG_UP"  : ["fvg up", "fvg صاعدة", "fvg↑", "bullish fvg", "bullish fvg touch"],
+    "FVG_DN"  : ["fvg down", "fvg هابطة", "fvg↓", "bearish fvg", "bearish fvg touch"],
     "OF_BOX"  : ["order flow", "flow box"],
     "LIQ"     : ["liquidity", "سيولة"],
     "SCOB"    : ["scob"],
@@ -10083,6 +10156,7 @@ _LAST_BUCKETS = {
     "IDM OB": ["idm ob"],
     "Hist IDM OB": ["hist idm ob"],
     "Hist EXT OB": ["hist ext ob"],
+    "FVG": ["fvg touch", "bullish fvg", "bearish fvg"],
     "الدوائر الحمراء": ["الدوائر الحمراء", "red circle"],
     "الدوائر الخضراء": ["الدوائر الخضراء", "green circle"],
     "Bearish External OB": ["bearish external ob"],
@@ -10124,6 +10198,8 @@ _METRIC_MAP = {
     "Bearish Sweep": ["ALERT_BEARISH_SWEEP", "BEARISH_SWEEP"],
     "Bullish FVG": ["ALERT_BULLISH_FVG", "BULLISH_FVG"],
     "Bearish FVG": ["ALERT_BEARISH_FVG", "BEARISH_FVG"],
+    "Bullish FVG Touch": ["BULLISH_FVG_TOUCH", "ALERT_BULLISH_FVG_TOUCH"],
+    "Bearish FVG Touch": ["BEARISH_FVG_TOUCH", "ALERT_BEARISH_FVG_TOUCH"],
     "Bullish FVG Break": ["ALERT_BULLISH_FVG_BREAK", "BULLISH_FVG_BREAK"],
     "Bearish FVG Break": ["ALERT_BEARISH_FVG_BREAK", "BEARISH_FVG_BREAK"],
     "High Liquidity Level": ["ALERT_HIGH_LIQUIDITY_LEVEL", "HIGH_LIQUIDITY_LEVEL"],
@@ -10481,8 +10557,8 @@ _AR_KEYS = {
     "IDM"     : ["idm"," i d m "],
     "DEMAND"  : ["demand","طلب"],
     "SUPPLY"  : ["supply","عرض"],
-    "FVG_UP"  : ["fvg up","fvg صاعدة","fvg↑"],
-    "FVG_DN"  : ["fvg down","fvg هابطة","fvg↓"],
+    "FVG_UP"  : ["fvg up","fvg صاعدة","fvg↑", "bullish fvg", "bullish fvg touch"],
+    "FVG_DN"  : ["fvg down","fvg هابطة","fvg↓", "bearish fvg", "bearish fvg touch"],
     "OF_BOX"  : ["order flow","flow box"],
     "LIQ"     : ["liquidity","سيولة"],
     "SCOB"    : ["scob"],
@@ -10498,6 +10574,7 @@ _LAST_BUCKETS = {
     "IDM OB": ["idm ob","idm_ob"],
     "Hist IDM OB": ["hist idm ob","hist_idm_ob"],
     "Hist EXT OB": ["hist ext ob","hist_ext_ob"],
+    "FVG": ["fvg touch", "bullish fvg", "bearish fvg"],
     "الدوائر الحمراء": ["الدوائر الحمراء","red circle"],
     "الدوائر الخضراء": ["الدوائر الخضراء","green circle"],
     "Bearish External OB": ["bearish external ob"],
@@ -10579,6 +10656,8 @@ _METRIC_MAP = {
     "Bearish Sweep": ["ALERT_BEARISH_SWEEP", "BEARISH_SWEEP"],
     "Bullish FVG": ["ALERT_BULLISH_FVG", "BULLISH_FVG"],
     "Bearish FVG": ["ALERT_BEARISH_FVG", "BEARISH_FVG"],
+    "Bullish FVG Touch": ["BULLISH_FVG_TOUCH", "ALERT_BULLISH_FVG_TOUCH"],
+    "Bearish FVG Touch": ["BEARISH_FVG_TOUCH", "ALERT_BEARISH_FVG_TOUCH"],
     "Bullish FVG Break": ["ALERT_BULLISH_FVG_BREAK", "BULLISH_FVG_BREAK"],
     "Bearish FVG Break": ["ALERT_BEARISH_FVG_BREAK", "BEARISH_FVG_BREAK"],
     "High Liquidity Level": ["ALERT_HIGH_LIQUIDITY_LEVEL", "HIGH_LIQUIDITY_LEVEL"],
@@ -11164,6 +11243,9 @@ def _android_cli_entry() -> int:
                         if cfg.drop_last_incomplete and candles:
                             candles = candles[:-1]
                         runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe)
+                        event_window = MAX_EVENT_AGE_BARS.get(timeframe)
+                        if event_window is not None and event_window > 0:
+                            runtime.console_max_age_bars = max(runtime.console_max_age_bars, int(event_window))
                         runtime._bos_break_source = cfg.bos_confirmation
                         runtime._strict_close_for_break = cfg.strict_close_for_break
                         runtime.process([
