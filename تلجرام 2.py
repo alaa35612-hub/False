@@ -11629,6 +11629,7 @@ def _android_cli_entry() -> int:
     symbol_override = args.symbol or None
     runtime_cache: Dict[str, SmartMoneyAlgoProE5] = {}
     last_time_cache: Dict[str, int] = {}
+    candle_cache: Dict[str, deque] = {}
 
     def _new_runtime() -> SmartMoneyAlgoProE5:
         runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
@@ -11668,20 +11669,31 @@ def _android_cli_entry() -> int:
                     since_ms = None
                     if cfg.continuous_scan and runtime is not None and last_time:
                         since_ms = int(last_time) + 1
+                    window_size = max(args.limit, recent_window)
                     candles = fetch_ohlcv(
                         ex,
                         sym,
                         args.timeframe,
-                        max(args.limit, recent_window),
+                        window_size,
                         since_ms=since_ms,
                     )
                     fetch_elapsed = time.perf_counter() - fetch_started
                     if cfg.drop_last_incomplete and candles:
                         candles = candles[:-1]
+                    used_cache = False
                     if runtime is None or not cfg.continuous_scan:
                         runtime = _new_runtime()
+                        if sym in candle_cache:
+                            candles = list(candle_cache[sym])
+                            used_cache = True
                     process_started = time.perf_counter()
                     if candles:
+                        cache = candle_cache.get(sym)
+                        if cache is None:
+                            cache = deque(maxlen=window_size)
+                            candle_cache[sym] = cache
+                        if not used_cache:
+                            cache.extend(candles)
                         runtime.process(candles)
                         last_time_cache[sym] = runtime.series.get_time()
                         runtime_cache[sym] = runtime
