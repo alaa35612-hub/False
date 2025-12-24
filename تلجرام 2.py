@@ -9639,31 +9639,23 @@ def check_symbol_hits(state: Any, price: Optional[float] = None) -> Dict[str, Di
             series=series,
         )
 
-    def _event_entry(key: str) -> Tuple[str, Optional[str], Optional[int]]:
-        log = getattr(state, "console_event_log", {})
-        event = log.get(key) if isinstance(log, dict) else None
-        if not isinstance(event, dict):
-            return "miss", None, None
-        try:
-            if hasattr(state, "_console_event_within_age") and not state._console_event_within_age(event.get("time")):
-                return "miss", None, None
-        except Exception:
-            pass
-        status = event.get("status")
-        if status == "new":
-            return "new", event.get("display") or event.get("text"), event.get("time")
-        if status == "touched":
-            return "inside", event.get("display") or event.get("text"), event.get("time")
-        if status == "archived":
-            return "new", event.get("display") or event.get("text"), event.get("time")
-        return "miss", None, None
+    # Golden Zone (active box ``bxf``)
+    gz_box = getattr(state, "bxf", None)
+    gz_status, gz_detail, gz_ts = _box_entry("Golden Zone", [gz_box] if isinstance(gz_box, Box) else [])
 
-    # Golden Zone / OB events (first touch or newly created only)
-    gz_status, gz_detail, gz_ts = _event_entry("GOLDEN_ZONE")
-    ext_status, ext_detail, ext_ts = _event_entry("EXT_OB")
-    idm_status, idm_detail, idm_ts = _event_entry("IDM_OB")
-    hist_idm_status, hist_idm_detail, hist_idm_ts = _event_entry("HIST_IDM_OB")
-    hist_ext_status, hist_ext_detail, hist_ext_ts = _event_entry("HIST_EXT_OB")
+    # Current EXT / IDM OB boxes
+    ext_box = getattr(state, "lstBx", None)
+    idm_box = getattr(state, "lstBxIdm", None)
+    ext_status, ext_detail, ext_ts = _box_entry("EXT OB", [ext_box] if isinstance(ext_box, Box) else [])
+    idm_status, idm_detail, idm_ts = _box_entry("IDM OB", [idm_box] if isinstance(idm_box, Box) else [])
+
+    # Historical OB boxes
+    hist_idm_status, hist_idm_detail, hist_idm_ts = _box_entry(
+        "Hist IDM OB", _iter_objects(getattr(state, "hist_idm_boxes", PineArray()), Box)
+    )
+    hist_ext_status, hist_ext_detail, hist_ext_ts = _box_entry(
+        "Hist EXT OB", _iter_objects(getattr(state, "hist_ext_boxes", PineArray()), Box)
+    )
 
     # Swing Sweep lines
     swing_status, swing_detail, swing_ts = _line_hit_detail(
@@ -9730,14 +9722,6 @@ ZONE_LABELS: List[Tuple[str, str]] = [
     ("Hist EXT OB", "hist_ext_ob"),
     ("Swing Sweep", "swing_sweep"),
     ("Mark X", "mark_x"),
-]
-
-FOCUS_ZONE_LABELS: List[Tuple[str, str]] = [
-    ("Golden Zone", "golden_zone"),
-    ("EXT OB", "ext_ob"),
-    ("IDM OB", "idm_ob"),
-    ("Hist IDM OB", "hist_idm_ob"),
-    ("Hist EXT OB", "hist_ext_ob"),
 ]
 
 
@@ -9870,9 +9854,9 @@ def _handle_telegram_entry(symbol: str, timeframe: str, runtime: Any, hits: Dict
 def _build_zone_card(symbol: str, timeframe: str, runtime: Any, *, hits: Optional[Dict[str, Dict[str, Any]]] = None) -> Optional[str]:
     hits = hits or check_symbol_hits(runtime)
 
-    focus_hits = {key: hits.get(key, {}) for _, key in FOCUS_ZONE_LABELS}
-    inside_any = any(entry.get("status") in {"inside", "new"} for entry in focus_hits.values())
-    if not inside_any:
+    inside_any = any(entry.get("status") == "inside" for entry in hits.values())
+    near_any = any(entry.get("status") == "near" for entry in hits.values())
+    if not (inside_any or near_any):
         return None
 
     def _fmt_ts(ts: Optional[int]) -> str:
@@ -9885,7 +9869,7 @@ def _build_zone_card(symbol: str, timeframe: str, runtime: Any, *, hits: Optiona
 
     def _fmt_line(label: str, entry: Dict[str, Any]) -> str:
         status_key = entry.get("status")
-        icon = "✅" if status_key == "inside" else "🆕" if status_key == "new" else "❌"
+        icon = "✅" if status_key == "inside" else "🔵" if status_key == "near" else "❌"
         details: List[str] = []
         if entry.get("detail"):
             ts_part = ""
@@ -9904,8 +9888,8 @@ def _build_zone_card(symbol: str, timeframe: str, runtime: Any, *, hits: Optiona
 
     lines: List[str] = [f"SYMBOL: {symbol_display}"]
     lines.append(f"Status: {status_line}")
-    for label, key in FOCUS_ZONE_LABELS:
-        lines.append(_fmt_line(label, focus_hits.get(key, {})))
+    for label, key in ZONE_LABELS:
+        lines.append(_fmt_line(label, hits.get(key, {})))
 
     try:
         ts = runtime.series.get_time()
