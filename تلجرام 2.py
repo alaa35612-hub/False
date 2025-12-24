@@ -6524,6 +6524,12 @@ class SmartMoneyAlgoProE5:
         )
         if hasattr(self.bxf, "set_text_size"):
             self.bxf.set_text_size(self.inputs.structure_util.sizGd)
+        if hasattr(self.bxf, "set_text_color"):
+            self.bxf.set_text_color(f"color.new({color}, 20)")
+        if hasattr(self.bxf, "set_text_halign"):
+            self.bxf.set_text_halign("text.align_center")
+        if hasattr(self.bxf, "set_border_color"):
+            self.bxf.set_border_color("na")
         self.bxf_touched = False
         self.bxty = 1 if dir_up else -1
         self._golden_zone_touch_time = None
@@ -6628,7 +6634,7 @@ class SmartMoneyAlgoProE5:
                 bx = self.demandZone.get(i)
                 if (
                     self.demandZoneIsMit.get(i) == 0
-                    and (lstPrs is None or bx.top <= lstPrs)
+                    and (lstPrs is None or bx.top > lstPrs)
                     and bx.top <= y
                     and bx.bottom >= (self.lstHlPrsIdm if not math.isnan(self.lstHlPrsIdm) else -math.inf)
                 ):
@@ -6654,7 +6660,7 @@ class SmartMoneyAlgoProE5:
                 bx = self.supplyZone.get(i)
                 if (
                     self.supplyZoneIsMit.get(i) == 0
-                    and (lstPrs is None or bx.bottom >= lstPrs)
+                    and (lstPrs is None or bx.bottom < lstPrs)
                     and bx.bottom >= y
                     and bx.top <= (self.lstHlPrsIdm if not math.isnan(self.lstHlPrsIdm) else math.inf)
                 ):
@@ -6710,7 +6716,7 @@ class SmartMoneyAlgoProE5:
                 bx = self.demandZone.get(i)
                 cond = (
                     self.demandZoneIsMit.get(i) == 0
-                    and (lstPrs is None or bx.top <= lstPrs)
+                    and (lstPrs is None or bx.top < lstPrs)
                     and bx.top <= y
                     and bx.bottom >= (self.lstHlPrs if not math.isnan(self.lstHlPrs) else -math.inf)
                 )
@@ -6736,7 +6742,7 @@ class SmartMoneyAlgoProE5:
                 bx = self.supplyZone.get(i)
                 cond = (
                     self.supplyZoneIsMit.get(i) == 0
-                    and (lstPrs is None or bx.top >= lstPrs)
+                    and (lstPrs is None or bx.top > lstPrs)
                     and bx.bottom >= y
                     and bx.top <= (self.lstHlPrs if not math.isnan(self.lstHlPrs) else math.inf)
                 )
