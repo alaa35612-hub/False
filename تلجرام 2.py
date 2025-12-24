@@ -1948,6 +1948,12 @@ class SmartMoneyAlgoProE5:
                 bottom=box.bottom,
                 status=status,
             )
+            if status_key in {"touched", "retest"}:
+                if key == "GOLDEN_ZONE":
+                    if self._golden_zone_touch_time is None:
+                        self._golden_zone_touch_time = int(ts)
+                elif key in {"IDM_OB", "EXT_OB", "HIST_EXT_OB", "HIST_IDM_OB"}:
+                    self._ob_touch_times.setdefault(id(box), int(ts))
             if status_key == "new":
                 alert_titles = {
                     "IDM_OB": "IDM OB Zone Created",
@@ -2518,6 +2524,8 @@ class SmartMoneyAlgoProE5:
         self.hist_ext_boxes = PineArray()
         self._hist_ext_touched_ids: set[int] = set()
         self._hist_idm_touched_ids: set[int] = set()
+        self._ob_touch_times: Dict[int, int] = {}
+        self._golden_zone_touch_time: Optional[int] = None
         self.arrIdmHigh = PineArray()
         self.arrIdmLow = PineArray()
         self.arrIdmHBar = PineArray()
@@ -6465,6 +6473,7 @@ class SmartMoneyAlgoProE5:
         self.bxf = None
         self.bxty = 0
         self.bxf_touched = False
+        self._golden_zone_touch_time = None
 
     def _golden_zone_bounds(self) -> Optional[Tuple[float, float]]:
         if not isinstance(self.bxf, Box):
@@ -6505,6 +6514,7 @@ class SmartMoneyAlgoProE5:
             self.bxf.set_text_size(self.inputs.structure_util.sizGd)
         self.bxf_touched = False
         self.bxty = 1 if dir_up else -1
+        self._golden_zone_touch_time = None
 
     def _check_golden_zone_first_touch(
         self,
@@ -9364,6 +9374,8 @@ def _box_hit_detail(
     current_index: Optional[int] = None,
     recent_bars: int = 1,
     series: Any = None,
+    touch_times: Optional[Dict[int, int]] = None,
+    current_time: Optional[int] = None,
 ) -> Tuple[str, Optional[str], Optional[int]]:
     best_near: Tuple[str, Optional[str], Optional[int]] = ("miss", None, None)
     for bx in boxes:
@@ -9371,6 +9383,11 @@ def _box_hit_detail(
             continue
         if not _is_recent(bx, current_index, recent_bars):
             continue
+        if touch_times is not None:
+            touched_at = touch_times.get(id(bx))
+            if touched_at is not None:
+                if current_time is None or int(touched_at) != int(current_time):
+                    continue
         lower = min(bx.bottom, bx.top) - tolerance
         upper = max(bx.bottom, bx.top) + tolerance
         ts = _object_time(series, _object_bar_index(bx)) if series is not None else None
@@ -9598,6 +9615,15 @@ def check_symbol_hits(state: Any, price: Optional[float] = None) -> Dict[str, Di
     near_limit = abs(price_val) * near_pct / 100 if isinstance(price_val, (int, float)) and not math.isnan(price_val) else 0.0
 
     series = getattr(state, "series", None)
+    current_time: Optional[int] = None
+    if series is not None:
+        try:
+            current_time = int(series.get_time(0))
+        except Exception:
+            try:
+                current_time = int(series.get_time())
+            except Exception:
+                current_time = None
     current_index = _current_bar_index(state)
     tolerance = _liquidity_tolerance(price_val, state) if isinstance(price_val, (int, float)) and not math.isnan(price_val) else 0.0
 
@@ -9627,7 +9653,12 @@ def check_symbol_hits(state: Any, price: Optional[float] = None) -> Dict[str, Di
         series=series,
     )
 
-    def _box_entry(label: str, container: Iterable[Box]) -> Tuple[str, Optional[str], Optional[int]]:
+    def _box_entry(
+        label: str,
+        container: Iterable[Box],
+        *,
+        touch_times: Optional[Dict[int, int]] = None,
+    ) -> Tuple[str, Optional[str], Optional[int]]:
         return _box_hit_detail(
             label,
             price_val,
@@ -9637,24 +9668,44 @@ def check_symbol_hits(state: Any, price: Optional[float] = None) -> Dict[str, Di
             current_index=current_index,
             recent_bars=recent_bars,
             series=series,
+            touch_times=touch_times,
+            current_time=current_time,
         )
 
     # Golden Zone (active box ``bxf``)
     gz_box = getattr(state, "bxf", None)
-    gz_status, gz_detail, gz_ts = _box_entry("Golden Zone", [gz_box] if isinstance(gz_box, Box) else [])
+    gz_touch_times = None
+    if isinstance(gz_box, Box):
+        gz_touch_time = getattr(state, "_golden_zone_touch_time", None)
+        if isinstance(gz_touch_time, int):
+            gz_touch_times = {id(gz_box): gz_touch_time}
+    gz_status, gz_detail, gz_ts = _box_entry("Golden Zone", [gz_box] if isinstance(gz_box, Box) else [], touch_times=gz_touch_times)
 
     # Current EXT / IDM OB boxes
     ext_box = getattr(state, "lstBx", None)
     idm_box = getattr(state, "lstBxIdm", None)
-    ext_status, ext_detail, ext_ts = _box_entry("EXT OB", [ext_box] if isinstance(ext_box, Box) else [])
-    idm_status, idm_detail, idm_ts = _box_entry("IDM OB", [idm_box] if isinstance(idm_box, Box) else [])
+    ob_touch_times = getattr(state, "_ob_touch_times", None)
+    ext_status, ext_detail, ext_ts = _box_entry(
+        "EXT OB",
+        [ext_box] if isinstance(ext_box, Box) else [],
+        touch_times=ob_touch_times,
+    )
+    idm_status, idm_detail, idm_ts = _box_entry(
+        "IDM OB",
+        [idm_box] if isinstance(idm_box, Box) else [],
+        touch_times=ob_touch_times,
+    )
 
     # Historical OB boxes
     hist_idm_status, hist_idm_detail, hist_idm_ts = _box_entry(
-        "Hist IDM OB", _iter_objects(getattr(state, "hist_idm_boxes", PineArray()), Box)
+        "Hist IDM OB",
+        _iter_objects(getattr(state, "hist_idm_boxes", PineArray()), Box),
+        touch_times=ob_touch_times,
     )
     hist_ext_status, hist_ext_detail, hist_ext_ts = _box_entry(
-        "Hist EXT OB", _iter_objects(getattr(state, "hist_ext_boxes", PineArray()), Box)
+        "Hist EXT OB",
+        _iter_objects(getattr(state, "hist_ext_boxes", PineArray()), Box),
+        touch_times=ob_touch_times,
     )
 
     # Swing Sweep lines
