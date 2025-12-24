@@ -22,6 +22,7 @@ parity against the Pine logic.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import concurrent.futures
 import threading
 import bisect
@@ -40,6 +41,8 @@ from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+
+import ccxt.async_support as ccxt_async  # type: ignore
 
 try:
     import ccxt  # type: ignore
@@ -8175,16 +8178,29 @@ def fetch_binance_usdtm_symbols(
     return symbols
 
 
-def fetch_ohlcv(exchange: Any, symbol: str, timeframe: str, limit: int) -> List[Dict[str, float]]:
-    """Rate-limited OHLCV fetch constrained to the most recent window."""
+async def _fetch_binance_usdtm_symbols_async(
+    exchange: Any,
+    *,
+    limit: Optional[int] = None,
+) -> List[str]:
+    markets = await exchange.load_markets()
+    symbols = [
+        symbol
+        for symbol, market in markets.items()
+        if market.get("linear") and market.get("quote") == "USDT" and market.get("type") == "swap"
+    ]
+    symbols.sort()
+    if limit and limit > 0:
+        return symbols[:limit]
+    return symbols
+
+
+async def fetch_ohlcv(exchange: Any, symbol: str, timeframe: str, limit: int) -> List[Dict[str, float]]:
+    """Async OHLCV fetch constrained to the most recent window."""
 
     target = max(EDITOR_AUTORUN_DEFAULTS.recent_bars, int(limit) if limit and limit > 0 else 0)
     target = max(1, target)
-
-    def _call():
-        return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=target)
-
-    raw = _GLOBAL_RATE_LIMITER.run(_call)
+    raw = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=target)
     candles: List[Dict[str, float]] = []
     for entry in raw or []:
         candles.append(
@@ -8198,6 +8214,19 @@ def fetch_ohlcv(exchange: Any, symbol: str, timeframe: str, limit: int) -> List[
             }
         )
     return candles[-target:]
+
+
+async def fetch_ohlcv_async(
+    exchange: Any,
+    symbol: str,
+    timeframe: str,
+    limit: int,
+) -> Tuple[str, Optional[List[Dict[str, float]]]]:
+    try:
+        candles = await fetch_ohlcv(exchange, symbol, timeframe, limit)
+        return symbol, candles
+    except Exception:
+        return symbol, None
 
 
 def _split_arguments(argument_string: str) -> List[str]:
@@ -10102,7 +10131,7 @@ def _build_zone_card(symbol: str, timeframe: str, runtime: Any, *, hits: Optiona
     return "\n".join(lines)
 
 
-def scan_binance(
+async def scan_binance(
     timeframe: str,
     limit: int,
     symbols: Optional[List[str]],
@@ -10115,132 +10144,114 @@ def scan_binance(
     max_symbols: Optional[int] = None,
     symbol_selector: Optional[BinanceSymbolSelectorConfig] = None,
     ) -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
-    if ccxt is None:
-        raise RuntimeError("ccxt is not available")
-    exchange = ccxt.binanceusdm({"enableRateLimit": False})
     scan_started = time.perf_counter()
-    exchange_local = threading.local()
-
-    def _thread_exchange() -> Any:
-        ex = getattr(exchange_local, "exchange", None)
-        if ex is None:
-            ex = ccxt.binanceusdm({"enableRateLimit": False})
-            exchange_local.exchange = ex
-        return ex
-    all_symbols = symbols or fetch_binance_usdtm_symbols(
-        exchange,
-        limit=max_symbols,
-        selector=symbol_selector,
-    )
-    if max_symbols and max_symbols > 0:
-        all_symbols = all_symbols[: int(max_symbols)]
+    exchange = ccxt_async.binanceusdm({"enableRateLimit": True})
     try:
-        ticker_map = _GLOBAL_RATE_LIMITER.run(exchange.fetch_tickers, all_symbols)
-        if not isinstance(ticker_map, dict):
-            ticker_map = {}
-    except Exception as exc:
-        print(
-            f"تعذر جلب tickers مُجمّعة ({exc})، سيتم استخدام fetch_ticker لكل رمز.",
-            file=sys.stderr,
-            flush=True,
+        all_symbols = symbols or await _fetch_binance_usdtm_symbols_async(
+            exchange,
+            limit=max_symbols,
         )
-        ticker_map = {}
-
-    summaries: List[Dict[str, Any]] = []
-    primary_runtime: Optional[SmartMoneyAlgoProE5] = None
-    window = recent_window_bars
-    if window is None:
-        window = EDITOR_AUTORUN_DEFAULTS.recent_bars
-    window = max(1, int(window))
-
-    max_workers = 1 if (tracer and tracer.enabled) else max(1, int(concurrency))
-
-    def _process_symbol(idx: int, symbol: str) -> Optional[Tuple[SmartMoneyAlgoProE5, Dict[str, Any]]]:
-        local_exchange = exchange if max_workers == 1 else _thread_exchange()
-        ticker = ticker_map.get(symbol)
-        if ticker is None:
-            try:
-                ticker = _GLOBAL_RATE_LIMITER.run(local_exchange.fetch_ticker, symbol)
-            except Exception as exc:
-                print(
-                    f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ticker: {exc}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                return None
-        daily_change = _extract_daily_change_percent(ticker)
-        if min_daily_change > 0.0 and daily_change is not None and daily_change <= min_daily_change:
+        if max_symbols and max_symbols > 0:
+            all_symbols = all_symbols[: int(max_symbols)]
+        try:
+            ticker_map = await exchange.fetch_tickers(all_symbols)
+            if not isinstance(ticker_map, dict):
+                ticker_map = {}
+        except Exception as exc:
             print(
-                f"تخطي {_format_symbol(symbol)} (تغير 24 ساعة {daily_change:.2f}% ≤ الحد الأدنى {min_daily_change:.2f}%)",
+                f"تعذر جلب tickers مُجمّعة ({exc})، سيتم استخدام fetch_ticker لكل رمز.",
+                file=sys.stderr,
                 flush=True,
             )
+            ticker_map = {}
+
+        summaries: List[Dict[str, Any]] = []
+        primary_runtime: Optional[SmartMoneyAlgoProE5] = None
+        window = recent_window_bars
+        if window is None:
+            window = EDITOR_AUTORUN_DEFAULTS.recent_bars
+        window = max(1, int(window))
+
+        fetch_target = max(limit, window)
+        tasks = [
+            fetch_ohlcv_async(exchange, symbol, timeframe, fetch_target)
+            for symbol in all_symbols
+        ]
+        results = await asyncio.gather(*tasks)
+        for idx, (symbol, candles) in enumerate(results):
+            ticker = ticker_map.get(symbol)
+            if ticker is None:
+                try:
+                    ticker = await exchange.fetch_ticker(symbol)
+                except Exception as exc:
+                    print(
+                        f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ticker: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+            daily_change = _extract_daily_change_percent(ticker)
+            if min_daily_change > 0.0 and daily_change is not None and daily_change <= min_daily_change:
+                print(
+                    f"تخطي {_format_symbol(symbol)} (تغير 24 ساعة {daily_change:.2f}% ≤ الحد الأدنى {min_daily_change:.2f}%)",
+                    flush=True,
+                )
+                if tracer and tracer.enabled:
+                    tracer.log(
+                        "scan",
+                        "symbol_skipped_daily_change",
+                        timestamp=None,
+                        symbol=symbol,
+                        change=daily_change,
+                        threshold=min_daily_change,
+                    )
+                continue
+            if candles is None:
+                continue
+            runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
+            runtime.console_max_age_bars = max(runtime.console_max_age_bars, window)
+            runtime.scan_recent_bars = window
+            runtime.near_threshold_pct = getattr(inputs, "near_threshold_pct", EDITOR_AUTORUN_DEFAULTS.near_threshold_pct)
+            process_started = time.perf_counter()
+            runtime.process(candles)
+            process_elapsed = time.perf_counter() - process_started
+            metrics = runtime.gather_console_metrics()
+            metrics["daily_change_percent"] = daily_change
+            print(
+                f"[PERF] {_format_symbol(symbol)} process={process_elapsed:.3f}s",
+                flush=True,
+            )
+            summaries.append(
+                {
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "candles": len(candles),
+                    "alerts": metrics.get("alerts", len(runtime.alerts)),
+                    "boxes": metrics.get("boxes", len(runtime.boxes)),
+                    "metrics": metrics,
+                }
+            )
+            print_symbol_summary(idx, symbol, timeframe, len(candles), metrics)
             if tracer and tracer.enabled:
                 tracer.log(
                     "scan",
-                    "symbol_skipped_daily_change",
-                    timestamp=None,
+                    "symbol_complete",
+                    timestamp=runtime.series.get_time(0),
                     symbol=symbol,
-                    change=daily_change,
-                    threshold=min_daily_change,
+                    timeframe=timeframe,
+                    candles=len(candles),
                 )
-            return None
-        fetch_started = time.perf_counter()
-        candles = fetch_ohlcv(local_exchange, symbol, timeframe, max(limit, window))
-        fetch_elapsed = time.perf_counter() - fetch_started
-        runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
-        runtime.console_max_age_bars = max(runtime.console_max_age_bars, window)
-        runtime.scan_recent_bars = window
-        runtime.near_threshold_pct = getattr(inputs, "near_threshold_pct", EDITOR_AUTORUN_DEFAULTS.near_threshold_pct)
-        process_started = time.perf_counter()
-        runtime.process(candles)
-        process_elapsed = time.perf_counter() - process_started
-        metrics = runtime.gather_console_metrics()
-        metrics["daily_change_percent"] = daily_change
-        print(
-            f"[PERF] {_format_symbol(symbol)} fetch={fetch_elapsed:.3f}s "
-            f"process={process_elapsed:.3f}s",
-            flush=True,
-        )
-        summaries.append(
-            {
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "candles": len(candles),
-                "alerts": metrics.get("alerts", len(runtime.alerts)),
-                "boxes": metrics.get("boxes", len(runtime.boxes)),
-                "metrics": metrics,
-            }
-        )
-        print_symbol_summary(idx, symbol, timeframe, len(candles), metrics)
-        if tracer and tracer.enabled:
-            tracer.log(
-                "scan",
-                "symbol_complete",
-                timestamp=runtime.series.get_time(0),
-                symbol=symbol,
-                timeframe=timeframe,
-                candles=len(candles),
-            )
-        return runtime, metrics
-
-    futures: List[Tuple[int, concurrent.futures.Future]] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for idx, symbol in enumerate(all_symbols):
-            futures.append((idx, executor.submit(_process_symbol, idx, symbol)))
-        for idx, future in futures:
-            result = future.result()
-            if not result:
-                continue
-            runtime, _metrics = result
             if primary_runtime is None:
                 primary_runtime = runtime
 
-    if primary_runtime is None:
-        primary_runtime = SmartMoneyAlgoProE5(inputs=inputs, tracer=tracer)
-        primary_runtime.console_max_age_bars = max(primary_runtime.console_max_age_bars, window)
-        primary_runtime.process([])
-    print(f"[PERF] scan_total={time.perf_counter() - scan_started:.3f}s", flush=True)
-    return primary_runtime, summaries
+        if primary_runtime is None:
+            primary_runtime = SmartMoneyAlgoProE5(inputs=inputs, tracer=tracer)
+            primary_runtime.console_max_age_bars = max(primary_runtime.console_max_age_bars, window)
+            primary_runtime.process([])
+        print(f"[PERF] scan_total={time.perf_counter() - scan_started:.3f}s", flush=True)
+        return primary_runtime, summaries
+    finally:
+        await exchange.close()
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -10397,14 +10408,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             log("Foundation")
             log("Inventory")
             log("Timeline")
-            runtime, summaries = scan_binance(
-                args.timeframe,
-                args.lookback,
-                manual_symbols,
-                args.concurrency,
-                tracer,
-                min_daily_change=args.min_daily_change,
-                inputs=indicator_inputs,
+            runtime, summaries = asyncio.run(
+                scan_binance(
+                    args.timeframe,
+                    args.lookback,
+                    manual_symbols,
+                    args.concurrency,
+                    tracer,
+                    min_daily_change=args.min_daily_change,
+                    inputs=indicator_inputs,
+                )
             )
             perform_comparison()
             log("Rendering")
@@ -10996,7 +11009,7 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
             OrderBlockInputs,
             StructureInputs,
             ICTMarketStructureInputs,
-            fetch_ohlcv,
+            fetch_ohlcv_sync,
             _parse_timeframe_to_seconds,
         )
     except NameError as e:
@@ -11034,7 +11047,7 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
     symbols = symbols[:int(cfg.max_scan)]
     for i, sym in enumerate(symbols, 1):
         try:
-            candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
+            candles = fetch_ohlcv_sync(ex, sym, args.timeframe, args.limit)
             if cfg.drop_last_incomplete and candles:
                 candles = candles[:-1]
             runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
@@ -11365,7 +11378,7 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
 def _build_exchange(_market_forced_usdtm:str="usdtm"):
     return ccxt.binanceusdm({"enableRateLimit": False})
 
-def fetch_ohlcv(ex, symbol, timeframe, limit):
+def fetch_ohlcv_sync(ex, symbol, timeframe, limit):
     target = max(EDITOR_AUTORUN_DEFAULTS.recent_bars, int(limit) if limit and limit > 0 else 0)
     target = max(1, target)
 
@@ -11788,7 +11801,7 @@ def _android_cli_entry() -> int:
         OrderBlockInputs
         StructureInputs
         ICTMarketStructureInputs
-        fetch_ohlcv
+        fetch_ohlcv_sync
     except NameError as e:
         print("Missing indicator class or inputs:", e, file=sys.stderr)
         return 3
@@ -11839,7 +11852,7 @@ def _android_cli_entry() -> int:
             for i, sym in enumerate(symbols, 1):
                 try:
                     fetch_started = time.perf_counter()
-                    candles = fetch_ohlcv(ex, sym, args.timeframe, max(args.limit, recent_window))
+                    candles = fetch_ohlcv_sync(ex, sym, args.timeframe, max(args.limit, recent_window))
                     fetch_elapsed = time.perf_counter() - fetch_started
                     if cfg.drop_last_incomplete and candles:
                         candles = candles[:-1]
