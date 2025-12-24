@@ -1927,6 +1927,18 @@ class SmartMoneyAlgoProE5:
             ts = event_time if isinstance(event_time, int) else box.left
             status_label = self.BOX_STATUS_LABELS.get(status, status)
             status_key = status if isinstance(status, str) and status else "active"
+            if status_key in {"touched", "retest"}:
+                if key == "GOLDEN_ZONE":
+                    if self._golden_zone_touch_time is None:
+                        self._golden_zone_touch_time = int(ts)
+                    elif int(ts) != int(self._golden_zone_touch_time):
+                        return
+                elif key in {"IDM_OB", "EXT_OB", "HIST_EXT_OB", "HIST_IDM_OB"}:
+                    existing_touch = self._ob_touch_times.get(id(box))
+                    if existing_touch is None:
+                        self._ob_touch_times[id(box)] = int(ts)
+                    elif int(ts) != int(existing_touch):
+                        return
             tally = self.console_box_status_tally[key]
             tally[status_key] += 1
             self.console_event_log[key] = {
@@ -9777,6 +9789,15 @@ ZONE_LABELS: List[Tuple[str, str]] = [
 
 
 _INSIDE_STATE: Dict[Tuple[str, str], Dict[str, Any]] = {}
+_NEW_ZONE_STATE: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+_ZONE_EVENT_KEYS: Dict[str, str] = {
+    "golden_zone": "GOLDEN_ZONE",
+    "ext_ob": "EXT_OB",
+    "idm_ob": "IDM_OB",
+    "hist_idm_ob": "HIST_IDM_OB",
+    "hist_ext_ob": "HIST_EXT_OB",
+}
 
 
 def _telegram_allowed_zone_keys() -> Set[str]:
@@ -9809,6 +9830,31 @@ def _inside_hits(
     return out
 
 
+def _new_zone_hits(
+    latest_events: Dict[str, Any],
+    *,
+    allowed_keys: Optional[Set[str]] = None,
+) -> List[Tuple[str, Dict[str, Any]]]:
+    out: List[Tuple[str, Dict[str, Any]]] = []
+    if not isinstance(latest_events, dict):
+        return out
+    for label, key in ZONE_LABELS:
+        if allowed_keys is not None and key not in allowed_keys:
+            continue
+        event_key = _ZONE_EVENT_KEYS.get(key)
+        if not event_key:
+            continue
+        event = latest_events.get(event_key)
+        if isinstance(event, dict):
+            status = event.get("status")
+            if event_key in {"HIST_IDM_OB", "HIST_EXT_OB"}:
+                if status in {"new", "archived"}:
+                    out.append((label, event))
+            elif status == "new":
+                out.append((label, event))
+    return out
+
+
 def _entry_signature(
     symbol: str,
     timeframe: str,
@@ -9822,6 +9868,23 @@ def _entry_signature(
         detail = entry.get("detail") or ""
         ts_val = entry.get("time") or ""
         parts.append(f"{label}|{detail}|{ts_val}")
+    base = f"{symbol}|{timeframe}|{candle_time or ''}|{'|'.join(sorted(parts))}"
+    return str(abs(hash(base)))
+
+
+def _new_zone_signature(
+    symbol: str,
+    timeframe: str,
+    candle_time: Optional[int],
+    latest_events: Dict[str, Any],
+    *,
+    allowed_keys: Optional[Set[str]] = None,
+) -> str:
+    parts: List[str] = []
+    for label, event in _new_zone_hits(latest_events, allowed_keys=allowed_keys):
+        ts_val = event.get("time") or ""
+        display = event.get("display") or label
+        parts.append(f"{label}|{display}|{ts_val}")
     base = f"{symbol}|{timeframe}|{candle_time or ''}|{'|'.join(sorted(parts))}"
     return str(abs(hash(base)))
 
@@ -9869,6 +9932,46 @@ def _format_telegram_entry_message(
     return "\n".join(msg_lines)
 
 
+def _format_telegram_new_zone_message(
+    symbol: str,
+    timeframe: str,
+    candle_time: Optional[int],
+    latest_events: Dict[str, Any],
+    *,
+    allowed_keys: Optional[Set[str]] = None,
+) -> Optional[str]:
+    new_list = _new_zone_hits(latest_events, allowed_keys=allowed_keys)
+    if not new_list:
+        return None
+    ts_display = "—"
+    if isinstance(candle_time, (int, float)):
+        try:
+            ts_display = time.strftime("%Y-%m-%d %H:%M", time.gmtime(candle_time / 1000))
+        except Exception:
+            ts_display = "—"
+    msg_lines = [
+        "🆕 NEW UNTOUCHED ZONES",
+        f"SYMBOL: {symbol} ({timeframe})",
+        f"Candle(UTC): {ts_display}",
+        "Zones (CREATED):",
+    ]
+    trimmed = new_list[:5]
+    for label, event in trimmed:
+        display = event.get("display") or label
+        ts_val = event.get("time")
+        ts_part = ""
+        if isinstance(ts_val, (int, float)):
+            try:
+                ts_part = f" @ {time.strftime(' %Y-%m-%d %H:%M', time.gmtime(ts_val / 1000)).strip()}"
+            except Exception:
+                ts_part = ""
+        msg_lines.append(f" - {label}: {display}{ts_part}")
+    if len(new_list) > len(trimmed):
+        msg_lines.append(" - …")
+    msg_lines.append("---")
+    return "\n".join(msg_lines)
+
+
 def _handle_telegram_entry(symbol: str, timeframe: str, runtime: Any, hits: Dict[str, Dict[str, Any]]) -> None:
     if not _TELEGRAM_NOTIFIER.enabled:
         return
@@ -9879,6 +9982,25 @@ def _handle_telegram_entry(symbol: str, timeframe: str, runtime: Any, hits: Dict
     if not inside_list:
         state.update({"was_inside": False, "last_inside_candle_time": None, "last_hit_signature": None})
         _INSIDE_STATE[key] = state
+        latest_events = {}
+        try:
+            latest_events = runtime._collect_latest_console_events()
+        except Exception:
+            latest_events = {}
+        new_state = _NEW_ZONE_STATE.get(key, {"last_new_candle_time": None, "last_new_signature": None})
+        candle_time = _safe_candle_time(runtime)
+        signature = _new_zone_signature(symbol, timeframe, candle_time, latest_events, allowed_keys=allowed_keys)
+        if signature != new_state.get("last_new_signature"):
+            msg = _format_telegram_new_zone_message(
+                symbol,
+                timeframe,
+                candle_time,
+                latest_events,
+                allowed_keys=allowed_keys,
+            )
+            if msg:
+                _TELEGRAM_NOTIFIER.send(msg)
+                _NEW_ZONE_STATE[key] = {"last_new_candle_time": candle_time, "last_new_signature": signature}
         return
 
     candle_time = _safe_candle_time(runtime)
