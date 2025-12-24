@@ -112,7 +112,7 @@ ANSI_HEADER_COLORS = [
 class RateLimiter:
     """Simple thread-safe limiter to keep ccxt requests within safe bounds."""
 
-    def __init__(self, *, max_per_sec: float = 5.0, max_concurrent: int = 3, delay_ms: int = 0,
+    def __init__(self, *, max_per_sec: float = 8.0, max_concurrent: int = 4, delay_ms: int = 0,
                  retry_count: int = 2, backoff_base: float = 0.5) -> None:
         self.min_interval = 1.0 / max(max_per_sec, 0.1)
         self.semaphore = threading.Semaphore(max(1, int(max_concurrent)))
@@ -160,6 +160,10 @@ def _set_rate_limits_from_cfg(cfg: Any) -> None:
     except Exception:
         max_concurrent = 3
     try:
+        max_per_sec = float(getattr(cfg, "max_requests_per_sec", max_concurrent))
+    except Exception:
+        max_per_sec = float(max_concurrent)
+    try:
         delay_ms = int(getattr(cfg, "request_delay_ms", 0))
     except Exception:
         delay_ms = 0
@@ -172,7 +176,7 @@ def _set_rate_limits_from_cfg(cfg: Any) -> None:
     except Exception:
         backoff_base = 0.5
     _GLOBAL_RATE_LIMITER = RateLimiter(
-        max_per_sec=float(max_concurrent) if max_concurrent > 0 else 5.0,
+        max_per_sec=float(max_per_sec) if max_per_sec > 0 else 8.0,
         max_concurrent=max_concurrent or 1,
         delay_ms=delay_ms,
         retry_count=retry_count,
@@ -194,7 +198,7 @@ TELEGRAM_BACKOFF_BASE_SEC: float = 1.5
 TELEGRAM_ZONE_TOGGLES: Dict[str, bool] = {
     "order_flow": False,
     "liquidity": False,
-    "fvg": True,
+    "fvg": False,
     "golden_zone": True,
     "ext_ob": True,
     "idm_ob": True,
@@ -325,14 +329,14 @@ _TELEGRAM_NOTIFIER = TelegramNotifier(
 class _EditorAutorunDefaults:
     timeframe: str = "15m"
     candle_limit: int = 500
-    max_symbols: int = 600
+    max_symbols: int = 2000
     recent_bars: int = 2
     near_threshold_pct: float = 0.2
     continuous_scan: bool = False
     scan_interval: float = 0.0
     height_metric: str = "percentage"
     height_scope: Optional[str] = None
-    height_threshold: Optional[float] = None
+    height_threshold: Optional[float] = 0.0
     height_candle_window: Optional[int] = None
 
 
@@ -9635,23 +9639,31 @@ def check_symbol_hits(state: Any, price: Optional[float] = None) -> Dict[str, Di
             series=series,
         )
 
-    # Golden Zone (active box ``bxf``)
-    gz_box = getattr(state, "bxf", None)
-    gz_status, gz_detail, gz_ts = _box_entry("Golden Zone", [gz_box] if isinstance(gz_box, Box) else [])
+    def _event_entry(key: str) -> Tuple[str, Optional[str], Optional[int]]:
+        log = getattr(state, "console_event_log", {})
+        event = log.get(key) if isinstance(log, dict) else None
+        if not isinstance(event, dict):
+            return "miss", None, None
+        try:
+            if hasattr(state, "_console_event_within_age") and not state._console_event_within_age(event.get("time")):
+                return "miss", None, None
+        except Exception:
+            pass
+        status = event.get("status")
+        if status == "new":
+            return "new", event.get("display") or event.get("text"), event.get("time")
+        if status == "touched":
+            return "inside", event.get("display") or event.get("text"), event.get("time")
+        if status == "archived":
+            return "new", event.get("display") or event.get("text"), event.get("time")
+        return "miss", None, None
 
-    # Current EXT / IDM OB boxes
-    ext_box = getattr(state, "lstBx", None)
-    idm_box = getattr(state, "lstBxIdm", None)
-    ext_status, ext_detail, ext_ts = _box_entry("EXT OB", [ext_box] if isinstance(ext_box, Box) else [])
-    idm_status, idm_detail, idm_ts = _box_entry("IDM OB", [idm_box] if isinstance(idm_box, Box) else [])
-
-    # Historical OB boxes
-    hist_idm_status, hist_idm_detail, hist_idm_ts = _box_entry(
-        "Hist IDM OB", _iter_objects(getattr(state, "hist_idm_boxes", PineArray()), Box)
-    )
-    hist_ext_status, hist_ext_detail, hist_ext_ts = _box_entry(
-        "Hist EXT OB", _iter_objects(getattr(state, "hist_ext_boxes", PineArray()), Box)
-    )
+    # Golden Zone / OB events (first touch or newly created only)
+    gz_status, gz_detail, gz_ts = _event_entry("GOLDEN_ZONE")
+    ext_status, ext_detail, ext_ts = _event_entry("EXT_OB")
+    idm_status, idm_detail, idm_ts = _event_entry("IDM_OB")
+    hist_idm_status, hist_idm_detail, hist_idm_ts = _event_entry("HIST_IDM_OB")
+    hist_ext_status, hist_ext_detail, hist_ext_ts = _event_entry("HIST_EXT_OB")
 
     # Swing Sweep lines
     swing_status, swing_detail, swing_ts = _line_hit_detail(
@@ -9718,6 +9730,14 @@ ZONE_LABELS: List[Tuple[str, str]] = [
     ("Hist EXT OB", "hist_ext_ob"),
     ("Swing Sweep", "swing_sweep"),
     ("Mark X", "mark_x"),
+]
+
+FOCUS_ZONE_LABELS: List[Tuple[str, str]] = [
+    ("Golden Zone", "golden_zone"),
+    ("EXT OB", "ext_ob"),
+    ("IDM OB", "idm_ob"),
+    ("Hist IDM OB", "hist_idm_ob"),
+    ("Hist EXT OB", "hist_ext_ob"),
 ]
 
 
@@ -9850,9 +9870,9 @@ def _handle_telegram_entry(symbol: str, timeframe: str, runtime: Any, hits: Dict
 def _build_zone_card(symbol: str, timeframe: str, runtime: Any, *, hits: Optional[Dict[str, Dict[str, Any]]] = None) -> Optional[str]:
     hits = hits or check_symbol_hits(runtime)
 
-    inside_any = any(entry.get("status") == "inside" for entry in hits.values())
-    near_any = any(entry.get("status") == "near" for entry in hits.values())
-    if not (inside_any or near_any):
+    focus_hits = {key: hits.get(key, {}) for _, key in FOCUS_ZONE_LABELS}
+    inside_any = any(entry.get("status") in {"inside", "new"} for entry in focus_hits.values())
+    if not inside_any:
         return None
 
     def _fmt_ts(ts: Optional[int]) -> str:
@@ -9865,7 +9885,7 @@ def _build_zone_card(symbol: str, timeframe: str, runtime: Any, *, hits: Optiona
 
     def _fmt_line(label: str, entry: Dict[str, Any]) -> str:
         status_key = entry.get("status")
-        icon = "✅" if status_key == "inside" else "🔵" if status_key == "near" else "❌"
+        icon = "✅" if status_key == "inside" else "🆕" if status_key == "new" else "❌"
         details: List[str] = []
         if entry.get("detail"):
             ts_part = ""
@@ -9884,8 +9904,8 @@ def _build_zone_card(symbol: str, timeframe: str, runtime: Any, *, hits: Optiona
 
     lines: List[str] = [f"SYMBOL: {symbol_display}"]
     lines.append(f"Status: {status_line}")
-    for label, key in ZONE_LABELS:
-        lines.append(_fmt_line(label, hits.get(key, {})))
+    for label, key in FOCUS_ZONE_LABELS:
+        lines.append(_fmt_line(label, focus_hits.get(key, {})))
 
     try:
         ts = runtime.series.get_time()
@@ -9920,7 +9940,16 @@ def scan_binance(
     ) -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
     if ccxt is None:
         raise RuntimeError("ccxt is not available")
-    exchange = ccxt.binanceusdm({"enableRateLimit": True})
+    exchange = ccxt.binanceusdm({"enableRateLimit": False})
+    scan_started = time.perf_counter()
+    exchange_local = threading.local()
+
+    def _thread_exchange() -> Any:
+        ex = getattr(exchange_local, "exchange", None)
+        if ex is None:
+            ex = ccxt.binanceusdm({"enableRateLimit": False})
+            exchange_local.exchange = ex
+        return ex
     all_symbols = symbols or fetch_binance_usdtm_symbols(
         exchange,
         limit=max_symbols,
@@ -9950,7 +9979,7 @@ def scan_binance(
     max_workers = 1 if (tracer and tracer.enabled) else max(1, int(concurrency))
 
     def _process_symbol(idx: int, symbol: str) -> Optional[Tuple[SmartMoneyAlgoProE5, Dict[str, Any]]]:
-        local_exchange = exchange if max_workers == 1 else ccxt.binanceusdm({"enableRateLimit": True})
+        local_exchange = exchange if max_workers == 1 else _thread_exchange()
         ticker = ticker_map.get(symbol)
         if ticker is None:
             try:
@@ -9978,14 +10007,23 @@ def scan_binance(
                     threshold=min_daily_change,
                 )
             return None
+        fetch_started = time.perf_counter()
         candles = fetch_ohlcv(local_exchange, symbol, timeframe, max(limit, window))
+        fetch_elapsed = time.perf_counter() - fetch_started
         runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
         runtime.console_max_age_bars = max(runtime.console_max_age_bars, window)
         runtime.scan_recent_bars = window
         runtime.near_threshold_pct = getattr(inputs, "near_threshold_pct", EDITOR_AUTORUN_DEFAULTS.near_threshold_pct)
+        process_started = time.perf_counter()
         runtime.process(candles)
+        process_elapsed = time.perf_counter() - process_started
         metrics = runtime.gather_console_metrics()
         metrics["daily_change_percent"] = daily_change
+        print(
+            f"[PERF] {_format_symbol(symbol)} fetch={fetch_elapsed:.3f}s "
+            f"process={process_elapsed:.3f}s",
+            flush=True,
+        )
         summaries.append(
             {
                 "symbol": symbol,
@@ -10024,6 +10062,7 @@ def scan_binance(
         primary_runtime = SmartMoneyAlgoProE5(inputs=inputs, tracer=tracer)
         primary_runtime.console_max_age_bars = max(primary_runtime.console_max_age_bars, window)
         primary_runtime.process([])
+    print(f"[PERF] scan_total={time.perf_counter() - scan_started:.3f}s", flush=True)
     return primary_runtime, summaries
 
 
@@ -10347,7 +10386,7 @@ def _send_tg(cfg: _CLISettings, lines: List[str]) -> None:
 # ----------------------------- Symbol Picker ----------------------------------
 def _build_exchange(market: str):
     # Futures-only
-    return ccxt.binanceusdm({"enableRateLimit": True})
+    return ccxt.binanceusdm({"enableRateLimit": False})
 
 def _pick_symbols(cfg: _CLISettings, symbol_override: Optional[str] = None, max_symbols_hint: int = 300) -> List[str]:
     if symbol_override:
@@ -11147,18 +11186,28 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
 
 # ---------- Live exchange helpers (Futures-only) ----------
 def _build_exchange(_market_forced_usdtm:str="usdtm"):
-    return ccxt.binanceusdm({"enableRateLimit": True})
+    return ccxt.binanceusdm({"enableRateLimit": False})
 
 def fetch_ohlcv(ex, symbol, timeframe, limit):
-    ex.load_markets()
     target = max(EDITOR_AUTORUN_DEFAULTS.recent_bars, int(limit) if limit and limit > 0 else 0)
     target = max(1, target)
 
     def _call():
         return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=target)
 
-    raw = _GLOBAL_RATE_LIMITER.run(_call)
-    return raw[-target:] if raw else []
+    raw = _GLOBAL_RATE_LIMITER.run(_call) or []
+    candles = [
+        {
+            "time": entry[0],
+            "open": entry[1],
+            "high": entry[2],
+            "low": entry[3],
+            "close": entry[4],
+            "volume": entry[5] if len(entry) > 5 else float("nan"),
+        }
+        for entry in raw[-target:]
+    ]
+    return candles
 
 # ---------- Settings & argument parsing ----------
 class Settings:
@@ -11196,8 +11245,9 @@ class Settings:
         self.structure_requires_wick = kw.get("structure_requires_wick", False)
         self.mtf_lookahead = kw.get("mtf_lookahead", False)
         self.zone_type = kw.get("zone_type", "Mother Bar")
-        self.max_workers = kw.get("max_workers", 3)
-        self.max_concurrent_requests = kw.get("max_concurrent_requests", 3)
+        self.max_workers = kw.get("max_workers", 4)
+        self.max_concurrent_requests = kw.get("max_concurrent_requests", 4)
+        self.max_requests_per_sec = kw.get("max_requests_per_sec", 8.0)
         self.request_delay_ms = kw.get("request_delay_ms", 0)
         self.retry_count = kw.get("retry_count", 2)
         self.retry_backoff_base = kw.get("retry_backoff_base", 0.5)
@@ -11475,8 +11525,8 @@ def _parse_args_android():
     return cfg, args
 
 # ---------- Symbols universe (Futures USDT-M only) ----------
-def _pick_symbols(cfg, symbol_override: str | None, max_symbols_hint: int):
-    ex = _build_exchange('usdtm')
+def _pick_symbols(cfg, symbol_override: str | None, max_symbols_hint: int, exchange: Optional[Any] = None):
+    ex = exchange or _build_exchange('usdtm')
     explicit = (symbol_override or "").strip()
     limit_hint = max_symbols_hint if max_symbols_hint else cfg.max_scan
     try:
@@ -11527,10 +11577,7 @@ def _pick_symbols(cfg, symbol_override: str | None, max_symbols_hint: int):
     if explicit:
         return symbols
 
-    ban = ("INU", "DOGE", "PEPE", "FLOKI", "BONK", "SHIB", "BABY", "CAT", "MOON", "MEME")
-    filtered = [s for s in symbols if not any(b in s for b in ban)]
-    if not filtered:
-        filtered = symbols
+    filtered = symbols
 
     if limit_value and limit_value > 0:
         filtered = filtered[:limit_value]
@@ -11589,6 +11636,17 @@ def _android_cli_entry() -> int:
     inputs.console.max_age_bars = max(1, recent_window - 1)
 
     symbol_override = args.symbol or None
+    runtime_cache: Dict[str, SmartMoneyAlgoProE5] = {}
+    candle_cache: Dict[str, deque] = {}
+
+    def _new_runtime() -> SmartMoneyAlgoProE5:
+        runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
+        runtime._bos_break_source = cfg.bos_confirmation
+        runtime._strict_close_for_break = cfg.strict_close_for_break
+        runtime.console_max_age_bars = max(runtime.console_max_age_bars, recent_window)
+        runtime.scan_recent_bars = recent_window
+        runtime.near_threshold_pct = getattr(inputs, "near_threshold_pct", EDITOR_AUTORUN_DEFAULTS.near_threshold_pct)
+        return runtime
     iteration = 0
     try:
         while True:
@@ -11596,7 +11654,13 @@ def _android_cli_entry() -> int:
             if cfg.continuous_scan and iteration > 1:
                 print(f"\nإعادة تشغيل المسح (الدورة {iteration})", flush=True)
 
-            symbols = _pick_symbols(cfg, symbol_override=symbol_override, max_symbols_hint=args.max_symbols)
+            scan_started = time.perf_counter()
+            symbols = _pick_symbols(
+                cfg,
+                symbol_override=symbol_override,
+                max_symbols_hint=args.max_symbols,
+                exchange=ex,
+            )
             symbols = list(dict.fromkeys(symbols))
             if cfg.max_scan:
                 try:
@@ -11605,19 +11669,40 @@ def _android_cli_entry() -> int:
                     pass
             for i, sym in enumerate(symbols, 1):
                 try:
-                    candles = fetch_ohlcv(ex, sym, args.timeframe, max(args.limit, recent_window))
+                    fetch_started = time.perf_counter()
+                    runtime = runtime_cache.get(sym)
+                    window_size = max(args.limit, recent_window)
+                    candles = fetch_ohlcv(
+                        ex,
+                        sym,
+                        args.timeframe,
+                        window_size,
+                    )
+                    fetch_elapsed = time.perf_counter() - fetch_started
                     if cfg.drop_last_incomplete and candles:
                         candles = candles[:-1]
-                    runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
-                    runtime._bos_break_source = cfg.bos_confirmation
-                    runtime._strict_close_for_break = cfg.strict_close_for_break
-                    runtime.console_max_age_bars = max(runtime.console_max_age_bars, recent_window)
-                    runtime.scan_recent_bars = recent_window
-                    runtime.near_threshold_pct = getattr(inputs, "near_threshold_pct", EDITOR_AUTORUN_DEFAULTS.near_threshold_pct)
-                    runtime.process([
-                        {"time": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5] if len(c)>5 else float('nan')}
-                        for c in candles
-                    ])
+                    used_cache = False
+                    if runtime is None or not cfg.continuous_scan:
+                        runtime = _new_runtime()
+                        if sym in candle_cache:
+                            candles = list(candle_cache[sym])
+                            used_cache = True
+                    process_started = time.perf_counter()
+                    if candles:
+                        cache = candle_cache.get(sym)
+                        if cache is None:
+                            cache = deque(maxlen=window_size)
+                            candle_cache[sym] = cache
+                        if not used_cache:
+                            cache.extend(candles)
+                        runtime.process(candles)
+                        runtime_cache[sym] = runtime
+                    process_elapsed = time.perf_counter() - process_started
+                    print(
+                        f"[PERF] {_format_symbol(sym)} fetch={fetch_elapsed:.3f}s "
+                        f"process={process_elapsed:.3f}s",
+                        flush=True,
+                    )
                 except Exception as e:
                     print(
                         f"[{i}/{len(symbols)}] {_format_symbol(sym)}: error {e}",
@@ -11636,6 +11721,7 @@ def _android_cli_entry() -> int:
 
             if args.verbose:
                 print(f"\nتم. عدد الرموز: {len(symbols)}")
+            print(f"[PERF] scan_total={time.perf_counter() - scan_started:.3f}s", flush=True)
 
             if not cfg.continuous_scan:
                 print(
