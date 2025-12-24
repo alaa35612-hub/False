@@ -198,7 +198,7 @@ TELEGRAM_BACKOFF_BASE_SEC: float = 1.5
 TELEGRAM_ZONE_TOGGLES: Dict[str, bool] = {
     "order_flow": False,
     "liquidity": False,
-    "fvg": True,
+    "fvg": False,
     "golden_zone": True,
     "ext_ob": True,
     "idm_ob": True,
@@ -329,14 +329,14 @@ _TELEGRAM_NOTIFIER = TelegramNotifier(
 class _EditorAutorunDefaults:
     timeframe: str = "15m"
     candle_limit: int = 500
-    max_symbols: int = 600
+    max_symbols: int = 2000
     recent_bars: int = 2
     near_threshold_pct: float = 0.2
     continuous_scan: bool = False
     scan_interval: float = 0.0
     height_metric: str = "percentage"
     height_scope: Optional[str] = None
-    height_threshold: Optional[float] = None
+    height_threshold: Optional[float] = 0.0
     height_candle_window: Optional[int] = None
 
 
@@ -11172,18 +11172,14 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
 def _build_exchange(_market_forced_usdtm:str="usdtm"):
     return ccxt.binanceusdm({"enableRateLimit": False})
 
-def fetch_ohlcv(ex, symbol, timeframe, limit, since_ms: Optional[int] = None):
+def fetch_ohlcv(ex, symbol, timeframe, limit):
     target = max(EDITOR_AUTORUN_DEFAULTS.recent_bars, int(limit) if limit and limit > 0 else 0)
     target = max(1, target)
 
     def _call():
-        if since_ms is None:
-            return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=target)
-        return ex.fetch_ohlcv(symbol, timeframe=timeframe, since=since_ms, limit=target)
+        return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=target)
 
     raw = _GLOBAL_RATE_LIMITER.run(_call) or []
-    if since_ms is not None:
-        raw = [entry for entry in raw if entry and entry[0] >= since_ms]
     candles = [
         {
             "time": entry[0],
@@ -11565,10 +11561,7 @@ def _pick_symbols(cfg, symbol_override: str | None, max_symbols_hint: int, excha
     if explicit:
         return symbols
 
-    ban = ("INU", "DOGE", "PEPE", "FLOKI", "BONK", "SHIB", "BABY", "CAT", "MOON", "MEME")
-    filtered = [s for s in symbols if not any(b in s for b in ban)]
-    if not filtered:
-        filtered = symbols
+    filtered = symbols
 
     if limit_value and limit_value > 0:
         filtered = filtered[:limit_value]
@@ -11628,7 +11621,6 @@ def _android_cli_entry() -> int:
 
     symbol_override = args.symbol or None
     runtime_cache: Dict[str, SmartMoneyAlgoProE5] = {}
-    last_time_cache: Dict[str, int] = {}
     candle_cache: Dict[str, deque] = {}
 
     def _new_runtime() -> SmartMoneyAlgoProE5:
@@ -11663,19 +11655,12 @@ def _android_cli_entry() -> int:
                 try:
                     fetch_started = time.perf_counter()
                     runtime = runtime_cache.get(sym)
-                    last_time = last_time_cache.get(sym)
-                    if runtime is not None and last_time is None:
-                        runtime = None
-                    since_ms = None
-                    if cfg.continuous_scan and runtime is not None and last_time:
-                        since_ms = int(last_time) + 1
                     window_size = max(args.limit, recent_window)
                     candles = fetch_ohlcv(
                         ex,
                         sym,
                         args.timeframe,
                         window_size,
-                        since_ms=since_ms,
                     )
                     fetch_elapsed = time.perf_counter() - fetch_started
                     if cfg.drop_last_incomplete and candles:
@@ -11695,7 +11680,6 @@ def _android_cli_entry() -> int:
                         if not used_cache:
                             cache.extend(candles)
                         runtime.process(candles)
-                        last_time_cache[sym] = runtime.series.get_time()
                         runtime_cache[sym] = runtime
                     process_elapsed = time.perf_counter() - process_started
                     print(
