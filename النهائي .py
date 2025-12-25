@@ -7674,21 +7674,12 @@ def _ohlcv_metric_value(
     first = candles[0]
     last = candles[-1]
 
-    try:
-        first_open = float(first[1])
-    except (TypeError, ValueError):
-        first_open = math.nan
-    try:
-        last_close = float(last[4])
-    except (TypeError, ValueError):
-        last_close = math.nan
+    first_open = _safe_float(_ohlcv_value(first, 1))
+    last_close = _safe_float(_ohlcv_value(last, 4))
 
     total_volume = 0.0
     for entry in candles:
-        try:
-            vol = float(entry[5])
-        except (TypeError, ValueError):
-            continue
+        vol = _safe_float(_ohlcv_value(entry, 5))
         if math.isnan(vol):
             continue
         total_volume += vol
@@ -7733,6 +7724,110 @@ def _extract_quote_volume(ticker: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+def _safe_float(value: Any) -> float:
+    """Convert arbitrary input to float, returning NaN on invalid data."""
+
+    if value is None or isinstance(value, bool):
+        return math.nan
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return math.nan
+        try:
+            return float(cleaned)
+        except ValueError:
+            return math.nan
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return math.nan
+
+
+def _safe_int(value: Any) -> float:
+    """Convert arbitrary input to int, returning NaN on invalid data."""
+
+    if value is None or isinstance(value, bool):
+        return math.nan
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and math.isnan(value):
+            return math.nan
+        return float(int(value))
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return math.nan
+        try:
+            return float(int(float(cleaned)))
+        except ValueError:
+            return math.nan
+    try:
+        return float(int(value))
+    except (TypeError, ValueError):
+        return math.nan
+
+
+def _normalize_ohlcv_sequence(rows: Sequence[Sequence[Any]]) -> List[List[float]]:
+    """Normalize OHLCV rows to numeric lists, skipping invalid timestamps."""
+
+    normalized: List[List[float]] = []
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) < 6:
+            continue
+        ts = _safe_int(row[0])
+        if math.isnan(ts):
+            continue
+        normalized.append(
+            [
+                int(ts),
+                _safe_float(row[1]),
+                _safe_float(row[2]),
+                _safe_float(row[3]),
+                _safe_float(row[4]),
+                _safe_float(row[5]),
+            ]
+        )
+    return normalized
+
+
+def _normalize_ohlcv_dicts(rows: Sequence[Sequence[Any]]) -> List[Dict[str, float]]:
+    """Normalize OHLCV rows into dicts with strict numeric casting."""
+
+    normalized = _normalize_ohlcv_sequence(rows)
+    return [
+        {
+            "time": int(row[0]),
+            "open": row[1],
+            "high": row[2],
+            "low": row[3],
+            "close": row[4],
+            "volume": row[5],
+        }
+        for row in normalized
+    ]
+
+
+def _ohlcv_value(entry: Any, index: int) -> Any:
+    """Safely return a value from an OHLCV entry by index."""
+
+    if isinstance(entry, (list, tuple)):
+        if len(entry) > index:
+            return entry[index]
+        return None
+    if isinstance(entry, dict):
+        mapping = {
+            0: "time",
+            1: "open",
+            2: "high",
+            3: "low",
+            4: "close",
+            5: "volume",
+        }
+        return entry.get(mapping[index])
+    return None
+
+
 def _binance_linear_symbol_id(symbol: str) -> Optional[str]:
     """Translate ``BTC/USDT:USDT`` into the REST identifier ``BTCUSDT``."""
 
@@ -7764,7 +7859,11 @@ def _bulk_fetch_recent_ohlcv(
     timeframe: str,
     candle_window: int,
 ) -> Dict[str, Sequence[Sequence[Any]]]:
-    """Fetch OHLC candles in parallel when possible to speed up filtering."""
+    """Fetch OHLC candles in parallel when possible to speed up filtering.
+
+    Threaded fetches keep network waits off the main scan loop so synchronous
+    runs stay responsive even when some symbols are slow or rate-limited.
+    """
 
     if candle_window <= 0:
         return {symbol: [] for symbol in symbols}
@@ -7828,7 +7927,8 @@ def _bulk_fetch_recent_ohlcv(
 
         if not isinstance(payload, list):
             return _fetch_recent_ohlcv(exchange, symbol, timeframe, candle_window)
-        return payload[-candle_window:]
+        normalized = _normalize_ohlcv_sequence(payload)
+        return normalized[-candle_window:]
 
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -7862,10 +7962,13 @@ def _fetch_recent_ohlcv(
     if candle_window <= 0:
         return []
     try:
-        return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=candle_window)
+        raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=candle_window)
     except Exception as exc:
         print(f"تعذر جلب شموع {symbol} على إطار {timeframe}: {exc}", flush=True)
         return []
+    if not isinstance(raw, list):
+        return []
+    return _normalize_ohlcv_sequence(raw)
 
 
 def _binance_pick_symbols(
@@ -8092,7 +8195,7 @@ def fetch_binance_usdtm_symbols(
     return symbols
 
 
-def fetch_ohlcv(exchange: Any, symbol: str, timeframe: str, limit: int) -> List[Dict[str, float]]:
+def _fetch_ohlcv_history(exchange: Any, symbol: str, timeframe: str, limit: int) -> List[Dict[str, float]]:
     """Fetch OHLCV data while preserving full history for structural parity.
 
     Binance USDT-M returns at most 1500 candles per request.  TradingView keeps
@@ -8116,27 +8219,25 @@ def fetch_ohlcv(exchange: Any, symbol: str, timeframe: str, limit: int) -> List[
         if target is not None and target < max_batch and not candles:
             # first batch can be trimmed if the caller only needs a small window
             request_limit = target
-        raw: List[List[float]]
-        if since <= 0:
-            raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=request_limit, since=since)
-        else:
-            raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=request_limit, since=since)
-        if not raw:
-            break
-        for entry in raw:
-            candles.append(
-                {
-                    "time": entry[0],
-                    "open": entry[1],
-                    "high": entry[2],
-                    "low": entry[3],
-                    "close": entry[4],
-                    "volume": entry[5],
-                }
+        try:
+            raw = exchange.fetch_ohlcv(
+                symbol,
+                timeframe=timeframe,
+                limit=request_limit,
+                since=since,
             )
+        except Exception as exc:
+            print(f"تعذر جلب الشموع لـ {symbol}: {exc}", flush=True)
+            break
+        if not isinstance(raw, list) or not raw:
+            break
+        normalized = _normalize_ohlcv_dicts(raw)
+        if not normalized:
+            break
+        candles.extend(normalized)
         if target is not None and len(candles) > target:
             candles = candles[-target:]
-        last_open = raw[-1][0]
+        last_open = normalized[-1]["time"]
         next_since = last_open + timeframe_ms
         if len(raw) < request_limit:
             break
@@ -10539,7 +10640,7 @@ def _build_exchange(_market_forced_usdtm:str="usdtm"):
 
 def fetch_ohlcv(ex, symbol, timeframe, limit):
     ex.load_markets()
-    return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    return _fetch_ohlcv_history(ex, symbol, timeframe, limit)
 
 # ---------- Settings & argument parsing ----------
 class Settings:
@@ -11083,14 +11184,19 @@ def _read_csv_series(path: str) -> List[Dict[str, float]]:
     with open(path, newline="", encoding="utf-8") as fh:
         rd = csv.DictReader(fh)
         for row in rd:
-            out.append({
-                "time": int(row["time"]),
-                "open": float(row["open"]),
-                "high": float(row["high"]),
-                "low": float(row["low"]),
-                "close": float(row["close"]),
-                "volume": float(row.get("volume", 0.0)),
-            })
+            ts = _safe_int(row.get("time"))
+            if math.isnan(ts):
+                continue
+            out.append(
+                {
+                    "time": int(ts),
+                    "open": _safe_float(row.get("open")),
+                    "high": _safe_float(row.get("high")),
+                    "low": _safe_float(row.get("low")),
+                    "close": _safe_float(row.get("close")),
+                    "volume": _safe_float(row.get("volume", 0.0)),
+                }
+            )
     return out
 
 
@@ -11111,13 +11217,25 @@ def _fetch_ohlcv_ccxt(exchange: "ccxt.binanceusdm", symbol: str, timeframe: str,
                 raise
             normalized_symbol = fallback
             batch = exchange.fetch_ohlcv(normalized_symbol, timeframe=timeframe, since=since, limit=limit)
-        if not batch:
+        if not isinstance(batch, list) or not batch:
             break
-        for t, o, h, l, c, v in batch:
+        normalized = _normalize_ohlcv_sequence(batch)
+        if not normalized:
+            break
+        for t, o, h, l, c, v in normalized:
             if t > until_ms:
                 return out
-            out.append({"time": t, "open": float(o), "high": float(h), "low": float(l), "close": float(c), "volume": float(v)})
-            since = t + 1
+            out.append(
+                {
+                    "time": int(t),
+                    "open": o,
+                    "high": h,
+                    "low": l,
+                    "close": c,
+                    "volume": v,
+                }
+            )
+            since = int(t) + 1
         if len(batch) < limit or out[-1]["time"] >= until_ms:
             break
     return out
