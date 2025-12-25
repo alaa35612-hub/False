@@ -22,10 +22,13 @@ parity against the Pine logic.
 from __future__ import annotations
 
 import argparse
+import atexit
 import concurrent.futures
 import bisect
 import dataclasses
 import datetime
+import hashlib
+import io
 import inspect
 import json
 import math
@@ -125,6 +128,10 @@ class _EditorAutorunDefaults:
 # كما يمكن تحديد فترة الانتظار بين الدورات من المتغير الذي يليه.
 AUTORUN_CONTINUOUS_SCAN = True
 AUTORUN_SCAN_INTERVAL = 0.0
+# إعدادات تلجرام (يمكن تركها فارغة والاعتماد على ENV أو CLI)
+TELEGRAM_BOT_TOKEN = ""
+TELEGRAM_CHAT_ID = ""
+TELEGRAM_AUTORUN_ENABLE = True
 
 EDITOR_AUTORUN_DEFAULTS = _EditorAutorunDefaults(
     continuous_scan=AUTORUN_CONTINUOUS_SCAN,
@@ -1575,6 +1582,8 @@ class SmartMoneyAlgoProE5:
             key = "MSS"
         elif collapsed == self.IDM_TEXT.replace(" ", ""):
             key = "IDM"
+        elif text.startswith(self.MID_TEXT):
+            key = "0.5"
         elif text.startswith(f"{self.BOS_TEXT} -"):
             key = "FUTURE_BOS"
         elif text.startswith(f"{self.CHOCH_TEXT} -"):
@@ -1591,13 +1600,25 @@ class SmartMoneyAlgoProE5:
                 existing = self.console_event_log.get(key)
                 if existing and existing.get("source") == "confirmed":
                     return
-            self.console_event_log[key] = {
-                "text": label.text,
-                "price": label.y,
-                "time": label.x,
-                "time_display": format_timestamp(label.x),
-                "display": f"{label.text} @ {format_price(label.y)}",
-            }
+            direction = None
+            if label.color == self.inputs.structure.bull:
+                direction = "bullish"
+            elif label.color == self.inputs.structure.bear:
+                direction = "bearish"
+            status = "pending" if key in ("FUTURE_BOS", "FUTURE_CHOCH") else "confirmed"
+            source = "future/pending" if key in ("FUTURE_BOS", "FUTURE_CHOCH") else "label"
+            marker = "✖" if key == "X" else None
+            self._register_concept_event(
+                key,
+                text=label.text,
+                time_value=label.x,
+                price=label.y,
+                direction=direction,
+                status=status,
+                source=source,
+                display=f"{label.text} @ {format_price(label.y)}",
+                marker=marker,
+            )
             self._trace("label", "register", timestamp=label.x, key=key, text=label.text, price=label.y)
 
     def _register_structure_break_event(
@@ -1619,7 +1640,15 @@ class SmartMoneyAlgoProE5:
             "direction": "bullish" if bullish else "bearish",
             "direction_display": direction_text,
             "source": "confirmed",
+            "status": "confirmed",
+            "status_display": "مؤكد",
         }
+        pending_key = "FUTURE_BOS" if key == "BOS" else ("FUTURE_CHOCH" if key == "CHOCH" else None)
+        if pending_key and pending_key in self.console_event_log:
+            pending_event = self.console_event_log[pending_key]
+            pending_event["status"] = "confirmed"
+            pending_event["status_display"] = "مؤكد"
+            pending_event["source"] = "confirmed"
 
     def _register_box_event(self, box: Box, *, status: str = "active", event_time: Optional[int] = None) -> None:
         text = box.text.strip()
@@ -1649,6 +1678,15 @@ class SmartMoneyAlgoProE5:
                 "status": status,
                 "status_display": status_label,
             }
+            if key in ("IDM_OB", "EXT_OB", "HIST_IDM_OB", "HIST_EXT_OB"):
+                self._register_concept_event(
+                    "OB",
+                    text="OB",
+                    time_value=ts,
+                    price_range=(box.bottom, box.top),
+                    status=status,
+                    source="box",
+                )
             self._trace(
                 "box",
                 "register",
@@ -1670,6 +1708,132 @@ class SmartMoneyAlgoProE5:
                     price_range = f"{format_price(box.bottom)} → {format_price(box.top)}"
                     message = f"{{ticker}} {box.text} Created, Range: {price_range}"
                     self.alertcondition(True, alert_title, message)
+
+    def _register_concept_event(
+        self,
+        key: str,
+        *,
+        text: str,
+        time_value: Optional[int] = None,
+        price: Optional[float] = None,
+        price_range: Optional[Tuple[float, float]] = None,
+        direction: Optional[str] = None,
+        status: Optional[str] = None,
+        source: Optional[str] = None,
+        display: Optional[str] = None,
+        marker: Optional[str] = None,
+    ) -> None:
+        """تسجيل حدث موحّد في console_event_log (يُستخدم مع عمر الحدث)."""
+        timestamp = time_value if isinstance(time_value, int) else self.series.get_time()
+        resolved_direction = _normalize_direction(direction)
+        direction_display = "صاعد" if resolved_direction == "bullish" else ("هابط" if resolved_direction == "bearish" else None)
+        base_display = display
+        if base_display is None:
+            if price_range is not None:
+                base_display = f"{text} {format_price(price_range[0])} → {format_price(price_range[1])}"
+            elif price is not None:
+                base_display = f"{text} @ {format_price(price)}"
+            else:
+                base_display = text
+        marker_symbol = marker
+        if marker_symbol is None:
+            if resolved_direction == "bullish":
+                marker_symbol = "🟢"
+            elif resolved_direction == "bearish":
+                marker_symbol = "🔴"
+        if marker_symbol:
+            base_display = f"{marker_symbol} {base_display}"
+        self.console_event_log[key] = {
+            "text": text,
+            "price": price if price_range is None else price_range,
+            "time": timestamp,
+            "time_display": format_timestamp(timestamp),
+            "display": base_display,
+            "direction": resolved_direction,
+            "direction_display": direction_display,
+            "status": status,
+            "status_display": status,
+            "source": source,
+        }
+
+    def _register_key_level_event(
+        self,
+        *,
+        level_key: str,
+        label_text: str,
+        time_value: int,
+        price: float,
+        timeframe: str,
+        direction: Optional[str],
+        status: str = "active",
+    ) -> None:
+        """تسجيل مستويات Key Levels/السيولة المرتبطة بالأطر الزمنية."""
+        event_time = self.series.get_time()
+        level_time_display = format_timestamp(time_value)
+        display_text = f"KEY LEVEL [{timeframe}] {label_text} @ {format_price(price)}"
+        if level_time_display and level_time_display != "—":
+            display_text = f"{display_text} (t={level_time_display})"
+        self._register_concept_event(
+            f"KEY_LEVEL_{level_key}",
+            text=f"KEY LEVEL [{timeframe}] {label_text}",
+            time_value=event_time,
+            price=price,
+            direction=direction,
+            status=status,
+            source="line",
+            display=display_text,
+        )
+        self._register_concept_event(
+            "KEY_LEVELS",
+            text="KEY LEVELS",
+            time_value=event_time,
+            price=price,
+            direction=direction,
+            status=status,
+            source="line",
+            display=display_text,
+        )
+        self._register_concept_event(
+            f"KEY_LEVELS_{timeframe}",
+            text=f"KEY LEVELS {timeframe}",
+            time_value=event_time,
+            price=price,
+            direction=direction,
+            status=status,
+            source="line",
+            display=display_text,
+        )
+        if direction:
+            self._register_concept_event(
+                f"LIQUIDITY_LEVEL_{level_key}",
+                text=f"LIQUIDITY LEVEL [{timeframe}] {label_text}",
+                time_value=event_time,
+                price=price,
+                direction=direction,
+                status=status,
+                source="line",
+                display=display_text,
+            )
+            self._register_concept_event(
+                "LIQUIDITY_LEVELS",
+                text="LIQUIDITY LEVELS",
+                time_value=event_time,
+                price=price,
+                direction=direction,
+                status=status,
+                source="line",
+                display=display_text,
+            )
+            self._register_concept_event(
+                f"LIQUIDITY_LEVELS_{timeframe}",
+                text=f"LIQUIDITY LEVELS {timeframe}",
+                time_value=event_time,
+                price=price,
+                direction=direction,
+                status=status,
+                source="line",
+                display=display_text,
+            )
 
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
         events: Dict[str, Dict[str, Any]] = {}
@@ -1753,6 +1917,7 @@ class SmartMoneyAlgoProE5:
         record_label("MSS_PLUS", lambda lbl: _text_equals(lbl, "MSS+", allow_hyphen=True))
         record_label("MSS", lambda lbl: _text_equals(lbl, "MSS") and "+" not in lbl.text)
         record_label("IDM", lambda lbl: _text_equals(lbl, self.IDM_TEXT))
+        record_label("0.5", lambda lbl: lbl.text.strip().startswith(self.MID_TEXT))
         record_label(
             "FUTURE_BOS",
             lambda lbl: lbl.text.startswith(f"{self.BOS_TEXT} -"),
@@ -3633,6 +3798,14 @@ class SmartMoneyAlgoProE5:
             )
             if label:
                 self._combine_levels(prices, labels, intra_open, label, kl.Color_4H_Levels)
+                self._register_key_level_event(
+                    level_key=f"4H_{iotext}",
+                    label_text=iotext,
+                    time_value=intra_time,
+                    price=intra_open,
+                    timeframe="4H",
+                    direction=None,
+                )
             if not math.isnan(intrah_open):
                 label = self._update_level_visual(
                     "4h_high",
@@ -3648,6 +3821,14 @@ class SmartMoneyAlgoProE5:
                 )
                 if label:
                     self._combine_levels(prices, labels, intrah_open, label, kl.Color_4H_Levels)
+                    self._register_key_level_event(
+                        level_key=f"4H_{pihtext}",
+                        label_text=pihtext,
+                        time_value=intrah_time,
+                        price=intrah_open,
+                        timeframe="4H",
+                        direction="bearish",
+                    )
             if not math.isnan(intral_open):
                 label = self._update_level_visual(
                     "4h_low",
@@ -3663,6 +3844,14 @@ class SmartMoneyAlgoProE5:
                 )
                 if label:
                     self._combine_levels(prices, labels, intral_open, label, kl.Color_4H_Levels)
+                    self._register_key_level_event(
+                        level_key=f"4H_{piltext}",
+                        label_text=piltext,
+                        time_value=intral_time,
+                        price=intral_open,
+                        timeframe="4H",
+                        direction="bullish",
+                    )
 
         if kl.Show_Monday_Levels and not math.isnan(self.monday_high) and not math.isnan(self.monday_low):
             right = extend_to_current()
@@ -3680,6 +3869,14 @@ class SmartMoneyAlgoProE5:
             )
             if label:
                 self._combine_levels(prices, labels, self.monday_high, label, kl.Color_Monday_Levels)
+                self._register_key_level_event(
+                    level_key=f"MON_{pmonhtext}",
+                    label_text=pmonhtext,
+                    time_value=self.monday_time,
+                    price=self.monday_high,
+                    timeframe="MONDAY",
+                    direction="bearish",
+                )
             label = self._update_level_visual(
                 "monday_low",
                 self.monday_time,
@@ -3694,6 +3891,14 @@ class SmartMoneyAlgoProE5:
             )
             if label:
                 self._combine_levels(prices, labels, self.monday_low, label, kl.Color_Monday_Levels)
+                self._register_key_level_event(
+                    level_key=f"MON_{pmonltext}",
+                    label_text=pmonltext,
+                    time_value=self.monday_time,
+                    price=self.monday_low,
+                    timeframe="MONDAY",
+                    direction="bullish",
+                )
             label = self._update_level_visual(
                 "monday_mid",
                 self.monday_time,
@@ -3708,6 +3913,14 @@ class SmartMoneyAlgoProE5:
             )
             if label:
                 self._combine_levels(prices, labels, self.monday_mid, label, kl.Color_Monday_Levels)
+                self._register_key_level_event(
+                    level_key=f"MON_{pmonmtext}",
+                    label_text=pmonmtext,
+                    time_value=self.monday_time,
+                    price=self.monday_mid,
+                    timeframe="MONDAY",
+                    direction=None,
+                )
 
         if kl.Show_Daily_Levels and not math.isnan(daily_open):
             right = extend_to_current()
@@ -3725,6 +3938,14 @@ class SmartMoneyAlgoProE5:
             )
             if label:
                 self._combine_levels(prices, labels, daily_open, label, kl.Color_Daily_Levels)
+                self._register_key_level_event(
+                    level_key=f"D_{dotext}",
+                    label_text=dotext,
+                    time_value=daily_time,
+                    price=daily_open,
+                    timeframe="DAILY",
+                    direction=None,
+                )
             if not math.isnan(dailyh_open):
                 label = self._update_level_visual(
                     "daily_high",
@@ -3740,6 +3961,14 @@ class SmartMoneyAlgoProE5:
                 )
                 if label:
                     self._combine_levels(prices, labels, dailyh_open, label, kl.Color_Daily_Levels)
+                    self._register_key_level_event(
+                        level_key=f"D_{pdhtext}",
+                        label_text=pdhtext,
+                        time_value=dailyh_time,
+                        price=dailyh_open,
+                        timeframe="DAILY",
+                        direction="bearish",
+                    )
             if not math.isnan(dailyl_open):
                 label = self._update_level_visual(
                     "daily_low",
@@ -3755,6 +3984,14 @@ class SmartMoneyAlgoProE5:
                 )
                 if label:
                     self._combine_levels(prices, labels, dailyl_open, label, kl.Color_Daily_Levels)
+                    self._register_key_level_event(
+                        level_key=f"D_{pdltext}",
+                        label_text=pdltext,
+                        time_value=dailyl_time,
+                        price=dailyl_open,
+                        timeframe="DAILY",
+                        direction="bullish",
+                    )
 
         if kl.Show_Weekly_Levels and not math.isnan(weekly_open):
             right = extend_to_current()
@@ -3819,6 +4056,14 @@ class SmartMoneyAlgoProE5:
             )
             if label:
                 self._combine_levels(prices, labels, monthly_open, label, kl.MonthlyColor)
+                self._register_key_level_event(
+                    level_key=f"M_{motext}",
+                    label_text=motext,
+                    time_value=monthly_time,
+                    price=monthly_open,
+                    timeframe="MONTHLY",
+                    direction=None,
+                )
             if not math.isnan(monthlyh_open):
                 label = self._update_level_visual(
                     "monthly_high",
@@ -3834,6 +4079,14 @@ class SmartMoneyAlgoProE5:
                 )
                 if label:
                     self._combine_levels(prices, labels, monthlyh_open, label, kl.MonthlyColor)
+                    self._register_key_level_event(
+                        level_key=f"M_{pmhtext}",
+                        label_text=pmhtext,
+                        time_value=monthlyh_time,
+                        price=monthlyh_open,
+                        timeframe="MONTHLY",
+                        direction="bearish",
+                    )
             if not math.isnan(monthlyl_open):
                 label = self._update_level_visual(
                     "monthly_low",
@@ -3849,6 +4102,14 @@ class SmartMoneyAlgoProE5:
                 )
                 if label:
                     self._combine_levels(prices, labels, monthlyl_open, label, kl.MonthlyColor)
+                    self._register_key_level_event(
+                        level_key=f"M_{pmltext}",
+                        label_text=pmltext,
+                        time_value=monthlyl_time,
+                        price=monthlyl_open,
+                        timeframe="MONTHLY",
+                        direction="bullish",
+                    )
 
         if kl.Show_Quaterly_Levels and not math.isnan(quarterly_open):
             right = extend_to_current()
@@ -4708,6 +4969,66 @@ class SmartMoneyAlgoProE5:
 
         self.bullish_OB_Break = bull_base or bull_mtf
         self.bearish_OB_Break = bear_base or bear_mtf
+        if self.bullish_OB_Break or self.bearish_OB_Break:
+            direction = "bearish" if self.bullish_OB_Break else "bullish"
+            price_now = self.series.get("close")
+            ext_box = getattr(self, "lstBx", None)
+            idm_box = getattr(self, "lstBxIdm", None)
+            if isinstance(ext_box, Box):
+                self._register_concept_event(
+                    "BREAK_EXT_OB",
+                    text="Break EXT OB",
+                    time_value=self.series.get_time(),
+                    price=price_now,
+                    price_range=(ext_box.bottom, ext_box.top),
+                    direction=direction,
+                    status="broken",
+                    source="computed",
+                    marker="✖",
+                )
+            if isinstance(idm_box, Box):
+                self._register_concept_event(
+                    "BREAK_IDM_OB",
+                    text="Break IDM OB",
+                    time_value=self.series.get_time(),
+                    price=price_now,
+                    price_range=(idm_box.bottom, idm_box.top),
+                    direction=direction,
+                    status="broken",
+                    source="computed",
+                    marker="✖",
+                )
+            self._register_concept_event(
+                "X",
+                text="X",
+                time_value=self.series.get_time(),
+                price=price_now,
+                direction=direction,
+                status="marked",
+                source="computed",
+                marker="✖",
+            )
+            propulsion = self.fvg_gap != 0
+            mitigation = bool(getattr(self, "arrmitOBBull", PineArray()).size() or getattr(self, "arrmitOBBear", PineArray()).size())
+            sweep = bool(self.isSweepOBS or self.isSweepOBD)
+            block_status = "propulsion" if propulsion else ("mitigation" if mitigation else "breaker")
+            details = []
+            if sweep:
+                details.append("sweep")
+            if mitigation:
+                details.append("mitigation")
+            if propulsion:
+                details.append("propulsion")
+            detail_text = " + ".join(details) if details else "breaker"
+            self._register_concept_event(
+                "BLOCK",
+                text=f"Block (Order/Breaker) {detail_text}",
+                time_value=self.series.get_time(),
+                price=price_now,
+                direction=direction,
+                status=block_status,
+                source="computed",
+            )
         self.alertcondition(self.bullish_OB_Break, "Bullish OB Break", "Bullish OB Broken Ez-SMC")
         self.alertcondition(self.bearish_OB_Break, "Bearish OB Break", "Bearish OB Broken Ez-SMC")
 
@@ -4739,6 +5060,7 @@ class SmartMoneyAlgoProE5:
         box_color: str,
         mtf_color: str,
         use_htf: bool,
+        bullish: bool,
     ) -> None:
         fvg = self.inputs.fvg
         extend_target = self._extend_time(fvg.length_extend)
@@ -4784,6 +5106,26 @@ class SmartMoneyAlgoProE5:
         )
         low_line.set_extend("extend.right" if fvg.fvg_extend else "extend.none")
         lowholder.unshift(low_line)
+
+        direction = "bullish" if bullish else "bearish"
+        self._register_concept_event(
+            f"FAIR_VALUE_GAP_{'BULL' if bullish else 'BEAR'}",
+            text="FAIR VALUE GAP",
+            time_value=bar_time,
+            price_range=(lower, upper),
+            direction=direction,
+            status="new",
+            source="box",
+        )
+        self._register_concept_event(
+            "FAIR_VALUE_GAPS",
+            text="FAIR VALUE GAPS",
+            time_value=self.series.get_time(),
+            price_range=(lower, upper),
+            direction=direction,
+            status="new",
+            source="box",
+        )
 
         high_color = mtf_color if use_htf else box_color
         high_line = self.line_new(
@@ -5015,6 +5357,7 @@ class SmartMoneyAlgoProE5:
                                 fvg.i_bullishfvgcolor,
                                 fvg.i_mtfbullishfvgcolor,
                                 True,
+                                True,
                             )
                             self.fvg_gap = 1
                     elif open1 < close1 and high0 < low2:
@@ -5034,6 +5377,7 @@ class SmartMoneyAlgoProE5:
                                 fvg.i_bearishfvgcolor,
                                 fvg.i_mtfbearishfvgcolor,
                                 True,
+                                False,
                             )
                             self.fvg_gap = -1
 
@@ -5085,6 +5429,8 @@ class SmartMoneyAlgoProE5:
 
         created_high = False
         created_low = False
+        created_high_info: Optional[Tuple[int, float]] = None
+        created_low_info: Optional[Tuple[int, float]] = None
 
         if pivot_high is not None:
             time_ref, price = pivot_high
@@ -5121,6 +5467,7 @@ class SmartMoneyAlgoProE5:
                     self.highBoxArrayHTF.push(box_obj)
                 self.last_liq_high_time = time_ref
                 created_high = True
+                created_high_info = (time_ref, price)
 
         if pivot_low is not None:
             time_ref, price = pivot_low
@@ -5157,6 +5504,7 @@ class SmartMoneyAlgoProE5:
                     self.lowBoxArrayHTF.push(box_obj)
                 self.last_liq_low_time = time_ref
                 created_low = True
+                created_low_info = (time_ref, price)
 
         high_line_alert = self._liquidity_remove_mitigated_lines(self.highLineArrayHTF, True, liq)
         low_line_alert = self._liquidity_remove_mitigated_lines(self.lowLineArrayHTF, False, liq)
@@ -5167,6 +5515,51 @@ class SmartMoneyAlgoProE5:
         self._liquidity_extend_lines(self.lowLineArrayHTF, extend_time)
         self._liquidity_extend_boxes(self.highBoxArrayHTF, extend_time)
         self._liquidity_extend_boxes(self.lowBoxArrayHTF, extend_time)
+
+        if created_high and created_high_info:
+            time_ref, price = created_high_info
+            self._register_concept_event(
+                "LIQUIDITY_LEVEL_HIGH",
+                text="LIQUIDITY LEVEL",
+                time_value=time_ref,
+                price=price,
+                direction="bearish",
+                status="new",
+                source="line",
+            )
+        if created_low and created_low_info:
+            time_ref, price = created_low_info
+            self._register_concept_event(
+                "LIQUIDITY_LEVEL_LOW",
+                text="LIQUIDITY LEVEL",
+                time_value=time_ref,
+                price=price,
+                direction="bullish",
+                status="new",
+                source="line",
+            )
+        if high_line_alert or high_box_alert:
+            self._register_concept_event(
+                "LIQUIDITY_LEVEL_HIGH_BREAK",
+                text="LIQUIDITY LEVEL BREAK",
+                time_value=self.series.get_time(),
+                price=self.series.get("close"),
+                direction="bullish",
+                status="broken",
+                source="computed",
+                marker="✖",
+            )
+        if low_line_alert or low_box_alert:
+            self._register_concept_event(
+                "LIQUIDITY_LEVEL_LOW_BREAK",
+                text="LIQUIDITY LEVEL BREAK",
+                time_value=self.series.get_time(),
+                price=self.series.get("close"),
+                direction="bearish",
+                status="broken",
+                source="computed",
+                marker="✖",
+            )
 
         self.alertcondition(created_high, "High Liquidity Level", "High Liquidity Level Found Ez-SMC")
         self.alertcondition(created_low, "Low Liquidity Level", "Low Liquidity Level Found Ez-SMC")
@@ -5964,6 +6357,26 @@ class SmartMoneyAlgoProE5:
             self.inputs.structure_util.colorSweep,
             "line.style_dotted",
         )
+        self._register_concept_event(
+            "SWING_SWEEP",
+            text="Swing Sweep",
+            time_value=self.series.get_time(),
+            price=y,
+            direction="bullish" if trend else "bearish",
+            status="triggered",
+            source="line",
+            marker="✖",
+        )
+        self._register_concept_event(
+            "X",
+            text="X",
+            time_value=self.series.get_time(),
+            price=y,
+            direction="bullish" if trend else "bearish",
+            status="marked",
+            source="computed",
+            marker="✖",
+        )
         if self.inputs.structure_util.markX:
             self.label_new(
                 self.textCenter(self.series.get_time(), x),
@@ -6575,6 +6988,17 @@ class SmartMoneyAlgoProE5:
             )
             zoneArray.push(box_obj)
             zoneArrayisMit.push(0)
+            zone_key = "DEMAND_ZONE" if isBull else "SUPPLY_ZONE"
+            zone_text = "DEMAND ZONE" if isBull else "SUPPLY ZONE"
+            self._register_concept_event(
+                zone_key,
+                text=zone_text,
+                time_value=self.series.get_time(),
+                price_range=(bot, top),
+                direction="bullish" if isBull else "bearish",
+                status="new",
+                source="box",
+            )
 
     # ------------------------------------------------------------------
     def processZones(self, zones: PineArray, isSupply: bool, zonesmit: PineArray) -> bool:
@@ -6598,6 +7022,15 @@ class SmartMoneyAlgoProE5:
                     )
                 )
                 self.demandZoneIsMit.push(0)
+                self._register_concept_event(
+                    "DEMAND_ZONE",
+                    text="DEMAND ZONE",
+                    time_value=self.series.get_time(),
+                    price_range=(botZone, topZone),
+                    direction="bullish",
+                    status="new",
+                    source="box",
+                )
             elif (not isSupply) and self.series.get("high") > topZone and self.series.get("close") < botZone:
                 self.supplyZone.push(
                     self.createBox(
@@ -6609,6 +7042,15 @@ class SmartMoneyAlgoProE5:
                     )
                 )
                 self.supplyZoneIsMit.push(0)
+                self._register_concept_event(
+                    "SUPPLY_ZONE",
+                    text="SUPPLY ZONE",
+                    time_value=self.series.get_time(),
+                    price_range=(botZone, topZone),
+                    direction="bearish",
+                    status="new",
+                    source="box",
+                )
             elif (
                 (isSupply and self.series.get("high") >= botZone and self.series.get("high", 1) < botZone)
                 or ((not isSupply) and self.series.get("low") <= topZone and self.series.get("low", 1) > topZone)
@@ -8612,11 +9054,30 @@ EVENT_DISPLAY_ORDER = [
     ("MSS_PLUS", "MSS+"),
     ("MSS", "MSS"),
     ("IDM", "IDM"),
+    ("0.5", "0.5"),
+    ("OB", "OB"),
     ("IDM_OB", "IDM OB"),
     ("EXT_OB", "EXT OB"),
     ("HIST_IDM_OB", "Hist IDM OB"),
     ("HIST_EXT_OB", "Hist EXT OB"),
+    ("BREAK_EXT_OB", "Break EXT OB"),
+    ("BREAK_IDM_OB", "Break IDM OB"),
+    ("BLOCK", "Block"),
     ("GOLDEN_ZONE", "Golden zone"),
+    ("DEMAND_ZONE", "DEMAND ZONE"),
+    ("SUPPLY_ZONE", "SUPPLY ZONE"),
+    ("FAIR_VALUE_GAPS", "FAIR VALUE GAPS"),
+    ("LIQUIDITY_LEVELS", "LIQUIDITY LEVELS"),
+    ("LIQUIDITY_LEVELS_4H", "LIQUIDITY 4H"),
+    ("LIQUIDITY_LEVELS_DAILY", "LIQUIDITY DAILY"),
+    ("LIQUIDITY_LEVELS_MONDAY", "LIQUIDITY MONDAY"),
+    ("LIQUIDITY_LEVELS_MONTHLY", "LIQUIDITY MONTHLY"),
+    ("SWING_SWEEP", "Swing Sweep"),
+    ("KEY_LEVELS", "KEY LEVELS"),
+    ("KEY_LEVELS_4H", "KEY LEVELS 4H"),
+    ("KEY_LEVELS_DAILY", "KEY LEVELS DAILY"),
+    ("KEY_LEVELS_MONDAY", "KEY LEVELS MONDAY"),
+    ("KEY_LEVELS_MONTHLY", "KEY LEVELS MONTHLY"),
     ("X", "X"),
     ("RED_CIRCLE", "الدوائر الحمراء"),
     ("GREEN_CIRCLE", "الدوائر الخضراء"),
@@ -8774,6 +9235,8 @@ def scan_binance(
     recent_window_bars: Optional[int] = None,
     max_symbols: Optional[int] = None,
     symbol_selector: Optional[BinanceSymbolSelectorConfig] = None,
+    telegram_cfg: Optional[_CLISettings] = None,
+    telegram_state: Optional[_TelegramState] = None,
 ) -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
     if ccxt is None:
         raise RuntimeError("ccxt is not available")
@@ -8861,6 +9324,25 @@ def scan_binance(
             }
         )
         print_symbol_summary(idx, symbol, timeframe, len(candles), metrics)
+        if telegram_cfg and telegram_cfg.tg_enable and telegram_state:
+            token, chat_id = _resolve_tg_credentials(telegram_cfg)
+            if token and chat_id:
+                header, event_lines = _telegram_event_summary(runtime, symbol, timeframe, telegram_state)
+                stdout_text = _consume_stdout_buffer(telegram_cfg, telegram_state)
+                message_lines: List[str] = [header]
+                if telegram_cfg.tg_send_events and event_lines:
+                    message_lines.extend(event_lines)
+                if stdout_text:
+                    message_lines.append("")
+                    message_lines.append(stdout_text)
+                if len(message_lines) > 1:
+                    send_telegram_message(
+                        token,
+                        chat_id,
+                        "\n".join(message_lines),
+                        throttle_sec=telegram_cfg.tg_throttle_sec,
+                        state=telegram_state,
+                    )
         if tracer and tracer.enabled:
             tracer.log(
                 "scan",
@@ -8941,6 +9423,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=0.0,
         help="عدد الثواني للانتظار قبل إعادة تشغيل المسح عند تفعيل --continuous-scan",
     )
+    parser.add_argument("--telegram", action="store_true", default=False, help="تفعيل إرسال تلجرام")
+    parser.add_argument("--tg", action="store_true", default=False, help="اختصار لتفعيل تلجرام")
+    parser.add_argument("--telegram-token", type=str, default="", help="Telegram BOT_TOKEN")
+    parser.add_argument("--telegram-chat-id", type=str, default="", help="Telegram CHAT_ID")
+    parser.add_argument("--telegram-stdout", action="store_true", default=False, help="إرسال stdout إلى تلجرام")
+    parser.add_argument("--telegram-throttle", type=float, default=3.0, help="فاصل زمني بين رسائل تلجرام")
     args = parser.parse_args(argv)
     if args.min_daily_change < 0.0:
         parser.error("--min-daily-change يجب أن يكون رقمًا غير سالب")
@@ -8948,6 +9436,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error("--max-age-bars يجب أن يكون رقمًا موجبًا")
     if args.scan_interval < 0.0:
         parser.error("--scan-interval يجب أن يكون رقمًا غير سالب")
+
+    tg_cfg = _CLISettings(
+        tg_enable=bool(args.telegram or args.tg or args.telegram_token or args.telegram_chat_id),
+        tg_token=args.telegram_token,
+        tg_chat_id=args.telegram_chat_id,
+        tg_send_stdout=args.telegram_stdout,
+        tg_throttle_sec=args.telegram_throttle,
+    )
+    if not tg_cfg.tg_enable and TELEGRAM_AUTORUN_ENABLE:
+        token, chat_id = _resolve_tg_credentials(tg_cfg)
+        if token and chat_id:
+            tg_cfg.tg_enable = True
+    tg_state = _TelegramState() if tg_cfg.tg_enable else None
+    original_stdout = hook_stdout_or_logger(bool(tg_cfg.tg_enable and tg_cfg.tg_send_stdout), tg_state) if tg_state else None
+    if original_stdout is not None:
+        atexit.register(lambda: setattr(sys, "stdout", original_stdout))
 
     def log(stage: str) -> None:
         print(stage, flush=True)
@@ -9040,6 +9544,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 tracer,
                 min_daily_change=args.min_daily_change,
                 inputs=indicator_inputs,
+                telegram_cfg=tg_cfg if tg_cfg.tg_enable else None,
+                telegram_state=tg_state,
             )
             perform_comparison()
             log("Rendering")
@@ -9158,6 +9664,11 @@ class _CLISettings:
     # scanner controls
     tg_enable: bool = False
     tg_title_prefix: str = "SMC Alert"
+    tg_token: str = ""
+    tg_chat_id: str = ""
+    tg_send_stdout: bool = False
+    tg_send_events: bool = True
+    tg_throttle_sec: float = 3.0
     # matching indicator behavior
     ob_test_mode: str = "CLOSE"  # goes to demand_supply.mittigation_filt (canonicalized inside)
     zone_type: str = "Mother Bar"  # goes to order_block.poi_type
@@ -9176,18 +9687,165 @@ class _CLISettings:
 def _get_secret(name: str) -> Optional[str]:
     return os.environ.get(name)
 
+@dataclass
+class _TelegramState:
+    last_sent_at: float = 0.0
+    last_stdout_hash: Optional[str] = None
+    last_event_hashes: Dict[str, str] = field(default_factory=dict)
+    stdout_buffer: List[str] = field(default_factory=list)
+
+
+def safe_chunk(text: str, limit: int = 4096) -> List[str]:
+    if not text:
+        return []
+    lines = text.splitlines()
+    chunks: List[str] = []
+    current: List[str] = []
+    current_len = 0
+    for line in lines:
+        line_len = len(line)
+        if current and current_len + 1 + line_len > limit:
+            chunks.append("\n".join(current))
+            current = []
+            current_len = 0
+        if line_len > limit:
+            start = 0
+            while start < line_len:
+                end = min(start + limit, line_len)
+                chunks.append(line[start:end])
+                start = end
+            continue
+        current.append(line)
+        current_len = current_len + (1 if current_len else 0) + line_len
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
+def send_telegram_message(
+    token: str,
+    chat_id: str,
+    text: str,
+    *,
+    throttle_sec: float = 0.0,
+    state: Optional[_TelegramState] = None,
+) -> bool:
+    if not token or not chat_id or requests is None:
+        return False
+    now = time.time()
+    if state and throttle_sec > 0 and (now - state.last_sent_at) < throttle_sec:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        for chunk in safe_chunk(text, limit=4096):
+            requests.post(
+                url,
+                data={"chat_id": chat_id, "text": chunk, "parse_mode": "HTML"},
+                timeout=8,
+            )
+        if state is not None:
+            state.last_sent_at = now
+        return True
+    except Exception:
+        return False
+
+
+class _StdoutTee(io.TextIOBase):
+    def __init__(self, real: Any, state: _TelegramState):
+        self._real = real
+        self._state = state
+
+    def write(self, s: str) -> int:
+        written = self._real.write(s)
+        if s:
+            self._state.stdout_buffer.append(s)
+        return written
+
+    def flush(self) -> None:
+        self._real.flush()
+
+    def isatty(self) -> bool:
+        return getattr(self._real, "isatty", lambda: False)()
+
+
+def hook_stdout_or_logger(enable: bool, state: _TelegramState) -> Optional[Any]:
+    if not enable:
+        return None
+    original = sys.stdout
+    sys.stdout = _StdoutTee(original, state)
+    return original
+
+
+def _resolve_tg_credentials(cfg: _CLISettings) -> Tuple[str, str]:
+    token = cfg.tg_token or _get_secret("TELEGRAM_BOT_TOKEN") or TELEGRAM_BOT_TOKEN or ""
+    chat_id = cfg.tg_chat_id or _get_secret("TELEGRAM_CHAT_ID") or TELEGRAM_CHAT_ID or ""
+    return token, chat_id
+
+
+def _format_event_line(key: str, payload: Dict[str, Any]) -> str:
+    direction = _resolve_direction(payload.get("direction"), payload.get("display"))
+    marker = "🟢" if direction == "bullish" else ("🔴" if direction == "bearish" else "")
+    price = payload.get("price")
+    if isinstance(price, (list, tuple)) and len(price) >= 2:
+        price_display = f"{format_price(price[0])} → {format_price(price[1])}"
+    elif isinstance(price, (int, float)):
+        price_display = format_price(price)
+    else:
+        price_display = "-"
+    source = payload.get("source") or "-"
+    status = payload.get("status") or payload.get("status_display") or "-"
+    time_display = payload.get("time_display") or format_timestamp(payload.get("time"))
+    prefix = f"{marker} " if marker else ""
+    return f"{prefix}[{key}] @ {price_display} — {source}/{status} — {time_display}"
+
+
+def _telegram_event_summary(
+    runtime: SmartMoneyAlgoProE5,
+    symbol: str,
+    timeframe: str,
+    state: _TelegramState,
+) -> Tuple[str, List[str]]:
+    metrics = runtime.gather_console_metrics()
+    events = metrics.get("latest_events") or {}
+    lines: List[str] = []
+    for key, payload in events.items():
+        digest = hashlib.sha1(
+            f"{key}|{payload.get('time')}|{payload.get('price')}|{payload.get('status')}|{payload.get('source')}".encode("utf-8")
+        ).hexdigest()
+        if state.last_event_hashes.get(key) == digest:
+            continue
+        state.last_event_hashes[key] = digest
+        lines.append(_format_event_line(key, payload))
+    title = f"{symbol} | {timeframe} | {format_timestamp(runtime.series.get_time(0))}"
+    return title, lines
+
+
+def _consume_stdout_buffer(cfg: _CLISettings, state: _TelegramState) -> str:
+    if not cfg.tg_send_stdout:
+        return ""
+    text = "".join(state.stdout_buffer).strip()
+    state.stdout_buffer.clear()
+    if not text:
+        return ""
+    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()
+    if state.last_stdout_hash == digest:
+        return ""
+    state.last_stdout_hash = digest
+    return text
+
+
 def _send_tg(cfg: _CLISettings, lines: List[str]) -> None:
     if not cfg.tg_enable:
         return
-    token = _get_secret("TELEGRAM_BOT_TOKEN")
-    chat_id = _get_secret("TELEGRAM_CHAT_ID")
-    if not token or not chat_id or requests is None:
+    token, chat_id = _resolve_tg_credentials(cfg)
+    if not token or not chat_id:
         return
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        requests.post(url, data={"chat_id": chat_id, "text": "\n".join(lines), "parse_mode": "HTML"}, timeout=8)
-    except Exception:
-        pass
+    send_telegram_message(
+        token,
+        chat_id,
+        "\n".join(lines),
+        throttle_sec=cfg.tg_throttle_sec,
+    )
 
 # ----------------------------- Symbol Picker ----------------------------------
 def _build_exchange(market: str):
@@ -9287,8 +9945,14 @@ def _parse_args_android() -> Tuple[_CLISettings, argparse.Namespace]:
     p.add_argument("--verbose", "-v", action="store_true", default=False)
     p.add_argument("--debug", action="store_true", default=False)
     p.add_argument("--tg", action="store_true", default=False)
+    p.add_argument("--telegram", action="store_true", default=False)
+    p.add_argument("--telegram-token", type=str, default="")
+    p.add_argument("--telegram-chat-id", type=str, default="")
+    p.add_argument("--telegram-stdout", action="store_true", default=False)
+    p.add_argument("--telegram-throttle", type=float, default=3.0)
     args, _ = p.parse_known_args()
 
+    tg_enable = args.tg or args.telegram
     cfg = _CLISettings(
         market='usdtm',  # forced futures-only
         showHL=args.show_hl,
@@ -9302,7 +9966,11 @@ def _parse_args_android() -> Tuple[_CLISettings, argparse.Namespace]:
         show_fvg=not args.no_fvg,
         show_liquidity=not args.no_liquidity,
         liquidity_display_limit=args.liquidity_limit,
-        tg_enable=args.tg,
+        tg_enable=tg_enable,
+        tg_token=args.telegram_token,
+        tg_chat_id=args.telegram_chat_id,
+        tg_send_stdout=args.telegram_stdout,
+        tg_throttle_sec=args.telegram_throttle,
         ob_test_mode=args.mitigation,
         bos_confirmation=args.bos_confirmation,
         strict_close_for_break=(args.bos_confirmation == "Close"),
@@ -9324,7 +9992,8 @@ def _should_route_android(argv: List[str]) -> bool:
         "--leng-smc","--swing-size","--no-fvg","--no-liquidity","--liquidity-limit",
         "--mitigation","--bos-confirmation","--no-bos-plus","--no-ob-break","--no-ote","--no-ote-alert","--no-mark-x",
         "--min-change","--min-volume","--max-scan","--allow-meme","--exclude-symbols","--exclude-patterns","--include-only",
-        "--recent","--verbose","-v","--debug","--tg"
+        "--recent","--verbose","-v","--debug","--tg","--telegram","--telegram-token","--telegram-chat-id",
+        "--telegram-stdout","--telegram-throttle"
     }
     return any(a in knobs for a in argv)
 
@@ -10051,6 +10720,11 @@ def _parse_args_android():
     p.add_argument("--max-symbols", "-n", type=int, default=EDITOR_AUTORUN_DEFAULTS.max_symbols)
     p.add_argument("--mitigation", choices=["WICK","CLOSE"], default="CLOSE")
     p.add_argument("--tg", action="store_true", default=False)
+    p.add_argument("--telegram", action="store_true", default=False)
+    p.add_argument("--telegram-token", type=str, default="")
+    p.add_argument("--telegram-chat-id", type=str, default="")
+    p.add_argument("--telegram-stdout", action="store_true", default=False)
+    p.add_argument("--telegram-throttle", type=float, default=3.0)
     p.add_argument("--symbol", "-s", default="")
     p.add_argument("--verbose", "-v", action="store_true", default=False)
     p.add_argument("--recent", type=int, default=EDITOR_AUTORUN_DEFAULTS.recent_bars)
@@ -10176,6 +10850,7 @@ def _parse_args_android():
     if not height_metric:
         height_metric = DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_metric
 
+    tg_enable = args.tg or args.telegram
     cfg = Settings(
         eps=args.eps,
         enable_alert_bos=True,
@@ -10183,8 +10858,12 @@ def _parse_args_android():
         enable_alert_idm_touch=True,
         mitigation_mode=args.mitigation,
         merge_ratio=0.10,
-        tg_enable=args.tg,
+        tg_enable=tg_enable,
         tg_title_prefix="SMC Alert",
+        tg_token=args.telegram_token,
+        tg_chat_id=args.telegram_chat_id,
+        tg_send_stdout=args.telegram_stdout,
+        tg_throttle_sec=args.telegram_throttle,
         showHL=args.show_hl,
         showMn=args.show_mn,
         showISOB=True if args.show_isob is None else args.show_isob,
