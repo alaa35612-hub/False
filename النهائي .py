@@ -1575,6 +1575,8 @@ class SmartMoneyAlgoProE5:
             key = "MSS"
         elif collapsed == self.IDM_TEXT.replace(" ", ""):
             key = "IDM"
+        elif text.startswith(self.MID_TEXT):
+            key = "0.5"
         elif text.startswith(f"{self.BOS_TEXT} -"):
             key = "FUTURE_BOS"
         elif text.startswith(f"{self.CHOCH_TEXT} -"):
@@ -1591,13 +1593,25 @@ class SmartMoneyAlgoProE5:
                 existing = self.console_event_log.get(key)
                 if existing and existing.get("source") == "confirmed":
                     return
-            self.console_event_log[key] = {
-                "text": label.text,
-                "price": label.y,
-                "time": label.x,
-                "time_display": format_timestamp(label.x),
-                "display": f"{label.text} @ {format_price(label.y)}",
-            }
+            direction = None
+            if label.color == self.inputs.structure.bull:
+                direction = "bullish"
+            elif label.color == self.inputs.structure.bear:
+                direction = "bearish"
+            status = "pending" if key in ("FUTURE_BOS", "FUTURE_CHOCH") else "confirmed"
+            source = "future/pending" if key in ("FUTURE_BOS", "FUTURE_CHOCH") else "label"
+            marker = "✖" if key == "X" else None
+            self._register_concept_event(
+                key,
+                text=label.text,
+                time_value=label.x,
+                price=label.y,
+                direction=direction,
+                status=status,
+                source=source,
+                display=f"{label.text} @ {format_price(label.y)}",
+                marker=marker,
+            )
             self._trace("label", "register", timestamp=label.x, key=key, text=label.text, price=label.y)
 
     def _register_structure_break_event(
@@ -1619,7 +1633,15 @@ class SmartMoneyAlgoProE5:
             "direction": "bullish" if bullish else "bearish",
             "direction_display": direction_text,
             "source": "confirmed",
+            "status": "confirmed",
+            "status_display": "مؤكد",
         }
+        pending_key = "FUTURE_BOS" if key == "BOS" else ("FUTURE_CHOCH" if key == "CHOCH" else None)
+        if pending_key and pending_key in self.console_event_log:
+            pending_event = self.console_event_log[pending_key]
+            pending_event["status"] = "confirmed"
+            pending_event["status_display"] = "مؤكد"
+            pending_event["source"] = "confirmed"
 
     def _register_box_event(self, box: Box, *, status: str = "active", event_time: Optional[int] = None) -> None:
         text = box.text.strip()
@@ -1670,6 +1692,85 @@ class SmartMoneyAlgoProE5:
                     price_range = f"{format_price(box.bottom)} → {format_price(box.top)}"
                     message = f"{{ticker}} {box.text} Created, Range: {price_range}"
                     self.alertcondition(True, alert_title, message)
+
+    def _register_concept_event(
+        self,
+        key: str,
+        *,
+        text: str,
+        time_value: Optional[int] = None,
+        price: Optional[float] = None,
+        price_range: Optional[Tuple[float, float]] = None,
+        direction: Optional[str] = None,
+        status: Optional[str] = None,
+        source: Optional[str] = None,
+        display: Optional[str] = None,
+        marker: Optional[str] = None,
+    ) -> None:
+        """تسجيل حدث موحّد في console_event_log (يُستخدم مع عمر الحدث)."""
+        timestamp = time_value if isinstance(time_value, int) else self.series.get_time()
+        resolved_direction = _normalize_direction(direction)
+        direction_display = "صاعد" if resolved_direction == "bullish" else ("هابط" if resolved_direction == "bearish" else None)
+        base_display = display
+        if base_display is None:
+            if price_range is not None:
+                base_display = f"{text} {format_price(price_range[0])} → {format_price(price_range[1])}"
+            elif price is not None:
+                base_display = f"{text} @ {format_price(price)}"
+            else:
+                base_display = text
+        marker_symbol = marker
+        if marker_symbol is None:
+            if resolved_direction == "bullish":
+                marker_symbol = "🟢"
+            elif resolved_direction == "bearish":
+                marker_symbol = "🔴"
+        if marker_symbol:
+            base_display = f"{marker_symbol} {base_display}"
+        self.console_event_log[key] = {
+            "text": text,
+            "price": price if price_range is None else price_range,
+            "time": timestamp,
+            "time_display": format_timestamp(timestamp),
+            "display": base_display,
+            "direction": resolved_direction,
+            "direction_display": direction_display,
+            "status": status,
+            "status_display": status,
+            "source": source,
+        }
+
+    def _register_key_level_event(
+        self,
+        *,
+        level_key: str,
+        label_text: str,
+        time_value: int,
+        price: float,
+        timeframe: str,
+        direction: Optional[str],
+        status: str = "active",
+    ) -> None:
+        """تسجيل مستويات Key Levels/السيولة المرتبطة بالأطر الزمنية."""
+        self._register_concept_event(
+            f"KEY_LEVEL_{level_key}",
+            text=f"KEY LEVEL [{timeframe}] {label_text}",
+            time_value=time_value,
+            price=price,
+            direction=direction,
+            status=status,
+            source="line",
+        )
+        if direction:
+            self._register_concept_event(
+                f"LIQUIDITY_LEVEL_{level_key}",
+                text=f"LIQUIDITY LEVEL [{timeframe}] {label_text}",
+                time_value=time_value,
+                price=price,
+                direction=direction,
+                status=status,
+                source="line",
+            )
 
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
         events: Dict[str, Dict[str, Any]] = {}
@@ -1753,6 +1854,7 @@ class SmartMoneyAlgoProE5:
         record_label("MSS_PLUS", lambda lbl: _text_equals(lbl, "MSS+", allow_hyphen=True))
         record_label("MSS", lambda lbl: _text_equals(lbl, "MSS") and "+" not in lbl.text)
         record_label("IDM", lambda lbl: _text_equals(lbl, self.IDM_TEXT))
+        record_label("0.5", lambda lbl: lbl.text.strip().startswith(self.MID_TEXT))
         record_label(
             "FUTURE_BOS",
             lambda lbl: lbl.text.startswith(f"{self.BOS_TEXT} -"),
@@ -3633,6 +3735,14 @@ class SmartMoneyAlgoProE5:
             )
             if label:
                 self._combine_levels(prices, labels, intra_open, label, kl.Color_4H_Levels)
+                self._register_key_level_event(
+                    level_key=f"4H_{iotext}",
+                    label_text=iotext,
+                    time_value=intra_time,
+                    price=intra_open,
+                    timeframe="4H",
+                    direction=None,
+                )
             if not math.isnan(intrah_open):
                 label = self._update_level_visual(
                     "4h_high",
@@ -3648,6 +3758,14 @@ class SmartMoneyAlgoProE5:
                 )
                 if label:
                     self._combine_levels(prices, labels, intrah_open, label, kl.Color_4H_Levels)
+                    self._register_key_level_event(
+                        level_key=f"4H_{pihtext}",
+                        label_text=pihtext,
+                        time_value=intrah_time,
+                        price=intrah_open,
+                        timeframe="4H",
+                        direction="bearish",
+                    )
             if not math.isnan(intral_open):
                 label = self._update_level_visual(
                     "4h_low",
@@ -3663,6 +3781,14 @@ class SmartMoneyAlgoProE5:
                 )
                 if label:
                     self._combine_levels(prices, labels, intral_open, label, kl.Color_4H_Levels)
+                    self._register_key_level_event(
+                        level_key=f"4H_{piltext}",
+                        label_text=piltext,
+                        time_value=intral_time,
+                        price=intral_open,
+                        timeframe="4H",
+                        direction="bullish",
+                    )
 
         if kl.Show_Monday_Levels and not math.isnan(self.monday_high) and not math.isnan(self.monday_low):
             right = extend_to_current()
@@ -3680,6 +3806,14 @@ class SmartMoneyAlgoProE5:
             )
             if label:
                 self._combine_levels(prices, labels, self.monday_high, label, kl.Color_Monday_Levels)
+                self._register_key_level_event(
+                    level_key=f"MON_{pmonhtext}",
+                    label_text=pmonhtext,
+                    time_value=self.monday_time,
+                    price=self.monday_high,
+                    timeframe="MONDAY",
+                    direction="bearish",
+                )
             label = self._update_level_visual(
                 "monday_low",
                 self.monday_time,
@@ -3694,6 +3828,14 @@ class SmartMoneyAlgoProE5:
             )
             if label:
                 self._combine_levels(prices, labels, self.monday_low, label, kl.Color_Monday_Levels)
+                self._register_key_level_event(
+                    level_key=f"MON_{pmonltext}",
+                    label_text=pmonltext,
+                    time_value=self.monday_time,
+                    price=self.monday_low,
+                    timeframe="MONDAY",
+                    direction="bullish",
+                )
             label = self._update_level_visual(
                 "monday_mid",
                 self.monday_time,
@@ -3708,6 +3850,14 @@ class SmartMoneyAlgoProE5:
             )
             if label:
                 self._combine_levels(prices, labels, self.monday_mid, label, kl.Color_Monday_Levels)
+                self._register_key_level_event(
+                    level_key=f"MON_{pmonmtext}",
+                    label_text=pmonmtext,
+                    time_value=self.monday_time,
+                    price=self.monday_mid,
+                    timeframe="MONDAY",
+                    direction=None,
+                )
 
         if kl.Show_Daily_Levels and not math.isnan(daily_open):
             right = extend_to_current()
@@ -3725,6 +3875,14 @@ class SmartMoneyAlgoProE5:
             )
             if label:
                 self._combine_levels(prices, labels, daily_open, label, kl.Color_Daily_Levels)
+                self._register_key_level_event(
+                    level_key=f"D_{dotext}",
+                    label_text=dotext,
+                    time_value=daily_time,
+                    price=daily_open,
+                    timeframe="DAILY",
+                    direction=None,
+                )
             if not math.isnan(dailyh_open):
                 label = self._update_level_visual(
                     "daily_high",
@@ -3740,6 +3898,14 @@ class SmartMoneyAlgoProE5:
                 )
                 if label:
                     self._combine_levels(prices, labels, dailyh_open, label, kl.Color_Daily_Levels)
+                    self._register_key_level_event(
+                        level_key=f"D_{pdhtext}",
+                        label_text=pdhtext,
+                        time_value=dailyh_time,
+                        price=dailyh_open,
+                        timeframe="DAILY",
+                        direction="bearish",
+                    )
             if not math.isnan(dailyl_open):
                 label = self._update_level_visual(
                     "daily_low",
@@ -3755,6 +3921,14 @@ class SmartMoneyAlgoProE5:
                 )
                 if label:
                     self._combine_levels(prices, labels, dailyl_open, label, kl.Color_Daily_Levels)
+                    self._register_key_level_event(
+                        level_key=f"D_{pdltext}",
+                        label_text=pdltext,
+                        time_value=dailyl_time,
+                        price=dailyl_open,
+                        timeframe="DAILY",
+                        direction="bullish",
+                    )
 
         if kl.Show_Weekly_Levels and not math.isnan(weekly_open):
             right = extend_to_current()
@@ -3819,6 +3993,14 @@ class SmartMoneyAlgoProE5:
             )
             if label:
                 self._combine_levels(prices, labels, monthly_open, label, kl.MonthlyColor)
+                self._register_key_level_event(
+                    level_key=f"M_{motext}",
+                    label_text=motext,
+                    time_value=monthly_time,
+                    price=monthly_open,
+                    timeframe="MONTHLY",
+                    direction=None,
+                )
             if not math.isnan(monthlyh_open):
                 label = self._update_level_visual(
                     "monthly_high",
@@ -3834,6 +4016,14 @@ class SmartMoneyAlgoProE5:
                 )
                 if label:
                     self._combine_levels(prices, labels, monthlyh_open, label, kl.MonthlyColor)
+                    self._register_key_level_event(
+                        level_key=f"M_{pmhtext}",
+                        label_text=pmhtext,
+                        time_value=monthlyh_time,
+                        price=monthlyh_open,
+                        timeframe="MONTHLY",
+                        direction="bearish",
+                    )
             if not math.isnan(monthlyl_open):
                 label = self._update_level_visual(
                     "monthly_low",
@@ -3849,6 +4039,14 @@ class SmartMoneyAlgoProE5:
                 )
                 if label:
                     self._combine_levels(prices, labels, monthlyl_open, label, kl.MonthlyColor)
+                    self._register_key_level_event(
+                        level_key=f"M_{pmltext}",
+                        label_text=pmltext,
+                        time_value=monthlyl_time,
+                        price=monthlyl_open,
+                        timeframe="MONTHLY",
+                        direction="bullish",
+                    )
 
         if kl.Show_Quaterly_Levels and not math.isnan(quarterly_open):
             right = extend_to_current()
@@ -4708,6 +4906,66 @@ class SmartMoneyAlgoProE5:
 
         self.bullish_OB_Break = bull_base or bull_mtf
         self.bearish_OB_Break = bear_base or bear_mtf
+        if self.bullish_OB_Break or self.bearish_OB_Break:
+            direction = "bearish" if self.bullish_OB_Break else "bullish"
+            price_now = self.series.get("close")
+            ext_box = getattr(self, "lstBx", None)
+            idm_box = getattr(self, "lstBxIdm", None)
+            if isinstance(ext_box, Box):
+                self._register_concept_event(
+                    "BREAK_EXT_OB",
+                    text="Break EXT OB",
+                    time_value=self.series.get_time(),
+                    price=price_now,
+                    price_range=(ext_box.bottom, ext_box.top),
+                    direction=direction,
+                    status="broken",
+                    source="computed",
+                    marker="✖",
+                )
+            if isinstance(idm_box, Box):
+                self._register_concept_event(
+                    "BREAK_IDM_OB",
+                    text="Break IDM OB",
+                    time_value=self.series.get_time(),
+                    price=price_now,
+                    price_range=(idm_box.bottom, idm_box.top),
+                    direction=direction,
+                    status="broken",
+                    source="computed",
+                    marker="✖",
+                )
+            self._register_concept_event(
+                "X",
+                text="X",
+                time_value=self.series.get_time(),
+                price=price_now,
+                direction=direction,
+                status="marked",
+                source="computed",
+                marker="✖",
+            )
+            propulsion = self.fvg_gap != 0
+            mitigation = bool(getattr(self, "arrmitOBBull", PineArray()).size() or getattr(self, "arrmitOBBear", PineArray()).size())
+            sweep = bool(self.isSweepOBS or self.isSweepOBD)
+            block_status = "propulsion" if propulsion else ("mitigation" if mitigation else "breaker")
+            details = []
+            if sweep:
+                details.append("sweep")
+            if mitigation:
+                details.append("mitigation")
+            if propulsion:
+                details.append("propulsion")
+            detail_text = " + ".join(details) if details else "breaker"
+            self._register_concept_event(
+                "BLOCK",
+                text=f"Block (Order/Breaker) {detail_text}",
+                time_value=self.series.get_time(),
+                price=price_now,
+                direction=direction,
+                status=block_status,
+                source="computed",
+            )
         self.alertcondition(self.bullish_OB_Break, "Bullish OB Break", "Bullish OB Broken Ez-SMC")
         self.alertcondition(self.bearish_OB_Break, "Bearish OB Break", "Bearish OB Broken Ez-SMC")
 
@@ -4739,6 +4997,7 @@ class SmartMoneyAlgoProE5:
         box_color: str,
         mtf_color: str,
         use_htf: bool,
+        bullish: bool,
     ) -> None:
         fvg = self.inputs.fvg
         extend_target = self._extend_time(fvg.length_extend)
@@ -4784,6 +5043,17 @@ class SmartMoneyAlgoProE5:
         )
         low_line.set_extend("extend.right" if fvg.fvg_extend else "extend.none")
         lowholder.unshift(low_line)
+
+        direction = "bullish" if bullish else "bearish"
+        self._register_concept_event(
+            f"FAIR_VALUE_GAP_{'BULL' if bullish else 'BEAR'}",
+            text="FAIR VALUE GAP",
+            time_value=bar_time,
+            price_range=(lower, upper),
+            direction=direction,
+            status="new",
+            source="box",
+        )
 
         high_color = mtf_color if use_htf else box_color
         high_line = self.line_new(
@@ -5015,6 +5285,7 @@ class SmartMoneyAlgoProE5:
                                 fvg.i_bullishfvgcolor,
                                 fvg.i_mtfbullishfvgcolor,
                                 True,
+                                True,
                             )
                             self.fvg_gap = 1
                     elif open1 < close1 and high0 < low2:
@@ -5034,6 +5305,7 @@ class SmartMoneyAlgoProE5:
                                 fvg.i_bearishfvgcolor,
                                 fvg.i_mtfbearishfvgcolor,
                                 True,
+                                False,
                             )
                             self.fvg_gap = -1
 
@@ -5085,6 +5357,8 @@ class SmartMoneyAlgoProE5:
 
         created_high = False
         created_low = False
+        created_high_info: Optional[Tuple[int, float]] = None
+        created_low_info: Optional[Tuple[int, float]] = None
 
         if pivot_high is not None:
             time_ref, price = pivot_high
@@ -5121,6 +5395,7 @@ class SmartMoneyAlgoProE5:
                     self.highBoxArrayHTF.push(box_obj)
                 self.last_liq_high_time = time_ref
                 created_high = True
+                created_high_info = (time_ref, price)
 
         if pivot_low is not None:
             time_ref, price = pivot_low
@@ -5157,6 +5432,7 @@ class SmartMoneyAlgoProE5:
                     self.lowBoxArrayHTF.push(box_obj)
                 self.last_liq_low_time = time_ref
                 created_low = True
+                created_low_info = (time_ref, price)
 
         high_line_alert = self._liquidity_remove_mitigated_lines(self.highLineArrayHTF, True, liq)
         low_line_alert = self._liquidity_remove_mitigated_lines(self.lowLineArrayHTF, False, liq)
@@ -5167,6 +5443,51 @@ class SmartMoneyAlgoProE5:
         self._liquidity_extend_lines(self.lowLineArrayHTF, extend_time)
         self._liquidity_extend_boxes(self.highBoxArrayHTF, extend_time)
         self._liquidity_extend_boxes(self.lowBoxArrayHTF, extend_time)
+
+        if created_high and created_high_info:
+            time_ref, price = created_high_info
+            self._register_concept_event(
+                "LIQUIDITY_LEVEL_HIGH",
+                text="LIQUIDITY LEVEL",
+                time_value=time_ref,
+                price=price,
+                direction="bearish",
+                status="new",
+                source="line",
+            )
+        if created_low and created_low_info:
+            time_ref, price = created_low_info
+            self._register_concept_event(
+                "LIQUIDITY_LEVEL_LOW",
+                text="LIQUIDITY LEVEL",
+                time_value=time_ref,
+                price=price,
+                direction="bullish",
+                status="new",
+                source="line",
+            )
+        if high_line_alert or high_box_alert:
+            self._register_concept_event(
+                "LIQUIDITY_LEVEL_HIGH_BREAK",
+                text="LIQUIDITY LEVEL BREAK",
+                time_value=self.series.get_time(),
+                price=self.series.get("close"),
+                direction="bullish",
+                status="broken",
+                source="computed",
+                marker="✖",
+            )
+        if low_line_alert or low_box_alert:
+            self._register_concept_event(
+                "LIQUIDITY_LEVEL_LOW_BREAK",
+                text="LIQUIDITY LEVEL BREAK",
+                time_value=self.series.get_time(),
+                price=self.series.get("close"),
+                direction="bearish",
+                status="broken",
+                source="computed",
+                marker="✖",
+            )
 
         self.alertcondition(created_high, "High Liquidity Level", "High Liquidity Level Found Ez-SMC")
         self.alertcondition(created_low, "Low Liquidity Level", "Low Liquidity Level Found Ez-SMC")
@@ -5964,6 +6285,26 @@ class SmartMoneyAlgoProE5:
             self.inputs.structure_util.colorSweep,
             "line.style_dotted",
         )
+        self._register_concept_event(
+            "SWING_SWEEP",
+            text="Swing Sweep",
+            time_value=self.series.get_time(),
+            price=y,
+            direction="bullish" if trend else "bearish",
+            status="triggered",
+            source="line",
+            marker="✖",
+        )
+        self._register_concept_event(
+            "X",
+            text="X",
+            time_value=self.series.get_time(),
+            price=y,
+            direction="bullish" if trend else "bearish",
+            status="marked",
+            source="computed",
+            marker="✖",
+        )
         if self.inputs.structure_util.markX:
             self.label_new(
                 self.textCenter(self.series.get_time(), x),
@@ -6575,6 +6916,17 @@ class SmartMoneyAlgoProE5:
             )
             zoneArray.push(box_obj)
             zoneArrayisMit.push(0)
+            zone_key = "DEMAND_ZONE" if isBull else "SUPPLY_ZONE"
+            zone_text = "DEMAND ZONE" if isBull else "SUPPLY ZONE"
+            self._register_concept_event(
+                zone_key,
+                text=zone_text,
+                time_value=left,
+                price_range=(bot, top),
+                direction="bullish" if isBull else "bearish",
+                status="new",
+                source="box",
+            )
 
     # ------------------------------------------------------------------
     def processZones(self, zones: PineArray, isSupply: bool, zonesmit: PineArray) -> bool:
@@ -6598,6 +6950,15 @@ class SmartMoneyAlgoProE5:
                     )
                 )
                 self.demandZoneIsMit.push(0)
+                self._register_concept_event(
+                    "DEMAND_ZONE",
+                    text="DEMAND ZONE",
+                    time_value=leftZone,
+                    price_range=(botZone, topZone),
+                    direction="bullish",
+                    status="new",
+                    source="box",
+                )
             elif (not isSupply) and self.series.get("high") > topZone and self.series.get("close") < botZone:
                 self.supplyZone.push(
                     self.createBox(
@@ -6609,6 +6970,15 @@ class SmartMoneyAlgoProE5:
                     )
                 )
                 self.supplyZoneIsMit.push(0)
+                self._register_concept_event(
+                    "SUPPLY_ZONE",
+                    text="SUPPLY ZONE",
+                    time_value=leftZone,
+                    price_range=(botZone, topZone),
+                    direction="bearish",
+                    status="new",
+                    source="box",
+                )
             elif (
                 (isSupply and self.series.get("high") >= botZone and self.series.get("high", 1) < botZone)
                 or ((not isSupply) and self.series.get("low") <= topZone and self.series.get("low", 1) > topZone)
