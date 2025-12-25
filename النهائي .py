@@ -7720,6 +7720,15 @@ def fetch_binance_usdtm_symbols(
     return symbols
 
 
+def _ensure_markets_loaded(exchange: Any) -> None:
+    """Load exchange markets once per client for faster repeated OHLCV calls."""
+
+    markets = getattr(exchange, "markets", None)
+    if markets:
+        return
+    exchange.load_markets()
+
+
 def fetch_ohlcv(exchange: Any, symbol: str, timeframe: str, limit: int) -> List[Dict[str, float]]:
     """Fetch OHLCV data while preserving full history for structural parity.
 
@@ -7745,10 +7754,7 @@ def fetch_ohlcv(exchange: Any, symbol: str, timeframe: str, limit: int) -> List[
             # first batch can be trimmed if the caller only needs a small window
             request_limit = target
         raw: List[List[float]]
-        if since <= 0:
-            raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=request_limit, since=since)
-        else:
-            raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=request_limit, since=since)
+        raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=request_limit, since=since)
         if not raw:
             break
         for entry in raw:
@@ -8779,6 +8785,7 @@ def scan_binance(
     if ccxt is None:
         raise RuntimeError("ccxt is not available")
     exchange = ccxt.binanceusdm({"enableRateLimit": True})
+    _ensure_markets_loaded(exchange)
     all_symbols = symbols or fetch_binance_usdtm_symbols(
         exchange,
         limit=max_symbols,
@@ -8814,6 +8821,7 @@ def scan_binance(
         local_exchange = getattr(exchange_local, "client", None)
         if local_exchange is None:
             local_exchange = ccxt.binanceusdm({"enableRateLimit": True})
+            _ensure_markets_loaded(local_exchange)
             exchange_local.client = local_exchange
         return local_exchange
 
@@ -8899,6 +8907,8 @@ def scan_binance(
         results = [scan_symbol(idx, symbol) for idx, symbol in enumerate(all_symbols)]
     else:
         max_workers = max(1, int(concurrency))
+        if all_symbols:
+            max_workers = min(max_workers, len(all_symbols))
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
             future_map = {
                 pool.submit(scan_symbol, idx, symbol): idx
@@ -9999,7 +10009,7 @@ def _build_exchange(_market_forced_usdtm:str="usdtm"):
     return ccxt.binanceusdm({"enableRateLimit": True})
 
 def fetch_ohlcv(ex, symbol, timeframe, limit):
-    ex.load_markets()
+    _ensure_markets_loaded(ex)
     return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
 
 # ---------- Settings & argument parsing ----------
