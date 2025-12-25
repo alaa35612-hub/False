@@ -33,6 +33,7 @@ import os
 import re
 import sys
 import textwrap
+import threading
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -8798,60 +8799,80 @@ def scan_binance(
         else:
             window = 2
     window = max(1, int(window))
-    for idx, symbol in enumerate(all_symbols):
-        try:
-            ticker = exchange.fetch_ticker(symbol)
-        except Exception as exc:
-            print(
-                f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ticker: {exc}",
-                file=sys.stderr,
-                flush=True,
-            )
-            continue
-        daily_change = _extract_daily_change_percent(ticker)
-        if min_daily_change > 0.0 and daily_change is not None and daily_change <= min_daily_change:
-            print(
-                f"تخطي {_format_symbol(symbol)} (تغير 24 ساعة {daily_change:.2f}% ≤ الحد الأدنى {min_daily_change:.2f}%)",
-                flush=True,
-            )
-            if tracer and tracer.enabled:
-                tracer.log(
-                    "scan",
-                    "symbol_skipped_daily_change",
-                    timestamp=None,
-                    symbol=symbol,
-                    change=daily_change,
-                    threshold=min_daily_change,
-                )
-            continue
-        candles = fetch_ohlcv(exchange, symbol, timeframe, limit)
-        runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
-        runtime.process(candles)
-        metrics = runtime.gather_console_metrics()
-        latest_events = metrics.get("latest_events") or {}
-        recent_hits, recent_times = _collect_recent_event_hits(
-            runtime.series, latest_events, bars=window
-        )
-        if not recent_hits:
-            print(
-                f"تخطي {_format_symbol(symbol)} لعدم وجود أحداث خلال آخر {window} شموع",
-                flush=True,
-            )
-            if tracer and tracer.enabled:
-                tracer.log(
-                    "scan",
-                    "symbol_skipped_stale_events",
-                    timestamp=runtime.series.get_time(0) or None,
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    reference_times=recent_times,
-                    window=window,
-                )
-            continue
 
-        metrics["daily_change_percent"] = daily_change
-        summaries.append(
-            {
+    tickers: Dict[str, Any] = {}
+    ticker_error: Optional[Exception] = None
+    try:
+        tickers = exchange.fetch_tickers()
+    except Exception as exc:
+        ticker_error = exc
+        print(f"تعذر جلب بيانات التيكر بشكلٍ مجمّع: {exc}", flush=True)
+
+    exchange_local = threading.local()
+
+    def _get_exchange() -> Any:
+        local_exchange = getattr(exchange_local, "client", None)
+        if local_exchange is None:
+            local_exchange = ccxt.binanceusdm({"enableRateLimit": True})
+            exchange_local.client = local_exchange
+        return local_exchange
+
+    def scan_symbol(idx: int, symbol: str) -> Tuple[int, Optional[SmartMoneyAlgoProE5], Optional[Dict[str, Any]]]:
+        try:
+            ticker = tickers.get(symbol)
+            if ticker is None and (min_daily_change > 0.0 or ticker_error is not None):
+                try:
+                    ticker = _get_exchange().fetch_ticker(symbol)
+                except Exception as exc:
+                    print(
+                        f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ticker: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    return idx, None, None
+            daily_change = _extract_daily_change_percent(ticker)
+            if min_daily_change > 0.0 and daily_change is not None and daily_change <= min_daily_change:
+                print(
+                    f"تخطي {_format_symbol(symbol)} (تغير 24 ساعة {daily_change:.2f}% ≤ الحد الأدنى {min_daily_change:.2f}%)",
+                    flush=True,
+                )
+                if tracer and tracer.enabled:
+                    tracer.log(
+                        "scan",
+                        "symbol_skipped_daily_change",
+                        timestamp=None,
+                        symbol=symbol,
+                        change=daily_change,
+                        threshold=min_daily_change,
+                    )
+                return idx, None, None
+            candles = fetch_ohlcv(_get_exchange(), symbol, timeframe, limit)
+            runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
+            runtime.process(candles)
+            metrics = runtime.gather_console_metrics()
+            latest_events = metrics.get("latest_events") or {}
+            recent_hits, recent_times = _collect_recent_event_hits(
+                runtime.series, latest_events, bars=window
+            )
+            if not recent_hits:
+                print(
+                    f"تخطي {_format_symbol(symbol)} لعدم وجود أحداث خلال آخر {window} شموع",
+                    flush=True,
+                )
+                if tracer and tracer.enabled:
+                    tracer.log(
+                        "scan",
+                        "symbol_skipped_stale_events",
+                        timestamp=runtime.series.get_time(0) or None,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        reference_times=recent_times,
+                        window=window,
+                    )
+                return idx, None, None
+
+            metrics["daily_change_percent"] = daily_change
+            summary = {
                 "symbol": symbol,
                 "timeframe": timeframe,
                 "candles": len(candles),
@@ -8859,17 +8880,39 @@ def scan_binance(
                 "boxes": metrics.get("boxes", len(runtime.boxes)),
                 "metrics": metrics,
             }
-        )
-        print_symbol_summary(idx, symbol, timeframe, len(candles), metrics)
-        if tracer and tracer.enabled:
-            tracer.log(
-                "scan",
-                "symbol_complete",
-                timestamp=runtime.series.get_time(0),
-                symbol=symbol,
-                timeframe=timeframe,
-                candles=len(candles),
-            )
+            print_symbol_summary(idx, symbol, timeframe, len(candles), metrics)
+            if tracer and tracer.enabled:
+                tracer.log(
+                    "scan",
+                    "symbol_complete",
+                    timestamp=runtime.series.get_time(0),
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    candles=len(candles),
+                )
+            return idx, runtime, summary
+        except Exception as exc:
+            print(f"فشل مسح {_format_symbol(symbol)}: {exc}", flush=True)
+            return idx, None, None
+
+    if concurrency <= 1:
+        results = [scan_symbol(idx, symbol) for idx, symbol in enumerate(all_symbols)]
+    else:
+        max_workers = max(1, int(concurrency))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_map = {
+                pool.submit(scan_symbol, idx, symbol): idx
+                for idx, symbol in enumerate(all_symbols)
+            }
+            results = []
+            for future in concurrent.futures.as_completed(future_map):
+                results.append(future.result())
+
+    results.sort(key=lambda item: item[0])
+    for idx, runtime, summary in results:
+        if runtime is None or summary is None:
+            continue
+        summaries.append(summary)
         if primary_runtime is None:
             primary_runtime = runtime
     if primary_runtime is None:
