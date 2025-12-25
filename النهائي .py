@@ -22,10 +22,13 @@ parity against the Pine logic.
 from __future__ import annotations
 
 import argparse
+import atexit
 import concurrent.futures
 import bisect
 import dataclasses
 import datetime
+import hashlib
+import io
 import inspect
 import json
 import math
@@ -9144,6 +9147,8 @@ def scan_binance(
     recent_window_bars: Optional[int] = None,
     max_symbols: Optional[int] = None,
     symbol_selector: Optional[BinanceSymbolSelectorConfig] = None,
+    telegram_cfg: Optional[_CLISettings] = None,
+    telegram_state: Optional[_TelegramState] = None,
 ) -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
     if ccxt is None:
         raise RuntimeError("ccxt is not available")
@@ -9231,6 +9236,19 @@ def scan_binance(
             }
         )
         print_symbol_summary(idx, symbol, timeframe, len(candles), metrics)
+        if telegram_cfg and telegram_cfg.tg_enable and telegram_state:
+            token, chat_id = _resolve_tg_credentials(telegram_cfg)
+            if token and chat_id:
+                header, event_lines = _telegram_event_summary(runtime, symbol, timeframe, telegram_state)
+                if telegram_cfg.tg_send_events and event_lines:
+                    send_telegram_message(
+                        token,
+                        chat_id,
+                        f"{header}\n" + "\n".join(event_lines),
+                        throttle_sec=telegram_cfg.tg_throttle_sec,
+                        state=telegram_state,
+                    )
+                _send_stdout_buffer(telegram_cfg, token, chat_id, telegram_state, header)
         if tracer and tracer.enabled:
             tracer.log(
                 "scan",
@@ -9311,6 +9329,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=0.0,
         help="عدد الثواني للانتظار قبل إعادة تشغيل المسح عند تفعيل --continuous-scan",
     )
+    parser.add_argument("--telegram", action="store_true", default=False, help="تفعيل إرسال تلجرام")
+    parser.add_argument("--telegram-token", type=str, default="", help="Telegram BOT_TOKEN")
+    parser.add_argument("--telegram-chat-id", type=str, default="", help="Telegram CHAT_ID")
+    parser.add_argument("--telegram-stdout", action="store_true", default=False, help="إرسال stdout إلى تلجرام")
+    parser.add_argument("--telegram-throttle", type=float, default=3.0, help="فاصل زمني بين رسائل تلجرام")
     args = parser.parse_args(argv)
     if args.min_daily_change < 0.0:
         parser.error("--min-daily-change يجب أن يكون رقمًا غير سالب")
@@ -9318,6 +9341,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error("--max-age-bars يجب أن يكون رقمًا موجبًا")
     if args.scan_interval < 0.0:
         parser.error("--scan-interval يجب أن يكون رقمًا غير سالب")
+
+    tg_cfg = _CLISettings(
+        tg_enable=args.telegram,
+        tg_token=args.telegram_token,
+        tg_chat_id=args.telegram_chat_id,
+        tg_send_stdout=args.telegram_stdout,
+        tg_throttle_sec=args.telegram_throttle,
+    )
+    tg_state = _TelegramState() if tg_cfg.tg_enable else None
+    original_stdout = hook_stdout_or_logger(bool(tg_cfg.tg_enable and tg_cfg.tg_send_stdout), tg_state) if tg_state else None
+    if original_stdout is not None:
+        atexit.register(lambda: setattr(sys, "stdout", original_stdout))
 
     def log(stage: str) -> None:
         print(stage, flush=True)
@@ -9410,6 +9445,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 tracer,
                 min_daily_change=args.min_daily_change,
                 inputs=indicator_inputs,
+                telegram_cfg=tg_cfg if tg_cfg.tg_enable else None,
+                telegram_state=tg_state,
             )
             perform_comparison()
             log("Rendering")
@@ -9528,6 +9565,11 @@ class _CLISettings:
     # scanner controls
     tg_enable: bool = False
     tg_title_prefix: str = "SMC Alert"
+    tg_token: str = ""
+    tg_chat_id: str = ""
+    tg_send_stdout: bool = False
+    tg_send_events: bool = True
+    tg_throttle_sec: float = 3.0
     # matching indicator behavior
     ob_test_mode: str = "CLOSE"  # goes to demand_supply.mittigation_filt (canonicalized inside)
     zone_type: str = "Mother Bar"  # goes to order_block.poi_type
@@ -9546,18 +9588,177 @@ class _CLISettings:
 def _get_secret(name: str) -> Optional[str]:
     return os.environ.get(name)
 
+@dataclass
+class _TelegramState:
+    last_sent_at: float = 0.0
+    last_stdout_hash: Optional[str] = None
+    last_event_hashes: Dict[str, str] = field(default_factory=dict)
+    stdout_buffer: List[str] = field(default_factory=list)
+
+
+def safe_chunk(text: str, limit: int = 4096) -> List[str]:
+    if not text:
+        return []
+    lines = text.splitlines()
+    chunks: List[str] = []
+    current: List[str] = []
+    current_len = 0
+    for line in lines:
+        line_len = len(line)
+        if current and current_len + 1 + line_len > limit:
+            chunks.append("\n".join(current))
+            current = []
+            current_len = 0
+        if line_len > limit:
+            start = 0
+            while start < line_len:
+                end = min(start + limit, line_len)
+                chunks.append(line[start:end])
+                start = end
+            continue
+        current.append(line)
+        current_len = current_len + (1 if current_len else 0) + line_len
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
+def send_telegram_message(
+    token: str,
+    chat_id: str,
+    text: str,
+    *,
+    throttle_sec: float = 0.0,
+    state: Optional[_TelegramState] = None,
+) -> bool:
+    if not token or not chat_id or requests is None:
+        return False
+    now = time.time()
+    if state and throttle_sec > 0 and (now - state.last_sent_at) < throttle_sec:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        for chunk in safe_chunk(text, limit=4096):
+            requests.post(
+                url,
+                data={"chat_id": chat_id, "text": chunk, "parse_mode": "HTML"},
+                timeout=8,
+            )
+        if state is not None:
+            state.last_sent_at = now
+        return True
+    except Exception:
+        return False
+
+
+class _StdoutTee(io.TextIOBase):
+    def __init__(self, real: Any, state: _TelegramState):
+        self._real = real
+        self._state = state
+
+    def write(self, s: str) -> int:
+        written = self._real.write(s)
+        if s:
+            self._state.stdout_buffer.append(s)
+        return written
+
+    def flush(self) -> None:
+        self._real.flush()
+
+    def isatty(self) -> bool:
+        return getattr(self._real, "isatty", lambda: False)()
+
+
+def hook_stdout_or_logger(enable: bool, state: _TelegramState) -> Optional[Any]:
+    if not enable:
+        return None
+    original = sys.stdout
+    sys.stdout = _StdoutTee(original, state)
+    return original
+
+
+def _resolve_tg_credentials(cfg: _CLISettings) -> Tuple[str, str]:
+    token = cfg.tg_token or _get_secret("TELEGRAM_BOT_TOKEN") or ""
+    chat_id = cfg.tg_chat_id or _get_secret("TELEGRAM_CHAT_ID") or ""
+    return token, chat_id
+
+
+def _format_event_line(key: str, payload: Dict[str, Any]) -> str:
+    direction = _resolve_direction(payload.get("direction"), payload.get("display"))
+    marker = "🟢" if direction == "bullish" else ("🔴" if direction == "bearish" else "")
+    price = payload.get("price")
+    if isinstance(price, (list, tuple)) and len(price) >= 2:
+        price_display = f"{format_price(price[0])} → {format_price(price[1])}"
+    elif isinstance(price, (int, float)):
+        price_display = format_price(price)
+    else:
+        price_display = "-"
+    source = payload.get("source") or "-"
+    status = payload.get("status") or payload.get("status_display") or "-"
+    time_display = payload.get("time_display") or format_timestamp(payload.get("time"))
+    prefix = f"{marker} " if marker else ""
+    return f"{prefix}[{key}] @ {price_display} — {source}/{status} — {time_display}"
+
+
+def _telegram_event_summary(
+    runtime: SmartMoneyAlgoProE5,
+    symbol: str,
+    timeframe: str,
+    state: _TelegramState,
+) -> Tuple[str, List[str]]:
+    metrics = runtime.gather_console_metrics()
+    events = metrics.get("latest_events") or {}
+    lines: List[str] = []
+    for key, payload in events.items():
+        digest = hashlib.sha1(
+            f"{key}|{payload.get('time')}|{payload.get('price')}|{payload.get('status')}|{payload.get('source')}".encode("utf-8")
+        ).hexdigest()
+        if state.last_event_hashes.get(key) == digest:
+            continue
+        state.last_event_hashes[key] = digest
+        lines.append(_format_event_line(key, payload))
+    title = f"{symbol} | {timeframe} | {format_timestamp(runtime.series.get_time(0))}"
+    return title, lines
+
+
+def _send_stdout_buffer(
+    cfg: _CLISettings,
+    token: str,
+    chat_id: str,
+    state: _TelegramState,
+    header: str,
+) -> None:
+    if not cfg.tg_send_stdout:
+        return
+    text = "".join(state.stdout_buffer).strip()
+    state.stdout_buffer.clear()
+    if not text:
+        return
+    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()
+    if state.last_stdout_hash == digest:
+        return
+    state.last_stdout_hash = digest
+    send_telegram_message(
+        token,
+        chat_id,
+        f"{header}\n{text}",
+        throttle_sec=cfg.tg_throttle_sec,
+        state=state,
+    )
+
+
 def _send_tg(cfg: _CLISettings, lines: List[str]) -> None:
     if not cfg.tg_enable:
         return
-    token = _get_secret("TELEGRAM_BOT_TOKEN")
-    chat_id = _get_secret("TELEGRAM_CHAT_ID")
-    if not token or not chat_id or requests is None:
+    token, chat_id = _resolve_tg_credentials(cfg)
+    if not token or not chat_id:
         return
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        requests.post(url, data={"chat_id": chat_id, "text": "\n".join(lines), "parse_mode": "HTML"}, timeout=8)
-    except Exception:
-        pass
+    send_telegram_message(
+        token,
+        chat_id,
+        "\n".join(lines),
+        throttle_sec=cfg.tg_throttle_sec,
+    )
 
 # ----------------------------- Symbol Picker ----------------------------------
 def _build_exchange(market: str):
@@ -9657,8 +9858,14 @@ def _parse_args_android() -> Tuple[_CLISettings, argparse.Namespace]:
     p.add_argument("--verbose", "-v", action="store_true", default=False)
     p.add_argument("--debug", action="store_true", default=False)
     p.add_argument("--tg", action="store_true", default=False)
+    p.add_argument("--telegram", action="store_true", default=False)
+    p.add_argument("--telegram-token", type=str, default="")
+    p.add_argument("--telegram-chat-id", type=str, default="")
+    p.add_argument("--telegram-stdout", action="store_true", default=False)
+    p.add_argument("--telegram-throttle", type=float, default=3.0)
     args, _ = p.parse_known_args()
 
+    tg_enable = args.tg or args.telegram
     cfg = _CLISettings(
         market='usdtm',  # forced futures-only
         showHL=args.show_hl,
@@ -9672,7 +9879,11 @@ def _parse_args_android() -> Tuple[_CLISettings, argparse.Namespace]:
         show_fvg=not args.no_fvg,
         show_liquidity=not args.no_liquidity,
         liquidity_display_limit=args.liquidity_limit,
-        tg_enable=args.tg,
+        tg_enable=tg_enable,
+        tg_token=args.telegram_token,
+        tg_chat_id=args.telegram_chat_id,
+        tg_send_stdout=args.telegram_stdout,
+        tg_throttle_sec=args.telegram_throttle,
         ob_test_mode=args.mitigation,
         bos_confirmation=args.bos_confirmation,
         strict_close_for_break=(args.bos_confirmation == "Close"),
@@ -9694,7 +9905,8 @@ def _should_route_android(argv: List[str]) -> bool:
         "--leng-smc","--swing-size","--no-fvg","--no-liquidity","--liquidity-limit",
         "--mitigation","--bos-confirmation","--no-bos-plus","--no-ob-break","--no-ote","--no-ote-alert","--no-mark-x",
         "--min-change","--min-volume","--max-scan","--allow-meme","--exclude-symbols","--exclude-patterns","--include-only",
-        "--recent","--verbose","-v","--debug","--tg"
+        "--recent","--verbose","-v","--debug","--tg","--telegram","--telegram-token","--telegram-chat-id",
+        "--telegram-stdout","--telegram-throttle"
     }
     return any(a in knobs for a in argv)
 
@@ -10421,6 +10633,11 @@ def _parse_args_android():
     p.add_argument("--max-symbols", "-n", type=int, default=EDITOR_AUTORUN_DEFAULTS.max_symbols)
     p.add_argument("--mitigation", choices=["WICK","CLOSE"], default="CLOSE")
     p.add_argument("--tg", action="store_true", default=False)
+    p.add_argument("--telegram", action="store_true", default=False)
+    p.add_argument("--telegram-token", type=str, default="")
+    p.add_argument("--telegram-chat-id", type=str, default="")
+    p.add_argument("--telegram-stdout", action="store_true", default=False)
+    p.add_argument("--telegram-throttle", type=float, default=3.0)
     p.add_argument("--symbol", "-s", default="")
     p.add_argument("--verbose", "-v", action="store_true", default=False)
     p.add_argument("--recent", type=int, default=EDITOR_AUTORUN_DEFAULTS.recent_bars)
@@ -10546,6 +10763,7 @@ def _parse_args_android():
     if not height_metric:
         height_metric = DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_metric
 
+    tg_enable = args.tg or args.telegram
     cfg = Settings(
         eps=args.eps,
         enable_alert_bos=True,
@@ -10553,8 +10771,12 @@ def _parse_args_android():
         enable_alert_idm_touch=True,
         mitigation_mode=args.mitigation,
         merge_ratio=0.10,
-        tg_enable=args.tg,
+        tg_enable=tg_enable,
         tg_title_prefix="SMC Alert",
+        tg_token=args.telegram_token,
+        tg_chat_id=args.telegram_chat_id,
+        tg_send_stdout=args.telegram_stdout,
+        tg_throttle_sec=args.telegram_throttle,
         showHL=args.show_hl,
         showMn=args.show_mn,
         showISOB=True if args.show_isob is None else args.show_isob,
