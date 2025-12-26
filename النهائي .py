@@ -820,7 +820,7 @@ class DemandSupplyInputs:
 
 @dataclass
 class FVGInputs:
-    show_fvg: bool = False
+    show_fvg: bool = True
     i_tf: str = ""
     i_mtf: str = "HTF"
     i_bullishfvgcolor: str = "color.new(color.green,100)"
@@ -847,7 +847,7 @@ class FVGInputs:
 
 @dataclass
 class LiquidityInputs:
-    currentTF: bool = False
+    currentTF: bool = True
     displayLimit: int = 20
     lowLineColorHTF: str = "#00bbf94d"
     highLineColorHTF: str = "#e91e624d"
@@ -1569,18 +1569,19 @@ class SmartMoneyAlgoProE5:
     def _register_label_event(self, label: Label) -> None:
         text = label.text.strip()
         collapsed = text.replace(" ", "")
+        normalized = collapsed.upper().replace("0", "O")
         key: Optional[str] = None
-        if collapsed == "BOS":
+        if normalized == "BOS":
             key = "BOS"
-        elif collapsed == "BOS+":
+        elif normalized == "BOS+":
             key = "BOS_PLUS"
-        elif collapsed == self.CHOCH_TEXT.replace(" ", ""):
+        elif normalized == self.CHOCH_TEXT.replace(" ", "").upper():
             key = "CHOCH"
-        elif collapsed == "MSS+":
+        elif normalized == "MSS+":
             key = "MSS_PLUS"
-        elif collapsed == "MSS":
+        elif normalized == "MSS":
             key = "MSS"
-        elif collapsed == self.IDM_TEXT.replace(" ", ""):
+        elif normalized == self.IDM_TEXT.replace(" ", "").upper():
             key = "IDM"
         elif text.startswith(f"{self.BOS_TEXT} -"):
             key = "FUTURE_BOS"
@@ -9588,26 +9589,38 @@ _AR_KEYS = {
 # Buckets for "latest per logic"
 _LAST_BUCKETS = {
     "BOS": ["bos", "b 0 s"],
+    "BOS+": ["bos+", "bos plus", "bos_plus"],
     "CHOCH": ["choch", "ch o ch"],
+    "MSS": ["mss"],
+    "MSS+": ["mss+", "mss plus", "mss_plus"],
     "Golden zone": ["golden zone"],
     "IDM": ["idm @", " i d m "],
     "EXT OB": ["ext ob", "ext_ob", "ext  ob"],
     "IDM OB": ["idm ob"],
     "Hist IDM OB": ["hist idm ob"],
     "Hist EXT OB": ["hist ext ob"],
+    "FVG_UP": ["fvg up", "fvg↑", "fvg up touched", "fvg up touch"],
+    "FVG_DN": ["fvg down", "fvg↓", "fvg down touched", "fvg down touch"],
+    "LIQ": ["liquidity", "liquidity touched", "سيولة"],
     "الدوائر الحمراء": ["الدوائر الحمراء", "red circle"],
     "الدوائر الخضراء": ["الدوائر الخضراء", "green circle"],
 }
 # ---- Bind to indicator metrics if available ----
 _METRIC_MAP = {
     "BOS": ["BOS", "bos"],
+    "BOS+": ["BOS_PLUS", "bos_plus", "BOS+"],
     "CHOCH": ["CHOCH", "choch"],
+    "MSS": ["MSS", "mss"],
+    "MSS+": ["MSS_PLUS", "mss_plus", "MSS+"],
     "Golden zone": ["GOLDEN_ZONE", "golden_zone", "GZ"],
     "IDM": ["IDM", "idm"],
     "EXT OB": ["EXT_OB", "ext_ob", "EXT-OB"],
     "IDM OB": ["IDM_OB", "idm_ob"],
     "Hist IDM OB": ["HIST_IDM_OB", "hist_idm_ob"],
     "Hist EXT OB": ["HIST_EXT_OB", "hist_ext_ob"],
+    "FVG_UP": ["FVG_UP", "fvg_up", "fvg_up_touch", "FVG Up"],
+    "FVG_DN": ["FVG_DN", "fvg_dn", "fvg_dn_touch", "FVG Down"],
+    "LIQ": ["LIQ", "liq", "liquidity"],
     "الدوائر الحمراء": ["RED_CIRCLE", "red_circle", "RED_CIRCLES"],
     "الدوائر الخضراء": ["GREEN_CIRCLE", "green_circle", "GREEN_CIRCLES"],
 }
@@ -9987,13 +10000,19 @@ _AR_KEYS = {
 # منطق “آخر حدث لكل بند” / أسماء عربية مطلوبة
 _LAST_BUCKETS = {
     "BOS": ["bos","b 0 s"],
+    "BOS+": ["bos+","bos plus","bos_plus"],
     "CHOCH": ["choch","ch o ch"],
+    "MSS": ["mss"],
+    "MSS+": ["mss+","mss plus","mss_plus"],
     "Golden zone": ["golden zone","gz"],
     "IDM": ["idm"," i d m "],
     "EXT OB": ["ext ob","ext_ob"],
     "IDM OB": ["idm ob","idm_ob"],
     "Hist IDM OB": ["hist idm ob","hist_idm_ob"],
     "Hist EXT OB": ["hist ext ob","hist_ext_ob"],
+    "FVG_UP": ["fvg up","fvg↑","fvg up touched","fvg up touch"],
+    "FVG_DN": ["fvg down","fvg↓","fvg down touched","fvg down touch"],
+    "LIQ": ["liquidity","liquidity touched","سيولة"],
     "الدوائر الحمراء": ["الدوائر الحمراء","red circle"],
     "الدوائر الخضراء": ["الدوائر الخضراء","green circle"],
 }
@@ -10040,13 +10059,19 @@ _INT_KEYS = [
 
 _METRIC_MAP = {
     "BOS": ["BOS","bos","b 0 s"],
+    "BOS+": ["BOS_PLUS","bos_plus","BOS+"],
     "CHOCH": ["CHOCH","choch","ch o ch"],
+    "MSS": ["MSS","mss"],
+    "MSS+": ["MSS_PLUS","mss_plus","MSS+"],
     "Golden zone": ["GOLDEN_ZONE","golden_zone","gz","golden zone"],
     "IDM": ["IDM","idm"," i d m "],
     "EXT OB": ["EXT_OB","ext_ob","ext ob"],
     "IDM OB": ["IDM_OB","idm_ob","idm ob"],
     "Hist IDM OB": ["HIST_IDM_OB","hist_idm_ob","hist idm ob"],
     "Hist EXT OB": ["HIST_EXT_OB","hist_ext_ob","hist ext ob"],
+    "FVG_UP": ["FVG_UP","fvg_up","fvg_up_touch","FVG Up"],
+    "FVG_DN": ["FVG_DN","fvg_dn","fvg_dn_touch","FVG Down"],
+    "LIQ": ["LIQ","liq","liquidity"],
     "الدوائر الحمراء": ["RED_CIRCLE","red_circle","الدوائر الحمراء","red circle"],
     "الدوائر الخضراء": ["GREEN_CIRCLE","green_circle","الدوائر الخضراء","green circle"],
 }
