@@ -10901,7 +10901,8 @@ def _android_cli_entry() -> int:
                             "Liquidity",
                         ]
                         cache = sent_event_cache.setdefault(sym, set())
-                        lines = [f"{_format_symbol(sym)} ({args.timeframe})"]
+                        clean_symbol = _format_symbol(sym).replace("\033[92m", "").replace("\033[0m", "")
+                        lines = [f"{clean_symbol} ({args.timeframe})"]
                         first_touch_only = {
                             "Golden zone",
                             "Hist EXT OB",
