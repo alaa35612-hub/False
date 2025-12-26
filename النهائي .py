@@ -108,12 +108,33 @@ ANSI_HEADER_COLORS = [
 ]
 
 
+def _warn_missing_deps(*, live_required: bool = False) -> bool:
+    if ccxt is None:
+        print(
+            "تحذير: مكتبة ccxt غير مثبتة. ثبّتها عبر: pip install ccxt",
+            flush=True,
+        )
+        if live_required:
+            return False
+    if requests is None:
+        print(
+            "تحذير: مكتبة requests غير مثبتة. ثبّتها عبر: pip install requests",
+            flush=True,
+        )
+    return True
+
+
 @dataclass(frozen=True)
 class _EditorAutorunDefaults:
     timeframe: str = "1m"
     candle_limit: int = 500
     max_symbols: int = 600
     recent_bars: int = 2
+    concurrency: int = 1
+    fast_scan: bool = True
+    parallel_scan: bool = False
+    telegram_token: str = ""
+    telegram_chat_id: str = ""
     continuous_scan: bool = False
     scan_interval: float = 0.0
     height_metric: str = "percentage"
@@ -125,11 +146,25 @@ class _EditorAutorunDefaults:
 # لتفعيل التشغيل المستمر افتراضيًا يمكنك تعديل المتغير التالي إلى True
 # كما يمكن تحديد فترة الانتظار بين الدورات من المتغير الذي يليه.
 AUTORUN_CONTINUOUS_SCAN = True
-AUTORUN_SCAN_INTERVAL = 0.0
+AUTORUN_SCAN_INTERVAL = 2.0
+AUTORUN_CONCURRENCY = 1
+AUTORUN_FAST_SCAN = True
+# فلتر ارتفاع العملات خلال 24 ساعة (٪) - عدّل النسبة لتخصيص الفلتر
+AUTORUN_MIN_DAILY_CHANGE = 5.0
+# إعدادات التوازي الآمن + تلجرام
+AUTORUN_PARALLEL_SCAN = False
+AUTORUN_TELEGRAM_TOKEN = ""
+AUTORUN_TELEGRAM_CHAT_ID = ""
 
 EDITOR_AUTORUN_DEFAULTS = _EditorAutorunDefaults(
     continuous_scan=AUTORUN_CONTINUOUS_SCAN,
     scan_interval=AUTORUN_SCAN_INTERVAL,
+    concurrency=AUTORUN_CONCURRENCY,
+    fast_scan=AUTORUN_FAST_SCAN,
+    height_threshold=AUTORUN_MIN_DAILY_CHANGE,
+    parallel_scan=AUTORUN_PARALLEL_SCAN,
+    telegram_token=AUTORUN_TELEGRAM_TOKEN,
+    telegram_chat_id=AUTORUN_TELEGRAM_CHAT_ID,
 )
 
 
@@ -7527,10 +7562,14 @@ def _binance_pick_symbols(
             print(f"تحذير: سيتم تجاهل الرموز غير الصحيحة: {', '.join(invalid_sorted)}")
         return BinanceSymbolSelection(valid, [], False, False)
 
-    try:
-        markets = exchange.load_markets()
-    except Exception as exc:
-        print(f"فشل تحميل أسواق Binance: {exc}")
+    markets = None
+    for attempt in range(3):
+        if _ensure_markets_loaded(exchange):
+            markets = exchange.markets
+            break
+        time.sleep(_rate_limit_backoff(attempt + 1))
+    if not markets:
+        print("فشل تحميل أسواق Binance بعد عدة محاولات.")
         return BinanceSymbolSelection([], [], False, False)
 
     usdtm_markets: List[Dict[str, Any]] = [
@@ -7543,7 +7582,7 @@ def _binance_pick_symbols(
         return BinanceSymbolSelection([], [], False, False)
 
     try:
-        tickers = exchange.fetch_tickers()
+        tickers = _call_with_retries(exchange.fetch_tickers, retries=3)
     except Exception as exc:
         print(f"تعذر جلب بيانات التيكر، سيتم استخدام فرز افتراضي: {exc}")
         tickers = {}
@@ -7720,7 +7759,111 @@ def fetch_binance_usdtm_symbols(
     return symbols
 
 
-def fetch_ohlcv(exchange: Any, symbol: str, timeframe: str, limit: int) -> List[Dict[str, float]]:
+def _ensure_markets_loaded(exchange: Any) -> bool:
+    """Load exchange markets once per client for faster repeated OHLCV calls."""
+
+    markets = getattr(exchange, "markets", None)
+    if markets:
+        return True
+    try:
+        _call_with_retries(exchange.load_markets, retries=3)
+    except Exception as exc:
+        if _is_rate_limit_error(exc):
+            print(f"تحذير: تعذر تحميل أسواق Binance بسبب معدل الطلبات: {exc}", flush=True)
+        else:
+            print(f"تحذير: تعذر تحميل أسواق Binance: {exc}", flush=True)
+        return False
+    return True
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    status = getattr(exc, "status", None) or getattr(exc, "status_code", None)
+    if isinstance(status, int) and status in (418, 429):
+        return True
+    return any(
+        token in message
+        for token in (
+            "too many requests",
+            "rate limit",
+            "rate-limit",
+            "banned",
+            "418",
+            "429",
+            "ip banned",
+        )
+    )
+
+
+def _rate_limit_backoff(attempt: int) -> float:
+    return min(10.0, 1.5 ** attempt)
+
+
+def _extract_ban_until_ms(message: str) -> Optional[int]:
+    match = re.search(r"banned until (\d+)", message, re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _sleep_until(timestamp_ms: int) -> None:
+    now_ms = int(time.time() * 1000)
+    if timestamp_ms <= now_ms:
+        return
+    wait_seconds = max(0.0, (timestamp_ms - now_ms) / 1000.0) + 1.0
+    time.sleep(wait_seconds)
+
+
+class _GlobalRateLimiter:
+    def __init__(self, min_interval: float = 0.2) -> None:
+        self._min_interval = max(0.0, float(min_interval))
+        self._lock = threading.Lock()
+        self._next_allowed = 0.0
+
+    def wait(self) -> None:
+        if self._min_interval <= 0:
+            return
+        with self._lock:
+            now = time.time()
+            if now < self._next_allowed:
+                time.sleep(self._next_allowed - now)
+            self._next_allowed = time.time() + self._min_interval
+
+
+GLOBAL_RATE_LIMITER = _GlobalRateLimiter()
+
+
+def _call_with_retries(action: Callable[[], Any], *, retries: int = 3) -> Any:
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            GLOBAL_RATE_LIMITER.wait()
+            return action()
+        except Exception as exc:  # pragma: no cover - defensive
+            last_exc = exc
+            if not _is_rate_limit_error(exc):
+                raise
+            ban_until = _extract_ban_until_ms(str(exc))
+            if ban_until:
+                _sleep_until(ban_until)
+            else:
+                time.sleep(_rate_limit_backoff(attempt + 1))
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("request failed without exception")
+
+
+def fetch_ohlcv(
+    exchange: Any,
+    symbol: str,
+    timeframe: str,
+    limit: int,
+    *,
+    fast_scan: bool = False,
+) -> List[Dict[str, float]]:
     """Fetch OHLCV data while preserving full history for structural parity.
 
     Binance USDT-M returns at most 1500 candles per request.  TradingView keeps
@@ -7739,16 +7882,34 @@ def fetch_ohlcv(exchange: Any, symbol: str, timeframe: str, limit: int) -> List[
     candles: List[Dict[str, float]] = []
     target = limit if limit > 0 else None
 
+    if fast_scan:
+        request_limit = target or max_batch
+        raw = _call_with_retries(
+            lambda: exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=request_limit),
+            retries=3,
+        )
+        return [
+            {
+                "time": entry[0],
+                "open": entry[1],
+                "high": entry[2],
+                "low": entry[3],
+                "close": entry[4],
+                "volume": entry[5],
+            }
+            for entry in raw
+        ]
+
     while True:
         request_limit = max_batch
         if target is not None and target < max_batch and not candles:
             # first batch can be trimmed if the caller only needs a small window
             request_limit = target
         raw: List[List[float]]
-        if since <= 0:
-            raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=request_limit, since=since)
-        else:
-            raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=request_limit, since=since)
+        raw = _call_with_retries(
+            lambda: exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=request_limit, since=since),
+            retries=3,
+        )
         if not raw:
             break
         for entry in raw:
@@ -8775,10 +8936,12 @@ def scan_binance(
     recent_window_bars: Optional[int] = None,
     max_symbols: Optional[int] = None,
     symbol_selector: Optional[BinanceSymbolSelectorConfig] = None,
+    fast_scan: bool = True,
 ) -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
     if ccxt is None:
         raise RuntimeError("ccxt is not available")
     exchange = ccxt.binanceusdm({"enableRateLimit": True})
+    _ensure_markets_loaded(exchange)
     all_symbols = symbols or fetch_binance_usdtm_symbols(
         exchange,
         limit=max_symbols,
@@ -8803,10 +8966,21 @@ def scan_binance(
     tickers: Dict[str, Any] = {}
     ticker_error: Optional[Exception] = None
     try:
-        tickers = exchange.fetch_tickers()
+        if all_symbols:
+            tickers = _call_with_retries(
+                lambda: exchange.fetch_tickers(all_symbols),
+                retries=3,
+            )
+        else:
+            tickers = _call_with_retries(exchange.fetch_tickers, retries=3)
     except Exception as exc:
-        ticker_error = exc
-        print(f"تعذر جلب بيانات التيكر بشكلٍ مجمّع: {exc}", flush=True)
+        try:
+            tickers = _call_with_retries(exchange.fetch_tickers, retries=3)
+        except Exception as fallback_exc:
+            ticker_error = fallback_exc
+            print(f"تعذر جلب بيانات التيكر بشكلٍ مجمّع: {fallback_exc}", flush=True)
+        else:
+            ticker_error = exc
 
     exchange_local = threading.local()
 
@@ -8814,6 +8988,8 @@ def scan_binance(
         local_exchange = getattr(exchange_local, "client", None)
         if local_exchange is None:
             local_exchange = ccxt.binanceusdm({"enableRateLimit": True})
+            if not _ensure_markets_loaded(local_exchange):
+                raise RuntimeError("تعذر تحميل الأسواق بسبب معدل الطلبات")
             exchange_local.client = local_exchange
         return local_exchange
 
@@ -8846,7 +9022,7 @@ def scan_binance(
                         threshold=min_daily_change,
                     )
                 return idx, None, None
-            candles = fetch_ohlcv(_get_exchange(), symbol, timeframe, limit)
+            candles = fetch_ohlcv(_get_exchange(), symbol, timeframe, limit, fast_scan=fast_scan)
             runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
             runtime.process(candles)
             metrics = runtime.gather_console_metrics()
@@ -8895,18 +9071,10 @@ def scan_binance(
             print(f"فشل مسح {_format_symbol(symbol)}: {exc}", flush=True)
             return idx, None, None
 
-    if concurrency <= 1:
-        results = [scan_symbol(idx, symbol) for idx, symbol in enumerate(all_symbols)]
-    else:
-        max_workers = max(1, int(concurrency))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-            future_map = {
-                pool.submit(scan_symbol, idx, symbol): idx
-                for idx, symbol in enumerate(all_symbols)
-            }
-            results = []
-            for future in concurrent.futures.as_completed(future_map):
-                results.append(future.result())
+    effective_concurrency = 1
+    if concurrency > 1:
+        print("تم فرض التوازي = 1 لتجنّب حظر REST من Binance.", flush=True)
+    results = [scan_symbol(idx, symbol) for idx, symbol in enumerate(all_symbols)]
 
     results.sort(key=lambda item: item[0])
     for idx, runtime, summary in results:
@@ -8935,7 +9103,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument("--bars", type=int, default=0, help="Limit number of candles to analyse from --data source")
     parser.add_argument("--symbols", type=str, default="")
-    parser.add_argument("--concurrency", type=int, default=3)
+    parser.add_argument("--concurrency", type=int, default=EDITOR_AUTORUN_DEFAULTS.concurrency)
     parser.add_argument(
         "--min-daily-change",
         type=float,
@@ -8981,8 +9149,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--scan-interval",
         type=float,
-        default=0.0,
+        default=EDITOR_AUTORUN_DEFAULTS.scan_interval,
         help="عدد الثواني للانتظار قبل إعادة تشغيل المسح عند تفعيل --continuous-scan",
+    )
+    parser.add_argument("--parallel-scan", action="store_true", default=EDITOR_AUTORUN_DEFAULTS.parallel_scan)
+    parser.add_argument("--telegram-token", default=EDITOR_AUTORUN_DEFAULTS.telegram_token)
+    parser.add_argument("--telegram-chat-id", default=EDITOR_AUTORUN_DEFAULTS.telegram_chat_id)
+    parser.add_argument(
+        "--fast-scan",
+        dest="fast_scan",
+        action=_OptionalBoolAction,
+        default=EDITOR_AUTORUN_DEFAULTS.fast_scan,
+        help="تسريع المسح بجلب آخر الشموع فقط بدون تحميل التاريخ الكامل (أسرع بكثير)",
+    )
+    parser.add_argument(
+        "--no-fast-scan",
+        dest="fast_scan",
+        action="store_false",
+        help="تعطيل وضع المسح السريع (الحصول على التاريخ الكامل)",
     )
     args = parser.parse_args(argv)
     if args.min_daily_change < 0.0:
@@ -8991,6 +9175,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error("--max-age-bars يجب أن يكون رقمًا موجبًا")
     if args.scan_interval < 0.0:
         parser.error("--scan-interval يجب أن يكون رقمًا غير سالب")
+    if args.continuous_scan and args.scan_interval <= 0.0:
+        args.scan_interval = max(EDITOR_AUTORUN_DEFAULTS.scan_interval, 2.0)
 
     def log(stage: str) -> None:
         print(stage, flush=True)
@@ -9083,6 +9269,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 tracer,
                 min_daily_change=args.min_daily_change,
                 inputs=indicator_inputs,
+                fast_scan=args.fast_scan,
             )
             perform_comparison()
             log("Rendering")
@@ -9208,13 +9395,16 @@ class _CLISettings:
     strict_close_for_break: bool = False
     # filters
     market: str = "usdtm"         # {usdtm, spot}
-    min_change: float = 5.0       # ≥ %
-    min_volume: float = 30_000_000.0  # ≥ USDT
+    min_change: Optional[float] = None       # ≥ %
+    min_volume: Optional[float] = None  # ≥ USDT
     max_scan: int = 60            # after filtering & sorting
     allow_meme: bool = False
     exclude_symbols: str = ""
     exclude_patterns: str = _DEFAULT_EXCLUDE_PATTERNS
     include_only: str = ""
+    parallel_scan: bool = False
+    telegram_token: str = ""
+    telegram_chat_id: str = ""
 
 def _get_secret(name: str) -> Optional[str]:
     return os.environ.get(name)
@@ -9232,22 +9422,50 @@ def _send_tg(cfg: _CLISettings, lines: List[str]) -> None:
     except Exception:
         pass
 
+
+def _send_tg_runtime(token: str, chat_id: str, lines: List[str]) -> None:
+    if not token or not chat_id or requests is None:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        requests.post(
+            url,
+            data={"chat_id": chat_id, "text": "\n".join(lines), "parse_mode": "HTML"},
+            timeout=8,
+        )
+    except Exception:
+        pass
+
 # ----------------------------- Symbol Picker ----------------------------------
 def _build_exchange(market: str):
     # Futures-only
     return ccxt.binanceusdm({"enableRateLimit": True})
 
-def _pick_symbols(cfg: _CLISettings, symbol_override: Optional[str] = None, max_symbols_hint: int = 300) -> List[str]:
+def _pick_symbols(
+    cfg: _CLISettings,
+    symbol_override: Optional[str] = None,
+    max_symbols_hint: int = 300,
+    *,
+    exchange: Optional[Any] = None,
+) -> List[str]:
     if symbol_override:
         return [symbol_override.strip().upper()]
-    ex = _build_exchange(cfg.market)
-    markets = ex.load_markets()
+    ex = exchange or _build_exchange(cfg.market)
+    markets = None
+    for attempt in range(3):
+        if _ensure_markets_loaded(ex):
+            markets = ex.markets
+            break
+        time.sleep(_rate_limit_backoff(attempt + 1))
+    if not markets:
+        print("تعذر تحميل الأسواق لاختيار الرموز. جرّب لاحقًا أو خفّض التوازي.", flush=True)
+        return []
     if cfg.market == "usdtm":
         universe = [s for s, m in markets.items() if m.get("linear") and m.get("quote") == "USDT" and m.get("type") == "swap"]
     else:
         universe = [s for s, m in markets.items() if m.get("spot") and m.get("quote") == "USDT"]
     try:
-        ticks = ex.fetch_tickers(universe)
+        ticks = _call_with_retries(lambda: ex.fetch_tickers(universe), retries=3)
     except Exception:
         # fallback: greedy highest-volume
         universe_sorted = sorted(universe)[:min(max_symbols_hint, cfg.max_scan)]
@@ -9273,7 +9491,7 @@ def _pick_symbols(cfg: _CLISettings, symbol_override: Optional[str] = None, max_
         pct_change = _pct_24h(t)
         if cfg.min_change is not None and pct_change < cfg.min_change:
             return False
-        if _qv_24h(t) < cfg.min_volume:
+        if cfg.min_volume is not None and _qv_24h(t) < cfg.min_volume:
             return False
         return True
 
@@ -9318,8 +9536,8 @@ def _parse_args_android() -> Tuple[_CLISettings, argparse.Namespace]:
     p.add_argument("--no-ote-alert", action="store_true")
     p.add_argument("--no-mark-x", action="store_true")
     # filters
-    p.add_argument("--min-change", type=float, default=5.0)
-    p.add_argument("--min-volume", type=float, default=30_000_000.0)
+    p.add_argument("--min-change", type=float, default=None)
+    p.add_argument("--min-volume", type=float, default=None)
     p.add_argument("--max-scan", type=int, default=60)
     p.add_argument("--allow-meme", action="store_true", default=False)
     p.add_argument("--exclude-symbols", default="")
@@ -9357,6 +9575,9 @@ def _parse_args_android() -> Tuple[_CLISettings, argparse.Namespace]:
         exclude_patterns=args.exclude_patterns,
         include_only=args.include_only,
         drop_last_incomplete=args.drop_last,
+        parallel_scan=args.parallel_scan,
+        telegram_token=args.telegram_token,
+        telegram_chat_id=args.telegram_chat_id,
     )
     return cfg, args
 
@@ -9998,9 +10219,42 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
 def _build_exchange(_market_forced_usdtm:str="usdtm"):
     return ccxt.binanceusdm({"enableRateLimit": True})
 
-def fetch_ohlcv(ex, symbol, timeframe, limit):
-    ex.load_markets()
-    return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+def fetch_ohlcv(ex, symbol, timeframe, limit, *, fast_scan: bool = False):
+    _ensure_markets_loaded(ex)
+    if fast_scan:
+        return _call_with_retries(
+            lambda: ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit),
+            retries=3,
+        )
+
+    timeframe_seconds = _parse_timeframe_to_seconds(timeframe, None) or 60
+    timeframe_ms = timeframe_seconds * 1000
+    max_batch = 1500
+    since = 0
+    candles = []
+    target = limit if limit > 0 else None
+
+    while True:
+        request_limit = max_batch
+        if target is not None and target < max_batch and not candles:
+            request_limit = target
+        raw = _call_with_retries(
+            lambda: ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=request_limit, since=since),
+            retries=3,
+        )
+        if not raw:
+            break
+        candles.extend(raw)
+        if target is not None and len(candles) > target:
+            candles = candles[-target:]
+        last_open = raw[-1][0]
+        next_since = last_open + timeframe_ms
+        if len(raw) < request_limit:
+            break
+        if next_since <= since:
+            next_since = since + timeframe_ms
+        since = next_since
+    return candles
 
 # ---------- Settings & argument parsing ----------
 class Settings:
@@ -10008,6 +10262,7 @@ class Settings:
         self.__dict__.update(kw)
         self.market = 'usdtm'
         self.max_scan = kw.get("max_scan", 60)
+        self.concurrency = kw.get("concurrency", EDITOR_AUTORUN_DEFAULTS.concurrency)
         self.drop_last_incomplete = kw.get("drop_last_incomplete", False)
         self.showHL = kw.get("showHL", False)
         self.showMn = kw.get("showMn", False)
@@ -10037,6 +10292,10 @@ class Settings:
         self.structure_requires_wick = kw.get("structure_requires_wick", False)
         self.mtf_lookahead = kw.get("mtf_lookahead", False)
         self.zone_type = kw.get("zone_type", "Mother Bar")
+        self.fast_scan = kw.get("fast_scan", EDITOR_AUTORUN_DEFAULTS.fast_scan)
+        self.parallel_scan = kw.get("parallel_scan", EDITOR_AUTORUN_DEFAULTS.parallel_scan)
+        self.telegram_token = kw.get("telegram_token", EDITOR_AUTORUN_DEFAULTS.telegram_token)
+        self.telegram_chat_id = kw.get("telegram_chat_id", EDITOR_AUTORUN_DEFAULTS.telegram_chat_id)
         raw_threshold = kw.get("min_change", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_threshold)
         try:
             self.min_change = float(raw_threshold) if raw_threshold is not None else None
@@ -10085,6 +10344,8 @@ class Settings:
         except (TypeError, ValueError):
             parsed_interval = EDITOR_AUTORUN_DEFAULTS.scan_interval
         self.continuous_interval = parsed_interval if parsed_interval >= 0 else 0.0
+        if self.continuous_scan and self.continuous_interval <= 0.0:
+            self.continuous_interval = max(EDITOR_AUTORUN_DEFAULTS.scan_interval, 2.0)
 
 def _parse_args_android():
     import argparse
@@ -10092,6 +10353,20 @@ def _parse_args_android():
     p.add_argument("--timeframe", "-t", default=EDITOR_AUTORUN_DEFAULTS.timeframe)
     p.add_argument("--limit", "-l", type=int, default=EDITOR_AUTORUN_DEFAULTS.candle_limit)
     p.add_argument("--max-symbols", "-n", type=int, default=EDITOR_AUTORUN_DEFAULTS.max_symbols)
+    p.add_argument("--concurrency", type=int, default=EDITOR_AUTORUN_DEFAULTS.concurrency)
+    p.add_argument(
+        "--fast-scan",
+        dest="fast_scan",
+        action=_OptionalBoolAction,
+        default=EDITOR_AUTORUN_DEFAULTS.fast_scan,
+        help="تسريع المسح بجلب آخر الشموع فقط بدون تحميل التاريخ الكامل",
+    )
+    p.add_argument(
+        "--no-fast-scan",
+        dest="fast_scan",
+        action="store_false",
+        help="تعطيل المسح السريع",
+    )
     p.add_argument("--mitigation", choices=["WICK","CLOSE"], default="CLOSE")
     p.add_argument("--tg", action="store_true", default=False)
     p.add_argument("--symbol", "-s", default="")
@@ -10099,6 +10374,9 @@ def _parse_args_android():
     p.add_argument("--recent", type=int, default=EDITOR_AUTORUN_DEFAULTS.recent_bars)
     p.add_argument("--drop-last", action="store_true", default=False)
     p.add_argument("--debug", action="store_true", default=False)
+    p.add_argument("--parallel-scan", action="store_true", default=EDITOR_AUTORUN_DEFAULTS.parallel_scan)
+    p.add_argument("--telegram-token", default=EDITOR_AUTORUN_DEFAULTS.telegram_token)
+    p.add_argument("--telegram-chat-id", default=EDITOR_AUTORUN_DEFAULTS.telegram_chat_id)
     p.add_argument("--show-hl", action="store_true", default=False)
     p.add_argument("--show-mn", action="store_true", default=False)
     p.add_argument("--show-isob", dest="show_isob", action="store_true")
@@ -10130,12 +10408,7 @@ def _parse_args_android():
     p.add_argument("--no-ote", action="store_true")
     p.add_argument("--no-ote-alert", action="store_true")
     p.add_argument("--bos-confirmation", choices=["Close","Wick","Candle High"], default="Close")
-    default_threshold = (
-        EDITOR_AUTORUN_DEFAULTS.height_threshold
-        if EDITOR_AUTORUN_DEFAULTS.height_threshold is not None
-        else DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_threshold
-    )
-    p.add_argument("--min-change", type=float, default=default_threshold)
+    p.add_argument("--min-change", type=float, default=EDITOR_AUTORUN_DEFAULTS.height_threshold)
     default_candle_window = (
         EDITOR_AUTORUN_DEFAULTS.height_candle_window
         if EDITOR_AUTORUN_DEFAULTS.height_candle_window is not None
@@ -10195,6 +10468,8 @@ def _parse_args_android():
         p.error("--limit must be > 0")
     if args.max_symbols <= 0:
         p.error("--max-symbols must be > 0")
+    if args.concurrency <= 0:
+        p.error("--concurrency يجب أن يكون رقمًا موجبًا")
     if args.recent <= 0:
         p.error("--recent يجب أن يكون رقمًا موجبًا")
     if args.height_candles is not None and args.height_candles <= 0:
@@ -10258,18 +10533,29 @@ def _parse_args_android():
         zone_type=zone_type,
         drop_last_incomplete=args.drop_last,
         max_scan=args.max_symbols,
+        concurrency=args.concurrency,
         min_change=args.min_change,
+        fast_scan=args.fast_scan,
         height_candle_window=args.height_candles,
         height_scope=height_scope,
         height_metric=height_metric,
         continuous_scan=args.continuous,
         continuous_interval=args.continuous_interval,
+        parallel_scan=args.parallel_scan,
+        telegram_token=args.telegram_token,
+        telegram_chat_id=args.telegram_chat_id,
     )
     return cfg, args
 
 # ---------- Symbols universe (Futures USDT-M only) ----------
-def _pick_symbols(cfg, symbol_override: str | None, max_symbols_hint: int):
-    ex = _build_exchange('usdtm')
+def _pick_symbols(
+    cfg,
+    symbol_override: str | None,
+    max_symbols_hint: int,
+    *,
+    exchange: Optional[Any] = None,
+):
+    ex = exchange or _build_exchange('usdtm')
     explicit = (symbol_override or "").strip()
     limit_hint = max_symbols_hint if max_symbols_hint else cfg.max_scan
     try:
@@ -10332,6 +10618,8 @@ def _pick_symbols(cfg, symbol_override: str | None, max_symbols_hint: int):
 
 # ---------- Android CLI entry ----------
 def _android_cli_entry() -> int:
+    if not _warn_missing_deps(live_required=True):
+        return 2
     if ccxt is None:
         print("ccxt not installed. pip install ccxt", file=sys.stderr)
         return 2
@@ -10339,6 +10627,22 @@ def _android_cli_entry() -> int:
     recent_window = max(1, args.recent)
 
     ex = _build_exchange(getattr(cfg, "market", 'usdtm'))
+    print("بدء تشغيل ماسح Binance (وضع المحرر)...", flush=True)
+    markets_ready = _ensure_markets_loaded(ex)
+    if markets_ready:
+        print("تم الاتصال بـ Binance وجلب الأسواق.", flush=True)
+    else:
+        print("تعذر جلب الأسواق، سيتم إعادة المحاولة ضمن الدورة.", flush=True)
+    exchange_local = threading.local()
+
+    def _get_local_exchange():
+        local_ex = getattr(exchange_local, "client", None)
+        if local_ex is None:
+            local_ex = _build_exchange(getattr(cfg, "market", 'usdtm'))
+            if not _ensure_markets_loaded(local_ex):
+                raise RuntimeError("تعذر تحميل الأسواق بسبب معدل الطلبات")
+            exchange_local.client = local_ex
+        return local_ex
 
     try:
         SmartMoneyAlgoProE5
@@ -10375,6 +10679,9 @@ def _android_cli_entry() -> int:
     inputs.console.max_age_bars = max(1, recent_window - 1)
 
     symbol_override = args.symbol or None
+    cached_symbols: Optional[List[str]] = None
+    candle_cache: Dict[str, List[List[float]]] = {}
+    sent_event_cache: Dict[str, set] = {}
     iteration = 0
     try:
         while True:
@@ -10382,33 +10689,116 @@ def _android_cli_entry() -> int:
             if cfg.continuous_scan and iteration > 1:
                 print(f"\nإعادة تشغيل المسح (الدورة {iteration})", flush=True)
 
-            symbols = _pick_symbols(cfg, symbol_override=symbol_override, max_symbols_hint=args.max_symbols)
+            if cached_symbols is None:
+                symbols = _pick_symbols(
+                    cfg,
+                    symbol_override=symbol_override,
+                    max_symbols_hint=args.max_symbols,
+                    exchange=ex,
+                )
+                cached_symbols = list(dict.fromkeys(symbols))
+            else:
+                symbols = cached_symbols
+                print("استخدام قائمة الرموز المحفوظة من الدورة الأولى.", flush=True)
             symbols = list(dict.fromkeys(symbols))
             if cfg.max_scan:
                 try:
                     symbols = symbols[: int(cfg.max_scan)]
                 except Exception:
                     pass
+            if symbols:
+                print(f"تم جلب {len(symbols)} رمزاً للفحص.", flush=True)
+            if not symbols:
+                print(
+                    "لا توجد رموز متاحة بعد تطبيق الفلاتر. "
+                    f"(min_change={getattr(cfg, 'min_change', None)}, "
+                    f"min_volume={getattr(cfg, 'min_volume', None)}, "
+                    f"include_only={getattr(cfg, 'include_only', '')}, "
+                    f"exclude_symbols={getattr(cfg, 'exclude_symbols', '')})",
+                    flush=True,
+                )
+                if not cfg.continuous_scan:
+                    print(
+                        "اكتمل المسح بعد دورة واحدة لأن خيار التشغيل المستمر غير مُفعّل."
+                        " لتشغيل المسح باستمرار استخدم --continuous=true أو عدّل"
+                        " AUTORUN_CONTINUOUS_SCAN في أعلى الملف.",
+                        flush=True,
+                    )
+                    break
+                if cfg.continuous_interval > 0:
+                    print(
+                        f"انتظار {cfg.continuous_interval:.2f} ثانية قبل تشغيل المسح التالي",
+                        flush=True,
+                    )
+                    time.sleep(cfg.continuous_interval)
+                continue
             alerts_total = 0
 
-            for i, sym in enumerate(symbols, 1):
+            def scan_symbol(i: int, sym: str):
                 try:
-                    candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
+                    local_ex = _get_local_exchange()
+                    candles = None
+                    if cfg.fast_scan and sym in candle_cache:
+                        cached = candle_cache[sym]
+                        if cached:
+                            last_ts = cached[-1][0]
+                            timeframe_sec = _parse_timeframe_to_seconds(args.timeframe, None) or 60
+                            since = int(last_ts + timeframe_sec * 1000)
+                            try:
+                                new_batch = _call_with_retries(
+                                    lambda: local_ex.fetch_ohlcv(
+                                        sym,
+                                        timeframe=args.timeframe,
+                                        since=since,
+                                        limit=args.limit,
+                                    ),
+                                    retries=3,
+                                )
+                            except Exception:
+                                new_batch = []
+                            if new_batch:
+                                cached = cached + new_batch
+                                if args.limit and args.limit > 0 and len(cached) > args.limit:
+                                    cached = cached[-args.limit :]
+                                candle_cache[sym] = cached
+                        candles = candle_cache[sym]
+                    else:
+                        for attempt in range(3):
+                            try:
+                                candles = fetch_ohlcv(
+                                    local_ex,
+                                    sym,
+                                    args.timeframe,
+                                    args.limit,
+                                    fast_scan=cfg.fast_scan,
+                                )
+                                break
+                            except Exception as exc:
+                                if not _is_rate_limit_error(exc):
+                                    raise
+                                time.sleep(_rate_limit_backoff(attempt + 1))
+                    if candles is None:
+                        raise RuntimeError("تعذر جلب البيانات بسبب معدل الطلبات")
+                    if cfg.fast_scan:
+                        candle_cache[sym] = candles
                     if cfg.drop_last_incomplete and candles:
                         candles = candles[:-1]
                     runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
                     runtime._bos_break_source = cfg.bos_confirmation
                     runtime._strict_close_for_break = cfg.strict_close_for_break
                     runtime.process([
-                        {"time": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5] if len(c)>5 else float('nan')}
+                        {
+                            "time": c[0],
+                            "open": c[1],
+                            "high": c[2],
+                            "low": c[3],
+                            "close": c[4],
+                            "volume": c[5] if len(c) > 5 else float("nan"),
+                        }
                         for c in candles
                     ])
                 except Exception as e:
-                    print(
-                        f"[{i}/{len(symbols)}] {_format_symbol(sym)}: error {e}",
-                        file=sys.stderr,
-                    )
-                    continue
+                    return i, sym, None, None, None, str(e)
 
                 metrics = runtime.gather_console_metrics()
                 latest_events = metrics.get("latest_events") or {}
@@ -10416,16 +10806,7 @@ def _android_cli_entry() -> int:
                     runtime.series, latest_events, bars=recent_window
                 )
                 if not recent_hits:
-                    if recent_window == 1:
-                        span_phrase = "آخر شمعة واحدة"
-                    elif recent_window == 2:
-                        span_phrase = "آخر شمعتين"
-                    else:
-                        span_phrase = f"آخر {recent_window} شموع"
-                    print(
-                        f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال {span_phrase}"
-                    )
-                    continue
+                    return i, sym, None, None, recent_hits, None
 
                 recent_alerts = list(getattr(runtime, "alerts", []))
                 if recent_window > 0 and hasattr(runtime, "series") and runtime.series.length() > 0:
@@ -10438,10 +10819,72 @@ def _android_cli_entry() -> int:
                             ]
                     except Exception:
                         pass
+                return i, sym, runtime, recent_alerts, recent_hits, None
+
+            if cfg.parallel_scan:
+                max_workers = max(1, int(cfg.concurrency))
+                max_workers = min(max_workers, len(symbols))
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    future_map = {
+                        pool.submit(scan_symbol, i, sym): i
+                        for i, sym in enumerate(symbols, 1)
+                    }
+                    results = [future.result() for future in concurrent.futures.as_completed(future_map)]
+            else:
+                if cfg.concurrency > 1:
+                    print("تم فرض التوازي = 1 لتجنّب حظر REST من Binance.", flush=True)
+                results = [scan_symbol(i, sym) for i, sym in enumerate(symbols, 1)]
+
+            results.sort(key=lambda item: item[0])
+            for i, sym, runtime, recent_alerts, recent_hits, err in results:
+                if err:
+                    print(
+                        f"[{i}/{len(symbols)}] {_format_symbol(sym)}: error {err}",
+                        file=sys.stderr,
+                    )
+                    continue
+                if runtime is None:
+                    if recent_window == 1:
+                        span_phrase = "آخر شمعة واحدة"
+                    elif recent_window == 2:
+                        span_phrase = "آخر شمعتين"
+                    else:
+                        span_phrase = f"آخر {recent_window} شموع"
+                    print(
+                        f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال {span_phrase}"
+                    )
+                    continue
 
                 if recent_alerts or args.verbose:
                     _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
                     alerts_total += len(recent_alerts)
+                    if cfg.telegram_token and cfg.telegram_chat_id:
+                        event_titles = {
+                            "CHOCH": "CHOCH",
+                            "BOS": "BOS",
+                            "IDM": "IDM",
+                            "GOLDEN_ZONE": "Golden zone",
+                            "HIST_EXT_OB": "Hist EXT OB",
+                            "HIST_IDM_OB": "Hist IDM OB",
+                            "IDM_OB": "IDM OB",
+                            "EXT_OB": "EXT OB",
+                        }
+                        latest_events = metrics.get("latest_events") or {}
+                        hits = [key for key in recent_hits if key in event_titles]
+                        if hits:
+                            cache = sent_event_cache.setdefault(sym, set())
+                            lines = [f"{_format_symbol(sym)} ({args.timeframe})"]
+                            for key in hits:
+                                payload = latest_events.get(key, {})
+                                ts = payload.get("time") or payload.get("ts") or payload.get("timestamp")
+                                signature = (key, int(ts) if isinstance(ts, (int, float)) else 0)
+                                if signature in cache:
+                                    continue
+                                cache.add(signature)
+                                display = payload.get("display") or payload.get("text") or event_titles[key]
+                                lines.append(f"- {display}")
+                            if len(lines) > 1:
+                                _send_tg_runtime(cfg.telegram_token, cfg.telegram_chat_id, lines)
 
             if args.verbose:
                 print(f"\nتم. عدد الرموز: {len(symbols)}  |  عدد التنبيهات: {alerts_total}")
@@ -10466,12 +10909,15 @@ def _android_cli_entry() -> int:
 
 # ---------- Router ----------
 def __router_main__():
+    if not _warn_missing_deps(live_required=True):
+        return 2
     if len(sys.argv) == 1:
         defaults = EDITOR_AUTORUN_DEFAULTS
         sys.argv += [
             "-t", defaults.timeframe,
             "-l", str(defaults.candle_limit),
             "--max-symbols", str(defaults.max_symbols),
+            "--concurrency", str(defaults.concurrency),
             "--recent", str(defaults.recent_bars),
             "--verbose",
         ]
@@ -10487,12 +10933,11 @@ def __router_main__():
             sys.argv.append("--continuous")
         if defaults.scan_interval > 0:
             sys.argv += ["--continuous-interval", str(defaults.scan_interval)]
+        if defaults.fast_scan:
+            sys.argv.append("--fast-scan")
+        else:
+            sys.argv.append("--no-fast-scan")
     return _android_cli_entry()
-
-# ---------- Main ----------
-if __name__ == "__main__":
-    __router_main__()
-
 
 # ============================================================================
 # === ICT Strategies Integration (Text-only Runner) — appended by assistant ===
@@ -11037,7 +11482,15 @@ def _main(argv: Optional[List[str]] = None) -> None:
         eng.run_backtest()
 
 
+def _entrypoint() -> int:
+    if "--ict" in sys.argv:
+        _warn_missing_deps(live_required="--live" in sys.argv)
+        _main()
+        return 0
+    return __router_main__() or 0
+
+
 if __name__ == "__main__":
     # تشغيل تلقائي من المحرر بالقيم الإفتراضية أعلاه.
-    _main()
+    _entrypoint()
 # ============================ End of Integration ============================
