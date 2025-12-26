@@ -5049,6 +5049,42 @@ class SmartMoneyAlgoProE5:
         if removed_bear == -1:
             self.fvg_removed = -1 if self.fvg_removed == 0 else self.fvg_removed
 
+        # --- FVG touch detection (first touch only) ---
+        touch_ids = getattr(self, "_fvg_touch_ids", None)
+        if touch_ids is None:
+            touch_ids = set()
+            self._fvg_touch_ids = touch_ids
+        current_time = self.series.get_time()
+        for is_bullish in (True, False):
+            holder = self.bullish_gap_holder if is_bullish else self.bearish_gap_holder
+            key = "FVG_UP" if is_bullish else "FVG_DN"
+            direction_label = "FVG Up" if is_bullish else "FVG Down"
+            for i in range(holder.size()):
+                box_obj: Box = holder.get(i)
+                if not isinstance(box_obj, Box):
+                    continue
+                top = box_obj.get_top()
+                bottom = box_obj.get_bottom()
+                if low <= top and high >= bottom:
+                    signature = (key, id(box_obj))
+                    if signature in touch_ids:
+                        continue
+                    touch_ids.add(signature)
+                    display = (
+                        f"{direction_label} Touched @ {format_price(close)} | "
+                        f"Range {format_price(bottom)} → {format_price(top)}"
+                    )
+                    self.console_event_log[key] = {
+                        "text": direction_label,
+                        "price": (bottom, top),
+                        "time": current_time,
+                        "time_display": format_timestamp(current_time),
+                        "display": display,
+                        "status": "touched",
+                        "status_display": self.BOX_STATUS_LABELS.get("touched", "touched"),
+                    }
+                    self.alertcondition(True, f"{direction_label} Touched", display)
+
         self._fvg_trim(self.bullish_gap_holder, fvg.max_fvg)
         self._fvg_trim(self.bullish_gap_fill_holder, fvg.max_fvg)
         self._fvg_trim(self.bullish_mid_holder, fvg.max_fvg)
@@ -5168,6 +5204,89 @@ class SmartMoneyAlgoProE5:
         self._liquidity_extend_lines(self.lowLineArrayHTF, extend_time)
         self._liquidity_extend_boxes(self.highBoxArrayHTF, extend_time)
         self._liquidity_extend_boxes(self.lowBoxArrayHTF, extend_time)
+
+        # --- Liquidity touch detection (first touch only) ---
+        touch_ids = getattr(self, "_liq_touch_ids", None)
+        if touch_ids is None:
+            touch_ids = set()
+            self._liq_touch_ids = touch_ids
+        current_time = self.series.get_time()
+        high = self.series.get("high")
+        low = self.series.get("low")
+        for line in list(self.highLineArrayHTF.values):
+            if not isinstance(line, Line):
+                continue
+            level = line.y1
+            if high >= level:
+                signature = ("LIQ_HIGH", id(line))
+                if signature not in touch_ids:
+                    touch_ids.add(signature)
+                    display = f"Liquidity touched High @ {format_price(level)} | Price {format_price(high)}"
+                    self.console_event_log["LIQ"] = {
+                        "text": "Liquidity High",
+                        "price": level,
+                        "time": current_time,
+                        "time_display": format_timestamp(current_time),
+                        "display": display,
+                        "status": "touched",
+                    }
+                    self.alertcondition(True, "Liquidity Level Touched", display)
+        for line in list(self.lowLineArrayHTF.values):
+            if not isinstance(line, Line):
+                continue
+            level = line.y1
+            if low <= level:
+                signature = ("LIQ_LOW", id(line))
+                if signature not in touch_ids:
+                    touch_ids.add(signature)
+                    display = f"Liquidity touched Low @ {format_price(level)} | Price {format_price(low)}"
+                    self.console_event_log["LIQ"] = {
+                        "text": "Liquidity Low",
+                        "price": level,
+                        "time": current_time,
+                        "time_display": format_timestamp(current_time),
+                        "display": display,
+                        "status": "touched",
+                    }
+                    self.alertcondition(True, "Liquidity Level Touched", display)
+        for box in list(self.highBoxArrayHTF.values):
+            if not isinstance(box, Box):
+                continue
+            top = box.top
+            bottom = box.bottom
+            if high >= bottom and low <= top:
+                signature = ("LIQ_HIGH_BOX", id(box))
+                if signature not in touch_ids:
+                    touch_ids.add(signature)
+                    display = f"Liquidity touched High @ {format_price(top)} | Range {format_price(bottom)} → {format_price(top)}"
+                    self.console_event_log["LIQ"] = {
+                        "text": "Liquidity High",
+                        "price": (bottom, top),
+                        "time": current_time,
+                        "time_display": format_timestamp(current_time),
+                        "display": display,
+                        "status": "touched",
+                    }
+                    self.alertcondition(True, "Liquidity Level Touched", display)
+        for box in list(self.lowBoxArrayHTF.values):
+            if not isinstance(box, Box):
+                continue
+            top = box.top
+            bottom = box.bottom
+            if high >= bottom and low <= top:
+                signature = ("LIQ_LOW_BOX", id(box))
+                if signature not in touch_ids:
+                    touch_ids.add(signature)
+                    display = f"Liquidity touched Low @ {format_price(bottom)} | Range {format_price(bottom)} → {format_price(top)}"
+                    self.console_event_log["LIQ"] = {
+                        "text": "Liquidity Low",
+                        "price": (bottom, top),
+                        "time": current_time,
+                        "time_display": format_timestamp(current_time),
+                        "display": display,
+                        "status": "touched",
+                    }
+                    self.alertcondition(True, "Liquidity Level Touched", display)
 
         self.alertcondition(created_high, "High Liquidity Level", "High Liquidity Level Found Ez-SMC")
         self.alertcondition(created_low, "Low Liquidity Level", "Low Liquidity Level Found Ez-SMC")
