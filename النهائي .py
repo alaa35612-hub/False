@@ -114,6 +114,8 @@ class _EditorAutorunDefaults:
     candle_limit: int = 500
     max_symbols: int = 600
     recent_bars: int = 2
+    concurrency: int = 3
+    fast_scan: bool = True
     continuous_scan: bool = False
     scan_interval: float = 0.0
     height_metric: str = "percentage"
@@ -126,10 +128,14 @@ class _EditorAutorunDefaults:
 # كما يمكن تحديد فترة الانتظار بين الدورات من المتغير الذي يليه.
 AUTORUN_CONTINUOUS_SCAN = True
 AUTORUN_SCAN_INTERVAL = 0.0
+AUTORUN_CONCURRENCY = 3
+AUTORUN_FAST_SCAN = True
 
 EDITOR_AUTORUN_DEFAULTS = _EditorAutorunDefaults(
     continuous_scan=AUTORUN_CONTINUOUS_SCAN,
     scan_interval=AUTORUN_SCAN_INTERVAL,
+    concurrency=AUTORUN_CONCURRENCY,
+    fast_scan=AUTORUN_FAST_SCAN,
 )
 
 
@@ -7527,10 +7533,14 @@ def _binance_pick_symbols(
             print(f"تحذير: سيتم تجاهل الرموز غير الصحيحة: {', '.join(invalid_sorted)}")
         return BinanceSymbolSelection(valid, [], False, False)
 
-    try:
-        markets = exchange.load_markets()
-    except Exception as exc:
-        print(f"فشل تحميل أسواق Binance: {exc}")
+    markets = None
+    for attempt in range(3):
+        if _ensure_markets_loaded(exchange):
+            markets = exchange.markets
+            break
+        time.sleep(_rate_limit_backoff(attempt + 1))
+    if not markets:
+        print("فشل تحميل أسواق Binance بعد عدة محاولات.")
         return BinanceSymbolSelection([], [], False, False)
 
     usdtm_markets: List[Dict[str, Any]] = [
@@ -7720,7 +7730,54 @@ def fetch_binance_usdtm_symbols(
     return symbols
 
 
-def fetch_ohlcv(exchange: Any, symbol: str, timeframe: str, limit: int) -> List[Dict[str, float]]:
+def _ensure_markets_loaded(exchange: Any) -> bool:
+    """Load exchange markets once per client for faster repeated OHLCV calls."""
+
+    markets = getattr(exchange, "markets", None)
+    if markets:
+        return True
+    try:
+        exchange.load_markets()
+    except Exception as exc:
+        if _is_rate_limit_error(exc):
+            print(f"تحذير: تعذر تحميل أسواق Binance بسبب معدل الطلبات: {exc}", flush=True)
+        else:
+            print(f"تحذير: تعذر تحميل أسواق Binance: {exc}", flush=True)
+        return False
+    return True
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    status = getattr(exc, "status", None) or getattr(exc, "status_code", None)
+    if isinstance(status, int) and status in (418, 429):
+        return True
+    return any(
+        token in message
+        for token in (
+            "too many requests",
+            "rate limit",
+            "rate-limit",
+            "banned",
+            "418",
+            "429",
+            "ip banned",
+        )
+    )
+
+
+def _rate_limit_backoff(attempt: int) -> float:
+    return min(10.0, 1.5 ** attempt)
+
+
+def fetch_ohlcv(
+    exchange: Any,
+    symbol: str,
+    timeframe: str,
+    limit: int,
+    *,
+    fast_scan: bool = False,
+) -> List[Dict[str, float]]:
     """Fetch OHLCV data while preserving full history for structural parity.
 
     Binance USDT-M returns at most 1500 candles per request.  TradingView keeps
@@ -7739,16 +7796,28 @@ def fetch_ohlcv(exchange: Any, symbol: str, timeframe: str, limit: int) -> List[
     candles: List[Dict[str, float]] = []
     target = limit if limit > 0 else None
 
+    if fast_scan:
+        request_limit = target or max_batch
+        raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=request_limit)
+        return [
+            {
+                "time": entry[0],
+                "open": entry[1],
+                "high": entry[2],
+                "low": entry[3],
+                "close": entry[4],
+                "volume": entry[5],
+            }
+            for entry in raw
+        ]
+
     while True:
         request_limit = max_batch
         if target is not None and target < max_batch and not candles:
             # first batch can be trimmed if the caller only needs a small window
             request_limit = target
         raw: List[List[float]]
-        if since <= 0:
-            raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=request_limit, since=since)
-        else:
-            raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=request_limit, since=since)
+        raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=request_limit, since=since)
         if not raw:
             break
         for entry in raw:
@@ -8775,10 +8844,12 @@ def scan_binance(
     recent_window_bars: Optional[int] = None,
     max_symbols: Optional[int] = None,
     symbol_selector: Optional[BinanceSymbolSelectorConfig] = None,
+    fast_scan: bool = False,
 ) -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
     if ccxt is None:
         raise RuntimeError("ccxt is not available")
     exchange = ccxt.binanceusdm({"enableRateLimit": True})
+    _ensure_markets_loaded(exchange)
     all_symbols = symbols or fetch_binance_usdtm_symbols(
         exchange,
         limit=max_symbols,
@@ -8803,10 +8874,18 @@ def scan_binance(
     tickers: Dict[str, Any] = {}
     ticker_error: Optional[Exception] = None
     try:
-        tickers = exchange.fetch_tickers()
+        if all_symbols:
+            tickers = exchange.fetch_tickers(all_symbols)
+        else:
+            tickers = exchange.fetch_tickers()
     except Exception as exc:
-        ticker_error = exc
-        print(f"تعذر جلب بيانات التيكر بشكلٍ مجمّع: {exc}", flush=True)
+        try:
+            tickers = exchange.fetch_tickers()
+        except Exception as fallback_exc:
+            ticker_error = fallback_exc
+            print(f"تعذر جلب بيانات التيكر بشكلٍ مجمّع: {fallback_exc}", flush=True)
+        else:
+            ticker_error = exc
 
     exchange_local = threading.local()
 
@@ -8814,6 +8893,7 @@ def scan_binance(
         local_exchange = getattr(exchange_local, "client", None)
         if local_exchange is None:
             local_exchange = ccxt.binanceusdm({"enableRateLimit": True})
+            _ensure_markets_loaded(local_exchange)
             exchange_local.client = local_exchange
         return local_exchange
 
@@ -8846,7 +8926,7 @@ def scan_binance(
                         threshold=min_daily_change,
                     )
                 return idx, None, None
-            candles = fetch_ohlcv(_get_exchange(), symbol, timeframe, limit)
+            candles = fetch_ohlcv(_get_exchange(), symbol, timeframe, limit, fast_scan=fast_scan)
             runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
             runtime.process(candles)
             metrics = runtime.gather_console_metrics()
@@ -8899,6 +8979,8 @@ def scan_binance(
         results = [scan_symbol(idx, symbol) for idx, symbol in enumerate(all_symbols)]
     else:
         max_workers = max(1, int(concurrency))
+        if all_symbols:
+            max_workers = min(max_workers, len(all_symbols))
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
             future_map = {
                 pool.submit(scan_symbol, idx, symbol): idx
@@ -8935,7 +9017,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument("--bars", type=int, default=0, help="Limit number of candles to analyse from --data source")
     parser.add_argument("--symbols", type=str, default="")
-    parser.add_argument("--concurrency", type=int, default=3)
+    parser.add_argument("--concurrency", type=int, default=EDITOR_AUTORUN_DEFAULTS.concurrency)
     parser.add_argument(
         "--min-daily-change",
         type=float,
@@ -8983,6 +9065,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         type=float,
         default=0.0,
         help="عدد الثواني للانتظار قبل إعادة تشغيل المسح عند تفعيل --continuous-scan",
+    )
+    parser.add_argument(
+        "--fast-scan",
+        dest="fast_scan",
+        action=_OptionalBoolAction,
+        default=EDITOR_AUTORUN_DEFAULTS.fast_scan,
+        help="تسريع المسح بجلب آخر الشموع فقط بدون تحميل التاريخ الكامل (أسرع بكثير)",
+    )
+    parser.add_argument(
+        "--no-fast-scan",
+        dest="fast_scan",
+        action="store_false",
+        help="تعطيل وضع المسح السريع (الحصول على التاريخ الكامل)",
     )
     args = parser.parse_args(argv)
     if args.min_daily_change < 0.0:
@@ -9083,6 +9178,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 tracer,
                 min_daily_change=args.min_daily_change,
                 inputs=indicator_inputs,
+                fast_scan=args.fast_scan,
             )
             perform_comparison()
             log("Rendering")
@@ -9208,8 +9304,8 @@ class _CLISettings:
     strict_close_for_break: bool = False
     # filters
     market: str = "usdtm"         # {usdtm, spot}
-    min_change: float = 5.0       # ≥ %
-    min_volume: float = 30_000_000.0  # ≥ USDT
+    min_change: Optional[float] = None       # ≥ %
+    min_volume: Optional[float] = None  # ≥ USDT
     max_scan: int = 60            # after filtering & sorting
     allow_meme: bool = False
     exclude_symbols: str = ""
@@ -9241,7 +9337,15 @@ def _pick_symbols(cfg: _CLISettings, symbol_override: Optional[str] = None, max_
     if symbol_override:
         return [symbol_override.strip().upper()]
     ex = _build_exchange(cfg.market)
-    markets = ex.load_markets()
+    markets = None
+    for attempt in range(3):
+        if _ensure_markets_loaded(ex):
+            markets = ex.markets
+            break
+        time.sleep(_rate_limit_backoff(attempt + 1))
+    if not markets:
+        print("تعذر تحميل الأسواق لاختيار الرموز. جرّب لاحقًا أو خفّض التوازي.", flush=True)
+        return []
     if cfg.market == "usdtm":
         universe = [s for s, m in markets.items() if m.get("linear") and m.get("quote") == "USDT" and m.get("type") == "swap"]
     else:
@@ -9273,7 +9377,7 @@ def _pick_symbols(cfg: _CLISettings, symbol_override: Optional[str] = None, max_
         pct_change = _pct_24h(t)
         if cfg.min_change is not None and pct_change < cfg.min_change:
             return False
-        if _qv_24h(t) < cfg.min_volume:
+        if cfg.min_volume is not None and _qv_24h(t) < cfg.min_volume:
             return False
         return True
 
@@ -9318,8 +9422,8 @@ def _parse_args_android() -> Tuple[_CLISettings, argparse.Namespace]:
     p.add_argument("--no-ote-alert", action="store_true")
     p.add_argument("--no-mark-x", action="store_true")
     # filters
-    p.add_argument("--min-change", type=float, default=5.0)
-    p.add_argument("--min-volume", type=float, default=30_000_000.0)
+    p.add_argument("--min-change", type=float, default=None)
+    p.add_argument("--min-volume", type=float, default=None)
     p.add_argument("--max-scan", type=int, default=60)
     p.add_argument("--allow-meme", action="store_true", default=False)
     p.add_argument("--exclude-symbols", default="")
@@ -9998,9 +10102,36 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
 def _build_exchange(_market_forced_usdtm:str="usdtm"):
     return ccxt.binanceusdm({"enableRateLimit": True})
 
-def fetch_ohlcv(ex, symbol, timeframe, limit):
-    ex.load_markets()
-    return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+def fetch_ohlcv(ex, symbol, timeframe, limit, *, fast_scan: bool = False):
+    _ensure_markets_loaded(ex)
+    if fast_scan:
+        return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+
+    timeframe_seconds = _parse_timeframe_to_seconds(timeframe, None) or 60
+    timeframe_ms = timeframe_seconds * 1000
+    max_batch = 1500
+    since = 0
+    candles = []
+    target = limit if limit > 0 else None
+
+    while True:
+        request_limit = max_batch
+        if target is not None and target < max_batch and not candles:
+            request_limit = target
+        raw = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=request_limit, since=since)
+        if not raw:
+            break
+        candles.extend(raw)
+        if target is not None and len(candles) > target:
+            candles = candles[-target:]
+        last_open = raw[-1][0]
+        next_since = last_open + timeframe_ms
+        if len(raw) < request_limit:
+            break
+        if next_since <= since:
+            next_since = since + timeframe_ms
+        since = next_since
+    return candles
 
 # ---------- Settings & argument parsing ----------
 class Settings:
@@ -10008,6 +10139,7 @@ class Settings:
         self.__dict__.update(kw)
         self.market = 'usdtm'
         self.max_scan = kw.get("max_scan", 60)
+        self.concurrency = kw.get("concurrency", EDITOR_AUTORUN_DEFAULTS.concurrency)
         self.drop_last_incomplete = kw.get("drop_last_incomplete", False)
         self.showHL = kw.get("showHL", False)
         self.showMn = kw.get("showMn", False)
@@ -10037,6 +10169,7 @@ class Settings:
         self.structure_requires_wick = kw.get("structure_requires_wick", False)
         self.mtf_lookahead = kw.get("mtf_lookahead", False)
         self.zone_type = kw.get("zone_type", "Mother Bar")
+        self.fast_scan = kw.get("fast_scan", EDITOR_AUTORUN_DEFAULTS.fast_scan)
         raw_threshold = kw.get("min_change", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_threshold)
         try:
             self.min_change = float(raw_threshold) if raw_threshold is not None else None
@@ -10092,6 +10225,20 @@ def _parse_args_android():
     p.add_argument("--timeframe", "-t", default=EDITOR_AUTORUN_DEFAULTS.timeframe)
     p.add_argument("--limit", "-l", type=int, default=EDITOR_AUTORUN_DEFAULTS.candle_limit)
     p.add_argument("--max-symbols", "-n", type=int, default=EDITOR_AUTORUN_DEFAULTS.max_symbols)
+    p.add_argument("--concurrency", type=int, default=EDITOR_AUTORUN_DEFAULTS.concurrency)
+    p.add_argument(
+        "--fast-scan",
+        dest="fast_scan",
+        action=_OptionalBoolAction,
+        default=EDITOR_AUTORUN_DEFAULTS.fast_scan,
+        help="تسريع المسح بجلب آخر الشموع فقط بدون تحميل التاريخ الكامل",
+    )
+    p.add_argument(
+        "--no-fast-scan",
+        dest="fast_scan",
+        action="store_false",
+        help="تعطيل المسح السريع",
+    )
     p.add_argument("--mitigation", choices=["WICK","CLOSE"], default="CLOSE")
     p.add_argument("--tg", action="store_true", default=False)
     p.add_argument("--symbol", "-s", default="")
@@ -10130,12 +10277,7 @@ def _parse_args_android():
     p.add_argument("--no-ote", action="store_true")
     p.add_argument("--no-ote-alert", action="store_true")
     p.add_argument("--bos-confirmation", choices=["Close","Wick","Candle High"], default="Close")
-    default_threshold = (
-        EDITOR_AUTORUN_DEFAULTS.height_threshold
-        if EDITOR_AUTORUN_DEFAULTS.height_threshold is not None
-        else DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_threshold
-    )
-    p.add_argument("--min-change", type=float, default=default_threshold)
+    p.add_argument("--min-change", type=float, default=EDITOR_AUTORUN_DEFAULTS.height_threshold)
     default_candle_window = (
         EDITOR_AUTORUN_DEFAULTS.height_candle_window
         if EDITOR_AUTORUN_DEFAULTS.height_candle_window is not None
@@ -10195,6 +10337,8 @@ def _parse_args_android():
         p.error("--limit must be > 0")
     if args.max_symbols <= 0:
         p.error("--max-symbols must be > 0")
+    if args.concurrency <= 0:
+        p.error("--concurrency يجب أن يكون رقمًا موجبًا")
     if args.recent <= 0:
         p.error("--recent يجب أن يكون رقمًا موجبًا")
     if args.height_candles is not None and args.height_candles <= 0:
@@ -10258,7 +10402,9 @@ def _parse_args_android():
         zone_type=zone_type,
         drop_last_incomplete=args.drop_last,
         max_scan=args.max_symbols,
+        concurrency=args.concurrency,
         min_change=args.min_change,
+        fast_scan=args.fast_scan,
         height_candle_window=args.height_candles,
         height_scope=height_scope,
         height_metric=height_metric,
@@ -10339,6 +10485,16 @@ def _android_cli_entry() -> int:
     recent_window = max(1, args.recent)
 
     ex = _build_exchange(getattr(cfg, "market", 'usdtm'))
+    markets_ready = _ensure_markets_loaded(ex)
+    exchange_local = threading.local()
+
+    def _get_local_exchange():
+        local_ex = getattr(exchange_local, "client", None)
+        if local_ex is None:
+            local_ex = _build_exchange(getattr(cfg, "market", 'usdtm'))
+            _ensure_markets_loaded(local_ex)
+            exchange_local.client = local_ex
+        return local_ex
 
     try:
         SmartMoneyAlgoProE5
@@ -10389,26 +10545,70 @@ def _android_cli_entry() -> int:
                     symbols = symbols[: int(cfg.max_scan)]
                 except Exception:
                     pass
+            if not symbols:
+                print(
+                    "لا توجد رموز متاحة بعد تطبيق الفلاتر. "
+                    f"(min_change={getattr(cfg, 'min_change', None)}, "
+                    f"min_volume={getattr(cfg, 'min_volume', None)}, "
+                    f"include_only={getattr(cfg, 'include_only', '')}, "
+                    f"exclude_symbols={getattr(cfg, 'exclude_symbols', '')})",
+                    flush=True,
+                )
+                if not cfg.continuous_scan:
+                    print(
+                        "اكتمل المسح بعد دورة واحدة لأن خيار التشغيل المستمر غير مُفعّل."
+                        " لتشغيل المسح باستمرار استخدم --continuous=true أو عدّل"
+                        " AUTORUN_CONTINUOUS_SCAN في أعلى الملف.",
+                        flush=True,
+                    )
+                    break
+                if cfg.continuous_interval > 0:
+                    print(
+                        f"انتظار {cfg.continuous_interval:.2f} ثانية قبل تشغيل المسح التالي",
+                        flush=True,
+                    )
+                    time.sleep(cfg.continuous_interval)
+                continue
             alerts_total = 0
 
-            for i, sym in enumerate(symbols, 1):
+            def scan_symbol(i: int, sym: str):
                 try:
-                    candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
+                    local_ex = _get_local_exchange()
+                    candles = None
+                    for attempt in range(3):
+                        try:
+                            candles = fetch_ohlcv(
+                                local_ex,
+                                sym,
+                                args.timeframe,
+                                args.limit,
+                                fast_scan=cfg.fast_scan,
+                            )
+                            break
+                        except Exception as exc:
+                            if not _is_rate_limit_error(exc):
+                                raise
+                            time.sleep(_rate_limit_backoff(attempt + 1))
+                    if candles is None:
+                        raise RuntimeError("تعذر جلب البيانات بسبب معدل الطلبات")
                     if cfg.drop_last_incomplete and candles:
                         candles = candles[:-1]
                     runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
                     runtime._bos_break_source = cfg.bos_confirmation
                     runtime._strict_close_for_break = cfg.strict_close_for_break
                     runtime.process([
-                        {"time": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5] if len(c)>5 else float('nan')}
+                        {
+                            "time": c[0],
+                            "open": c[1],
+                            "high": c[2],
+                            "low": c[3],
+                            "close": c[4],
+                            "volume": c[5] if len(c) > 5 else float("nan"),
+                        }
                         for c in candles
                     ])
                 except Exception as e:
-                    print(
-                        f"[{i}/{len(symbols)}] {_format_symbol(sym)}: error {e}",
-                        file=sys.stderr,
-                    )
-                    continue
+                    return i, sym, None, None, None, str(e)
 
                 metrics = runtime.gather_console_metrics()
                 latest_events = metrics.get("latest_events") or {}
@@ -10416,16 +10616,7 @@ def _android_cli_entry() -> int:
                     runtime.series, latest_events, bars=recent_window
                 )
                 if not recent_hits:
-                    if recent_window == 1:
-                        span_phrase = "آخر شمعة واحدة"
-                    elif recent_window == 2:
-                        span_phrase = "آخر شمعتين"
-                    else:
-                        span_phrase = f"آخر {recent_window} شموع"
-                    print(
-                        f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال {span_phrase}"
-                    )
-                    continue
+                    return i, sym, None, None, recent_hits, None
 
                 recent_alerts = list(getattr(runtime, "alerts", []))
                 if recent_window > 0 and hasattr(runtime, "series") and runtime.series.length() > 0:
@@ -10438,6 +10629,38 @@ def _android_cli_entry() -> int:
                             ]
                     except Exception:
                         pass
+                return i, sym, runtime, recent_alerts, recent_hits, None
+
+            if cfg.concurrency <= 1:
+                results = [scan_symbol(i, sym) for i, sym in enumerate(symbols, 1)]
+            else:
+                max_workers = min(max(1, int(cfg.concurrency)), len(symbols))
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    future_map = {
+                        pool.submit(scan_symbol, i, sym): i
+                        for i, sym in enumerate(symbols, 1)
+                    }
+                    results = [future.result() for future in concurrent.futures.as_completed(future_map)]
+
+            results.sort(key=lambda item: item[0])
+            for i, sym, runtime, recent_alerts, recent_hits, err in results:
+                if err:
+                    print(
+                        f"[{i}/{len(symbols)}] {_format_symbol(sym)}: error {err}",
+                        file=sys.stderr,
+                    )
+                    continue
+                if runtime is None:
+                    if recent_window == 1:
+                        span_phrase = "آخر شمعة واحدة"
+                    elif recent_window == 2:
+                        span_phrase = "آخر شمعتين"
+                    else:
+                        span_phrase = f"آخر {recent_window} شموع"
+                    print(
+                        f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال {span_phrase}"
+                    )
+                    continue
 
                 if recent_alerts or args.verbose:
                     _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
@@ -10472,6 +10695,7 @@ def __router_main__():
             "-t", defaults.timeframe,
             "-l", str(defaults.candle_limit),
             "--max-symbols", str(defaults.max_symbols),
+            "--concurrency", str(defaults.concurrency),
             "--recent", str(defaults.recent_bars),
             "--verbose",
         ]
@@ -10487,6 +10711,10 @@ def __router_main__():
             sys.argv.append("--continuous")
         if defaults.scan_interval > 0:
             sys.argv += ["--continuous-interval", str(defaults.scan_interval)]
+        if defaults.fast_scan:
+            sys.argv.append("--fast-scan")
+        else:
+            sys.argv.append("--no-fast-scan")
     return _android_cli_entry()
 
 # ---------- Main ----------
