@@ -814,7 +814,7 @@ class DemandSupplyInputs:
 
 @dataclass
 class FVGInputs:
-    show_fvg: bool = False
+    show_fvg: bool = True
     i_tf: str = ""
     i_mtf: str = "HTF"
     i_bullishfvgcolor: str = "color.new(color.green,100)"
@@ -841,7 +841,7 @@ class FVGInputs:
 
 @dataclass
 class LiquidityInputs:
-    currentTF: bool = False
+    currentTF: bool = True
     displayLimit: int = 20
     lowLineColorHTF: str = "#00bbf94d"
     highLineColorHTF: str = "#e91e624d"
@@ -1563,18 +1563,19 @@ class SmartMoneyAlgoProE5:
     def _register_label_event(self, label: Label) -> None:
         text = label.text.strip()
         collapsed = text.replace(" ", "")
+        normalized = collapsed.upper().replace("0", "O")
         key: Optional[str] = None
-        if collapsed == "BOS":
+        if normalized == "BOS":
             key = "BOS"
-        elif collapsed == "BOS+":
+        elif normalized == "BOS+":
             key = "BOS_PLUS"
-        elif collapsed == self.CHOCH_TEXT.replace(" ", ""):
+        elif normalized == self.CHOCH_TEXT.replace(" ", "").upper():
             key = "CHOCH"
-        elif collapsed == "MSS+":
+        elif normalized == "MSS+":
             key = "MSS_PLUS"
-        elif collapsed == "MSS":
+        elif normalized == "MSS":
             key = "MSS"
-        elif collapsed == self.IDM_TEXT.replace(" ", ""):
+        elif normalized == self.IDM_TEXT.replace(" ", "").upper():
             key = "IDM"
         elif text.startswith(f"{self.BOS_TEXT} -"):
             key = "FUTURE_BOS"
@@ -1789,6 +1790,12 @@ class SmartMoneyAlgoProE5:
             sources=(self.hist_ext_boxes, self.boxes),
         )
         record_box("GOLDEN_ZONE", lambda bx: bx.text == "Golden zone")
+
+        for key in ("BOS_PLUS", "MSS", "MSS_PLUS"):
+            if key not in events:
+                payload = self.console_event_log.get(key)
+                if isinstance(payload, dict):
+                    events[key] = payload
 
         return events
 
@@ -3383,6 +3390,8 @@ class SmartMoneyAlgoProE5:
             self.int_t_MS = 1
             bull_mss = MSS
             bull_bos = not MSS
+            if bull_mss:
+                print(f"{ANSI_LABEL}[ICT] Bullish MSS Detected @ {format_price(self.internal_y_up)}{ANSI_RESET}", flush=True)
             if ict.showms and (ict.ms_type in ("All", "Internal")):
                 self._show_ms(self.internal_x_up, self.internal_y_up, "MSS" if MSS else "BOS", bull_color, True, True, label_size)
 
@@ -3397,6 +3406,8 @@ class SmartMoneyAlgoProE5:
             self.int_t_MS = -1
             bear_mss = MSS
             bear_bos = not MSS
+            if bear_mss:
+                print(f"{ANSI_LABEL}[ICT] Bearish MSS Detected @ {format_price(self.internal_y_dn)}{ANSI_RESET}", flush=True)
             if ict.showms and (ict.ms_type in ("All", "Internal")):
                 self._show_ms(self.internal_x_dn, self.internal_y_dn, "MSS" if MSS else "BOS", bear_color, True, False, label_size)
 
@@ -3410,6 +3421,8 @@ class SmartMoneyAlgoProE5:
             self.t_MS = 1
             bull_mss_ext = MSS
             bull_bos_ext = not MSS
+            if bull_mss_ext:
+                print(f"{ANSI_LABEL}[ICT] Bullish MSS+ Detected @ {format_price(self.y_up)}{ANSI_RESET}", flush=True)
             if ict.showms or ict.ms_type in ("All", "External"):
                 self._show_ms(self.x_up, self.y_up, "MSS+" if MSS else "BOS+", bull_color, False, True, label_size)
 
@@ -3423,6 +3436,8 @@ class SmartMoneyAlgoProE5:
             self.t_MS = -1
             bear_mss_ext = MSS
             bear_bos_ext = not MSS
+            if bear_mss_ext:
+                print(f"{ANSI_LABEL}[ICT] Bearish MSS+ Detected @ {format_price(self.y_dn)}{ANSI_RESET}", flush=True)
             if ict.showms and (ict.ms_type in ("All", "External")):
                 self._show_ms(self.x_dn, self.y_dn, "MSS+" if MSS else "BOS+", bear_color, False, False, label_size)
 
@@ -5049,6 +5064,43 @@ class SmartMoneyAlgoProE5:
         if removed_bear == -1:
             self.fvg_removed = -1 if self.fvg_removed == 0 else self.fvg_removed
 
+        # --- FVG touch detection (first touch only) ---
+        touch_ids = getattr(self, "_fvg_touch_ids", None)
+        if touch_ids is None:
+            touch_ids = set()
+            self._fvg_touch_ids = touch_ids
+        current_time = self.series.get_time()
+        for is_bullish in (True, False):
+            holder = self.bullish_gap_holder if is_bullish else self.bearish_gap_holder
+            key = "FVG_UP" if is_bullish else "FVG_DN"
+            direction_label = "FVG Up" if is_bullish else "FVG Down"
+            for i in range(holder.size()):
+                box_obj: Box = holder.get(i)
+                if not isinstance(box_obj, Box):
+                    continue
+                top = box_obj.get_top()
+                bottom = box_obj.get_bottom()
+                if low <= top and high >= bottom:
+                    signature = (key, id(box_obj))
+                    if signature in touch_ids:
+                        continue
+                    touch_ids.add(signature)
+                    display = (
+                        f"{direction_label} Touched @ {format_price(close)} | "
+                        f"Range {format_price(bottom)} → {format_price(top)}"
+                    )
+                    print(f"{ANSI_VALUE_ZERO}[تنبيه فوري] {display}{ANSI_RESET}", flush=True)
+                    self.console_event_log[key] = {
+                        "text": direction_label,
+                        "price": (bottom, top),
+                        "time": current_time,
+                        "time_display": format_timestamp(current_time),
+                        "display": display,
+                        "status": "touched",
+                        "status_display": self.BOX_STATUS_LABELS.get("touched", "touched"),
+                    }
+                    self.alertcondition(True, f"{direction_label} Touched", display)
+
         self._fvg_trim(self.bullish_gap_holder, fvg.max_fvg)
         self._fvg_trim(self.bullish_gap_fill_holder, fvg.max_fvg)
         self._fvg_trim(self.bullish_mid_holder, fvg.max_fvg)
@@ -5168,6 +5220,93 @@ class SmartMoneyAlgoProE5:
         self._liquidity_extend_lines(self.lowLineArrayHTF, extend_time)
         self._liquidity_extend_boxes(self.highBoxArrayHTF, extend_time)
         self._liquidity_extend_boxes(self.lowBoxArrayHTF, extend_time)
+
+        # --- Liquidity touch detection (first touch only) ---
+        touch_ids = getattr(self, "_liq_touch_ids", None)
+        if touch_ids is None:
+            touch_ids = set()
+            self._liq_touch_ids = touch_ids
+        current_time = self.series.get_time()
+        high = self.series.get("high")
+        low = self.series.get("low")
+        for line in list(self.highLineArrayHTF.values):
+            if not isinstance(line, Line):
+                continue
+            level = line.y1
+            if high >= level:
+                signature = ("LIQ_HIGH", id(line))
+                if signature not in touch_ids:
+                    touch_ids.add(signature)
+                    display = f"Liquidity touched High @ {format_price(level)} | Price {format_price(high)}"
+                    print(f"{ANSI_LABEL}[سيولة] {display}{ANSI_RESET}", flush=True)
+                    self.console_event_log["LIQ"] = {
+                        "text": "Liquidity High",
+                        "price": level,
+                        "time": current_time,
+                        "time_display": format_timestamp(current_time),
+                        "display": display,
+                        "status": "touched",
+                    }
+                    self.alertcondition(True, "Liquidity Level Touched", display)
+        for line in list(self.lowLineArrayHTF.values):
+            if not isinstance(line, Line):
+                continue
+            level = line.y1
+            if low <= level:
+                signature = ("LIQ_LOW", id(line))
+                if signature not in touch_ids:
+                    touch_ids.add(signature)
+                    display = f"Liquidity touched Low @ {format_price(level)} | Price {format_price(low)}"
+                    print(f"{ANSI_LABEL}[سيولة] {display}{ANSI_RESET}", flush=True)
+                    self.console_event_log["LIQ"] = {
+                        "text": "Liquidity Low",
+                        "price": level,
+                        "time": current_time,
+                        "time_display": format_timestamp(current_time),
+                        "display": display,
+                        "status": "touched",
+                    }
+                    self.alertcondition(True, "Liquidity Level Touched", display)
+        for box in list(self.highBoxArrayHTF.values):
+            if not isinstance(box, Box):
+                continue
+            top = box.top
+            bottom = box.bottom
+            if high >= bottom and low <= top:
+                signature = ("LIQ_HIGH_BOX", id(box))
+                if signature not in touch_ids:
+                    touch_ids.add(signature)
+                    display = f"Liquidity touched High @ {format_price(top)} | Range {format_price(bottom)} → {format_price(top)}"
+                    print(f"{ANSI_LABEL}[سيولة] {display}{ANSI_RESET}", flush=True)
+                    self.console_event_log["LIQ"] = {
+                        "text": "Liquidity High",
+                        "price": (bottom, top),
+                        "time": current_time,
+                        "time_display": format_timestamp(current_time),
+                        "display": display,
+                        "status": "touched",
+                    }
+                    self.alertcondition(True, "Liquidity Level Touched", display)
+        for box in list(self.lowBoxArrayHTF.values):
+            if not isinstance(box, Box):
+                continue
+            top = box.top
+            bottom = box.bottom
+            if high >= bottom and low <= top:
+                signature = ("LIQ_LOW_BOX", id(box))
+                if signature not in touch_ids:
+                    touch_ids.add(signature)
+                    display = f"Liquidity touched Low @ {format_price(bottom)} | Range {format_price(bottom)} → {format_price(top)}"
+                    print(f"{ANSI_LABEL}[سيولة] {display}{ANSI_RESET}", flush=True)
+                    self.console_event_log["LIQ"] = {
+                        "text": "Liquidity Low",
+                        "price": (bottom, top),
+                        "time": current_time,
+                        "time_display": format_timestamp(current_time),
+                        "display": display,
+                        "status": "touched",
+                    }
+                    self.alertcondition(True, "Liquidity Level Touched", display)
 
         self.alertcondition(created_high, "High Liquidity Level", "High Liquidity Level Found Ez-SMC")
         self.alertcondition(created_low, "Low Liquidity Level", "Low Liquidity Level Found Ez-SMC")
@@ -6296,6 +6435,8 @@ class SmartMoneyAlgoProE5:
         if not math.isnan(y):
             if name == "BOS":
                 self._register_structure_break_event("BOS", y, event_time, bullish=trend)
+                direction = "Bullish" if trend else "Bearish"
+                print(f"{ANSI_VALUE_POS}[هيكل] BOS {direction} @ {format_price(y)}{ANSI_RESET}", flush=True)
             elif name == "ChoCh":
                 self._register_structure_break_event("CHOCH", y, event_time, bullish=trend)
         if name == "BOS" and self.inputs.structure.showSMC:
@@ -8613,6 +8754,9 @@ EVENT_DISPLAY_ORDER = [
     ("MSS_PLUS", "MSS+"),
     ("MSS", "MSS"),
     ("IDM", "IDM"),
+    ("FVG_UP", "FVG Up"),
+    ("FVG_DN", "FVG Down"),
+    ("LIQ", "Liquidity"),
     ("IDM_OB", "IDM OB"),
     ("EXT_OB", "EXT OB"),
     ("HIST_IDM_OB", "Hist IDM OB"),
@@ -9402,26 +9546,38 @@ _AR_KEYS = {
 # Buckets for "latest per logic"
 _LAST_BUCKETS = {
     "BOS": ["bos", "b 0 s"],
+    "BOS+": ["bos+", "bos plus", "bos_plus"],
     "CHOCH": ["choch", "ch o ch"],
+    "MSS": ["mss"],
+    "MSS+": ["mss+", "mss plus", "mss_plus"],
     "Golden zone": ["golden zone"],
     "IDM": ["idm @", " i d m "],
     "EXT OB": ["ext ob", "ext_ob", "ext  ob"],
     "IDM OB": ["idm ob"],
     "Hist IDM OB": ["hist idm ob"],
     "Hist EXT OB": ["hist ext ob"],
+    "FVG_UP": ["fvg up", "fvg↑", "fvg up touched", "fvg up touch"],
+    "FVG_DN": ["fvg down", "fvg↓", "fvg down touched", "fvg down touch"],
+    "LIQ": ["liquidity", "liquidity touched", "سيولة"],
     "الدوائر الحمراء": ["الدوائر الحمراء", "red circle"],
     "الدوائر الخضراء": ["الدوائر الخضراء", "green circle"],
 }
 # ---- Bind to indicator metrics if available ----
 _METRIC_MAP = {
     "BOS": ["BOS", "bos"],
+    "BOS+": ["BOS_PLUS", "bos_plus", "BOS+"],
     "CHOCH": ["CHOCH", "choch"],
+    "MSS": ["MSS", "mss"],
+    "MSS+": ["MSS_PLUS", "mss_plus", "MSS+"],
     "Golden zone": ["GOLDEN_ZONE", "golden_zone", "GZ"],
     "IDM": ["IDM", "idm"],
     "EXT OB": ["EXT_OB", "ext_ob", "EXT-OB"],
     "IDM OB": ["IDM_OB", "idm_ob"],
     "Hist IDM OB": ["HIST_IDM_OB", "hist_idm_ob"],
     "Hist EXT OB": ["HIST_EXT_OB", "hist_ext_ob"],
+    "FVG_UP": ["FVG_UP", "fvg_up", "fvg_up_touch", "FVG Up"],
+    "FVG_DN": ["FVG_DN", "fvg_dn", "fvg_dn_touch", "FVG Down"],
+    "LIQ": ["LIQ", "liq", "liquidity"],
     "الدوائر الحمراء": ["RED_CIRCLE", "red_circle", "RED_CIRCLES"],
     "الدوائر الخضراء": ["GREEN_CIRCLE", "green_circle", "GREEN_CIRCLES"],
 }
@@ -9801,13 +9957,19 @@ _AR_KEYS = {
 # منطق “آخر حدث لكل بند” / أسماء عربية مطلوبة
 _LAST_BUCKETS = {
     "BOS": ["bos","b 0 s"],
+    "BOS+": ["bos+","bos plus","bos_plus"],
     "CHOCH": ["choch","ch o ch"],
+    "MSS": ["mss"],
+    "MSS+": ["mss+","mss plus","mss_plus"],
     "Golden zone": ["golden zone","gz"],
     "IDM": ["idm"," i d m "],
     "EXT OB": ["ext ob","ext_ob"],
     "IDM OB": ["idm ob","idm_ob"],
     "Hist IDM OB": ["hist idm ob","hist_idm_ob"],
     "Hist EXT OB": ["hist ext ob","hist_ext_ob"],
+    "FVG_UP": ["fvg up","fvg↑","fvg up touched","fvg up touch"],
+    "FVG_DN": ["fvg down","fvg↓","fvg down touched","fvg down touch"],
+    "LIQ": ["liquidity","liquidity touched","سيولة"],
     "الدوائر الحمراء": ["الدوائر الحمراء","red circle"],
     "الدوائر الخضراء": ["الدوائر الخضراء","green circle"],
 }
@@ -9854,13 +10016,19 @@ _INT_KEYS = [
 
 _METRIC_MAP = {
     "BOS": ["BOS","bos","b 0 s"],
+    "BOS+": ["BOS_PLUS","bos_plus","BOS+"],
     "CHOCH": ["CHOCH","choch","ch o ch"],
+    "MSS": ["MSS","mss"],
+    "MSS+": ["MSS_PLUS","mss_plus","MSS+"],
     "Golden zone": ["GOLDEN_ZONE","golden_zone","gz","golden zone"],
     "IDM": ["IDM","idm"," i d m "],
     "EXT OB": ["EXT_OB","ext_ob","ext ob"],
     "IDM OB": ["IDM_OB","idm_ob","idm ob"],
     "Hist IDM OB": ["HIST_IDM_OB","hist_idm_ob","hist idm ob"],
     "Hist EXT OB": ["HIST_EXT_OB","hist_ext_ob","hist ext ob"],
+    "FVG_UP": ["FVG_UP","fvg_up","fvg_up_touch","FVG Up"],
+    "FVG_DN": ["FVG_DN","fvg_dn","fvg_dn_touch","FVG Down"],
+    "LIQ": ["LIQ","liq","liquidity"],
     "الدوائر الحمراء": ["RED_CIRCLE","red_circle","الدوائر الحمراء","red circle"],
     "الدوائر الخضراء": ["GREEN_CIRCLE","green_circle","الدوائر الخضراء","green circle"],
 }
