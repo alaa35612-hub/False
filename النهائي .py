@@ -73,6 +73,11 @@ ANSI_SYMBOL = ANSI_VALUE_POS
 ANSI_ALERT_BULL = ANSI_VALUE_POS
 ANSI_ALERT_BEAR = ANSI_VALUE_NEG
 
+# --------------------------- إعدادات تلجرام ---------------------------
+# ضع التوكن والآي دي هنا إذا لم ترغب باستخدام متغيرات البيئة.
+TELEGRAM_BOT_TOKEN = ""
+TELEGRAM_CHAT_ID = ""
+
 ALERT_BULLISH_KEYWORDS = (
     "bull",
     "bullish",
@@ -111,10 +116,13 @@ ANSI_HEADER_COLORS = [
 class _EditorAutorunDefaults:
     timeframe: str = "1m"
     candle_limit: int = 500
-    max_symbols: int = 600
-    recent_bars: int = 2
+    max_symbols: int = 500
+    recent_bars: int = 1
     continuous_scan: bool = False
     scan_interval: float = 0.0
+    scan_workers: int = 6
+    scan_chunk_size: int = 80
+    scan_throttle: float = 0.05
     height_metric: str = "percentage"
     height_scope: Optional[str] = None
     height_threshold: Optional[float] = None
@@ -7390,6 +7398,8 @@ def _bulk_fetch_recent_ohlcv(
     symbols: Sequence[str],
     timeframe: str,
     candle_window: int,
+    max_workers: Optional[int] = None,
+    throttle_s: float = 0.0,
 ) -> Dict[str, Sequence[Sequence[Any]]]:
     """Fetch OHLC candles in parallel when possible to speed up filtering."""
 
@@ -7411,7 +7421,8 @@ def _bulk_fetch_recent_ohlcv(
 
     results: Dict[str, Sequence[Sequence[Any]]] = {}
     endpoint = "https://fapi.binance.com/fapi/v1/klines"
-    max_workers = min(8, max(1, len(unique_symbols)))
+    resolved_workers = max_workers or min(8, max(1, len(unique_symbols)))
+    max_workers = max(1, resolved_workers)
     timeout = (3.05, 10.0)
 
     session: Optional[requests.Session]
@@ -7452,6 +7463,9 @@ def _bulk_fetch_recent_ohlcv(
                 flush=True,
             )
             return _fetch_recent_ohlcv(exchange, symbol, timeframe, candle_window)
+        finally:
+            if throttle_s > 0:
+                time.sleep(throttle_s)
 
         if not isinstance(payload, list):
             return _fetch_recent_ohlcv(exchange, symbol, timeframe, candle_window)
@@ -9174,20 +9188,49 @@ class _CLISettings:
     include_only: str = ""
 
 def _get_secret(name: str) -> Optional[str]:
-    return os.environ.get(name)
+    value = os.environ.get(name)
+    if value:
+        return value
+    if name == "TELEGRAM_BOT_TOKEN":
+        return TELEGRAM_BOT_TOKEN or None
+    if name == "TELEGRAM_CHAT_ID":
+        return TELEGRAM_CHAT_ID or None
+    return None
 
-def _send_tg(cfg: _CLISettings, lines: List[str]) -> None:
+def _send_tg(cfg: _CLISettings, lines: List[str]) -> bool:
     if not cfg.tg_enable:
-        return
+        return False
     token = _get_secret("TELEGRAM_BOT_TOKEN")
     chat_id = _get_secret("TELEGRAM_CHAT_ID")
-    if not token or not chat_id or requests is None:
-        return
+    if not token or not chat_id:
+        print("تحذير: Telegram غير مفعّل لأن التوكن أو الـ chat_id مفقود.", flush=True)
+        return False
+    if requests is None:
+        print("تحذير: مكتبة requests غير متوفرة لإرسال Telegram.", flush=True)
+        return False
+    payload = "\n".join(lines)
+    if not payload.strip():
+        return False
+    max_len = 3900
+    chunks = [payload[i : i + max_len] for i in range(0, len(payload), max_len)]
     try:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        requests.post(url, data={"chat_id": chat_id, "text": "\n".join(lines), "parse_mode": "HTML"}, timeout=8)
-    except Exception:
-        pass
+        for chunk in chunks:
+            response = requests.post(
+                url,
+                data={"chat_id": chat_id, "text": chunk},
+                timeout=8,
+            )
+            if response.status_code != 200:
+                print(
+                    f"تحذير: فشل إرسال Telegram (HTTP {response.status_code}): {response.text}",
+                    flush=True,
+                )
+                return False
+    except Exception as exc:
+        print(f"تحذير: فشل إرسال Telegram: {exc}", flush=True)
+        return False
+    return True
 
 # ----------------------------- Symbol Picker ----------------------------------
 def _build_exchange(market: str):
@@ -9488,6 +9531,48 @@ def _fetch_pct_change(exchange, symbol):
     except Exception:
         return None
 
+
+def _strip_ansi(text: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", text)
+
+
+def _latest_signal_lines(runtime, *, colorize: bool) -> List[str]:
+    latest = _extract_latest_from_runtime(runtime)
+    if not latest:
+        return []
+    time_to_close: Dict[int, float] = {}
+    last_close: Optional[float] = None
+    try:
+        series = runtime.series
+        times = getattr(series, "time", None)
+        closes = getattr(series, "close", None)
+        if isinstance(times, list) and isinstance(closes, list) and len(times) == len(closes):
+            time_to_close = dict(zip(times, closes))
+        last_close = series.get("close")
+    except Exception:
+        last_close = None
+
+    lines: List[str] = []
+    for name in _LAST_BUCKETS.keys():
+        item = latest.get(name)
+        if not item:
+            continue
+        ts, title = item
+        try:
+            ts_s = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts / 1000)) if ts else "—"
+        except Exception:
+            ts_s = "—"
+        raw_title = title or ""
+        display_title = _colorize_directional_text(raw_title) if colorize else _strip_ansi(raw_title)
+        price = None
+        if isinstance(ts, (int, float)):
+            price = time_to_close.get(int(ts))
+        if price is None:
+            price = last_close
+        price_s = _ar_num(price) if price is not None else "—"
+        lines.append(f"- {name}: {ts_s} UTC  |  {display_title}  |  السعر: {price_s}")
+    return lines
+
 def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
     ln = 0
     try:
@@ -9542,22 +9627,12 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
     print("شموع SCOB       :", c("SCOB"))
 
     print("\nأحدث الإشارات مع الأسعار")
-    if not recent_alerts:
+    latest_lines = _latest_signal_lines(runtime, colorize=True)
+    if not latest_lines:
         print("—")
     else:
-        # Latest per logic bucket
-        latest = _extract_latest_from_runtime(runtime)
-        for name in _LAST_BUCKETS.keys():
-            item = latest.get(name)
-            if not item:
-                continue
-            ts, title = item
-            try:
-                ts_s = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts/1000)) if ts else "—"
-            except Exception:
-                ts_s = "—"
-            colored_title = _colorize_directional_text(title)
-            print(f"- {name}: {ts_s} UTC  |  {colored_title}")
+        for line in latest_lines:
+            print(line)
     if ccxt is None:
         print("ccxt not installed. pip install ccxt", file=sys.stderr)
         return 2
@@ -9936,28 +10011,76 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
     print("شموع SCOB       :", c("SCOB"))
 
     print("\\nأحدث الإشارات مع الأسعار")
-    latest = _extract_latest_from_runtime(runtime)
-    if not latest:
+    latest_lines = _latest_signal_lines(runtime, colorize=True)
+    if not latest_lines:
         print("—")
     else:
-        for name in _LAST_BUCKETS.keys():
-            item = latest.get(name)
-            if not item: continue
-            ts, title = item
-            try:
-                ts_s = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts/1000)) if ts else "—"
-            except Exception:
-                ts_s = "—"
-            colored_title = _colorize_directional_text(title)
-            print(f"- {name}: {ts_s} UTC  |  {colored_title}")
+        for line in latest_lines:
+            print(line)
 
 # ---------- Live exchange helpers (Futures-only) ----------
 def _build_exchange(_market_forced_usdtm:str="usdtm"):
     return ccxt.binanceusdm({"enableRateLimit": True})
 
 def fetch_ohlcv(ex, symbol, timeframe, limit):
-    ex.load_markets()
+    if not getattr(ex, "markets", None):
+        ex.load_markets()
     return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+
+
+def _candle_rows_to_dicts(candles: Sequence[Sequence[Any]]) -> List[Dict[str, float]]:
+    def _to_float(value: Any) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float("nan")
+
+    def _to_int(value: Any) -> int:
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return 0
+
+    return [
+        {
+            "time": _to_int(c[0]),
+            "open": _to_float(c[1]),
+            "high": _to_float(c[2]),
+            "low": _to_float(c[3]),
+            "close": _to_float(c[4]),
+            "volume": _to_float(c[5]) if len(c) > 5 else float("nan"),
+        }
+        for c in candles
+    ]
+
+
+def _fetch_candles_batch(
+    exchange: Any,
+    symbols: Sequence[str],
+    timeframe: str,
+    limit: int,
+    max_workers: int,
+    throttle_s: float,
+) -> Dict[str, Sequence[Sequence[Any]]]:
+    if not symbols:
+        return {}
+    if requests is None:
+        results: Dict[str, Sequence[Sequence[Any]]] = {}
+        for symbol in symbols:
+            results[symbol] = fetch_ohlcv(exchange, symbol, timeframe, limit)
+            if throttle_s > 0:
+                time.sleep(throttle_s)
+        return results
+    return _bulk_fetch_recent_ohlcv(
+        exchange,
+        symbols,
+        timeframe,
+        limit,
+        max_workers=max_workers,
+        throttle_s=throttle_s,
+    )
+
+
 
 # ---------- Settings & argument parsing ----------
 class Settings:
@@ -9994,6 +10117,9 @@ class Settings:
         self.structure_requires_wick = kw.get("structure_requires_wick", False)
         self.mtf_lookahead = kw.get("mtf_lookahead", False)
         self.zone_type = kw.get("zone_type", "Mother Bar")
+        self.scan_workers = kw.get("scan_workers", EDITOR_AUTORUN_DEFAULTS.scan_workers)
+        self.scan_chunk_size = kw.get("scan_chunk_size", EDITOR_AUTORUN_DEFAULTS.scan_chunk_size)
+        self.scan_throttle = kw.get("scan_throttle", EDITOR_AUTORUN_DEFAULTS.scan_throttle)
         raw_threshold = kw.get("min_change", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_threshold)
         try:
             self.min_change = float(raw_threshold) if raw_threshold is not None else None
@@ -10049,6 +10175,24 @@ def _parse_args_android():
     p.add_argument("--timeframe", "-t", default=EDITOR_AUTORUN_DEFAULTS.timeframe)
     p.add_argument("--limit", "-l", type=int, default=EDITOR_AUTORUN_DEFAULTS.candle_limit)
     p.add_argument("--max-symbols", "-n", type=int, default=EDITOR_AUTORUN_DEFAULTS.max_symbols)
+    p.add_argument(
+        "--scan-workers",
+        type=int,
+        default=EDITOR_AUTORUN_DEFAULTS.scan_workers,
+        help="عدد العمال المتوازيين لجلب الشموع (لزيادة السرعة مع الحفاظ على الحظر).",
+    )
+    p.add_argument(
+        "--scan-chunk-size",
+        type=int,
+        default=EDITOR_AUTORUN_DEFAULTS.scan_chunk_size,
+        help="حجم الدفعة عند جلب الشموع على شكل مجموعات.",
+    )
+    p.add_argument(
+        "--scan-throttle",
+        type=float,
+        default=EDITOR_AUTORUN_DEFAULTS.scan_throttle,
+        help="فاصل زمني بسيط بالثواني بين طلبات الشموع لتقليل الحظر.",
+    )
     p.add_argument("--mitigation", choices=["WICK","CLOSE"], default="CLOSE")
     p.add_argument("--tg", action="store_true", default=False)
     p.add_argument("--symbol", "-s", default="")
@@ -10152,6 +10296,12 @@ def _parse_args_android():
         p.error("--limit must be > 0")
     if args.max_symbols <= 0:
         p.error("--max-symbols must be > 0")
+    if args.scan_workers <= 0:
+        p.error("--scan-workers يجب أن يكون رقمًا موجبًا")
+    if args.scan_chunk_size <= 0:
+        p.error("--scan-chunk-size يجب أن يكون رقمًا موجبًا")
+    if args.scan_throttle < 0:
+        p.error("--scan-throttle يجب أن يكون رقمًا غير سالب")
     if args.recent <= 0:
         p.error("--recent يجب أن يكون رقمًا موجبًا")
     if args.height_candles is not None and args.height_candles <= 0:
@@ -10215,6 +10365,9 @@ def _parse_args_android():
         zone_type=zone_type,
         drop_last_incomplete=args.drop_last,
         max_scan=args.max_symbols,
+        scan_workers=args.scan_workers,
+        scan_chunk_size=args.scan_chunk_size,
+        scan_throttle=args.scan_throttle,
         min_change=args.min_change,
         height_candle_window=args.height_candles,
         height_scope=height_scope,
@@ -10296,6 +10449,11 @@ def _android_cli_entry() -> int:
     recent_window = max(1, args.recent)
 
     ex = _build_exchange(getattr(cfg, "market", 'usdtm'))
+    if not getattr(ex, "markets", None):
+        try:
+            ex.load_markets()
+        except Exception:
+            pass
 
     try:
         SmartMoneyAlgoProE5
@@ -10329,7 +10487,7 @@ def _android_cli_entry() -> int:
         fvg=fvg, liquidity=liq, demand_supply=ds, order_block=ob,
         structure_util=utils, ict_structure=ict,
     )
-    inputs.console.max_age_bars = max(1, recent_window - 1)
+    inputs.console.max_age_bars = max(0, recent_window - 1)
 
     symbol_override = args.symbol or None
     iteration = 0
@@ -10348,56 +10506,72 @@ def _android_cli_entry() -> int:
                     pass
             alerts_total = 0
 
-            for i, sym in enumerate(symbols, 1):
-                try:
-                    candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
-                    if cfg.drop_last_incomplete and candles:
-                        candles = candles[:-1]
-                    runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
-                    runtime._bos_break_source = cfg.bos_confirmation
-                    runtime._strict_close_for_break = cfg.strict_close_for_break
-                    runtime.process([
-                        {"time": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5] if len(c)>5 else float('nan')}
-                        for c in candles
-                    ])
-                except Exception as e:
-                    print(
-                        f"[{i}/{len(symbols)}] {_format_symbol(sym)}: error {e}",
-                        file=sys.stderr,
-                    )
-                    continue
-
-                metrics = runtime.gather_console_metrics()
-                latest_events = metrics.get("latest_events") or {}
-                recent_hits, _ = _collect_recent_event_hits(
-                    runtime.series, latest_events, bars=recent_window
+            total_symbols = len(symbols)
+            chunk_size = max(1, int(cfg.scan_chunk_size))
+            for chunk_start in range(0, total_symbols, chunk_size):
+                chunk = symbols[chunk_start : chunk_start + chunk_size]
+                candle_map = _fetch_candles_batch(
+                    ex,
+                    chunk,
+                    args.timeframe,
+                    args.limit,
+                    int(cfg.scan_workers),
+                    float(cfg.scan_throttle),
                 )
-                if not recent_hits:
-                    if recent_window == 1:
-                        span_phrase = "آخر شمعة واحدة"
-                    elif recent_window == 2:
-                        span_phrase = "آخر شمعتين"
-                    else:
-                        span_phrase = f"آخر {recent_window} شموع"
-                    print(
-                        f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال {span_phrase}"
-                    )
-                    continue
-
-                recent_alerts = list(getattr(runtime, "alerts", []))
-                if recent_window > 0 and hasattr(runtime, "series") and runtime.series.length() > 0:
+                for offset, sym in enumerate(chunk, start=chunk_start + 1):
+                    i = offset
                     try:
-                        cutoff_idx = max(0, runtime.series.length() - recent_window)
-                        cutoff_time = runtime.series.get_time(cutoff_idx)
-                        if cutoff_time:
-                            recent_alerts = [
-                                (ts, title) for ts, title in recent_alerts if ts >= cutoff_time
-                            ]
-                    except Exception:
-                        pass
+                        candles = candle_map.get(sym) or fetch_ohlcv(ex, sym, args.timeframe, args.limit)
+                        if cfg.drop_last_incomplete and candles:
+                            candles = candles[:-1]
+                        runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
+                        runtime._bos_break_source = cfg.bos_confirmation
+                        runtime._strict_close_for_break = cfg.strict_close_for_break
+                        runtime.process(_candle_rows_to_dicts(candles))
+                    except Exception as e:
+                        print(
+                            f"[{i}/{total_symbols}] {_format_symbol(sym)}: error {e}",
+                            file=sys.stderr,
+                        )
+                        continue
 
-                if recent_alerts or args.verbose:
+                    metrics = runtime.gather_console_metrics()
+                    latest_events = metrics.get("latest_events") or {}
+                    recent_hits, _ = _collect_recent_event_hits(
+                        runtime.series, latest_events, bars=recent_window
+                    )
+                    if not recent_hits:
+                        if recent_window == 1:
+                            span_phrase = "آخر شمعة واحدة"
+                        elif recent_window == 2:
+                            span_phrase = "آخر شمعتين"
+                        else:
+                            span_phrase = f"آخر {recent_window} شموع"
+                        print(
+                            f"[{i}/{total_symbols}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال {span_phrase}"
+                        )
+                        continue
+
+                    recent_alerts = list(getattr(runtime, "alerts", []))
+                    if recent_window > 0 and hasattr(runtime, "series") and runtime.series.length() > 0:
+                        try:
+                            cutoff_idx = max(0, runtime.series.length() - recent_window)
+                            cutoff_time = runtime.series.get_time(cutoff_idx)
+                            if cutoff_time:
+                                recent_alerts = [
+                                    (ts, title) for ts, title in recent_alerts if ts >= cutoff_time
+                                ]
+                        except Exception:
+                            pass
+
                     _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
+                    if cfg.tg_enable:
+                        try:
+                            tg_lines = _latest_signal_lines(runtime, colorize=False)
+                            if tg_lines:
+                                _send_tg(cfg, [f"{_format_symbol(sym)} {args.timeframe}"] + tg_lines)
+                        except Exception:
+                            pass
                     alerts_total += len(recent_alerts)
 
             if args.verbose:
