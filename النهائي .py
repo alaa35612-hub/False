@@ -73,6 +73,11 @@ ANSI_SYMBOL = ANSI_VALUE_POS
 ANSI_ALERT_BULL = ANSI_VALUE_POS
 ANSI_ALERT_BEAR = ANSI_VALUE_NEG
 
+# --------------------------- إعدادات تلجرام ---------------------------
+# ضع التوكن والآي دي هنا إذا لم ترغب باستخدام متغيرات البيئة.
+TELEGRAM_BOT_TOKEN = ""
+TELEGRAM_CHAT_ID = ""
+
 ALERT_BULLISH_KEYWORDS = (
     "bull",
     "bullish",
@@ -111,10 +116,13 @@ ANSI_HEADER_COLORS = [
 class _EditorAutorunDefaults:
     timeframe: str = "1m"
     candle_limit: int = 500
-    max_symbols: int = 600
-    recent_bars: int = 2
+    max_symbols: int = 500
+    recent_bars: int = 1
     continuous_scan: bool = False
     scan_interval: float = 0.0
+    scan_workers: int = 6
+    scan_chunk_size: int = 80
+    scan_throttle: float = 0.05
     height_metric: str = "percentage"
     height_scope: Optional[str] = None
     height_threshold: Optional[float] = None
@@ -1336,6 +1344,8 @@ class SmartMoneyAlgoProE5:
         self.bar_colors: List[Tuple[int, str]] = []
         self.console_event_log: Dict[str, Dict[str, Any]] = {}
         self.console_box_status_tally: Dict[str, Counter[str]] = defaultdict(Counter)
+        self.future_labels: List[Dict[str, Any]] = []
+        self.touched_boxes: set[int] = set()
         console_inputs = getattr(self.inputs, "console", None)
         if console_inputs is None:
             max_age = 1
@@ -1587,6 +1597,10 @@ class SmartMoneyAlgoProE5:
             elif label.color == self.inputs.structure.bull:
                 key = "GREEN_CIRCLE"
         if key:
+            if key == "FUTURE_BOS":
+                self._track_future_label(label, "BOS")
+            elif key == "FUTURE_CHOCH":
+                self._track_future_label(label, "CHOCH")
             if key in ("BOS", "CHOCH"):
                 existing = self.console_event_log.get(key)
                 if existing and existing.get("source") == "confirmed":
@@ -1599,6 +1613,58 @@ class SmartMoneyAlgoProE5:
                 "display": f"{label.text} @ {format_price(label.y)}",
             }
             self._trace("label", "register", timestamp=label.x, key=key, text=label.text, price=label.y)
+
+    def _track_future_label(self, label: Label, label_type: str) -> None:
+        if not isinstance(label, Label):
+            return
+        for item in self.future_labels:
+            if (
+                item.get("type") == label_type
+                and item.get("price") == label.y
+                and item.get("time") == label.x
+                and item.get("text") == label.text
+            ):
+                return
+        self.future_labels.append(
+            {
+                "type": label_type,
+                "price": label.y,
+                "time": label.x,
+                "text": label.text,
+                "touched": False,
+            }
+        )
+
+    def _check_future_label_touches(self, high: float, low: float, time_val: int) -> None:
+        if not self.future_labels:
+            return
+        for item in self.future_labels:
+            if item.get("touched"):
+                continue
+            price = item.get("price")
+            if not isinstance(price, (int, float)):
+                continue
+            if low <= price <= high:
+                item["touched"] = True
+                label_type = item.get("type")
+                key = "FUTURE_CHOCH_TOUCHED" if label_type == "CHOCH" else "FUTURE_BOS_TOUCHED"
+                text = item.get("text") or ("CHoCH -" if label_type == "CHOCH" else "B O S -")
+                display = f"Future {text} touched @ {format_price(price)}"
+                self.console_event_log[key] = {
+                    "text": text,
+                    "price": price,
+                    "time": time_val,
+                    "time_display": format_timestamp(time_val),
+                    "display": display,
+                }
+                self._trace(
+                    "future_label",
+                    "touched",
+                    timestamp=time_val,
+                    key=key,
+                    text=text,
+                    price=price,
+                )
 
     def _register_structure_break_event(
         self,
@@ -1649,6 +1715,20 @@ class SmartMoneyAlgoProE5:
                 "status": status,
                 "status_display": status_label,
             }
+            if status == "touched" and key in {"IDM_OB", "EXT_OB", "GOLDEN_ZONE"}:
+                box_id = id(box)
+                if box_id not in self.touched_boxes:
+                    self.touched_boxes.add(box_id)
+                    touched_key = f"{key}_TOUCHED"
+                    self.console_event_log[touched_key] = {
+                        "text": box.text,
+                        "price": (box.bottom, box.top),
+                        "time": ts,
+                        "time_display": format_timestamp(ts),
+                        "display": f"{box.text} touched {format_price(box.bottom)} → {format_price(box.top)}",
+                        "status": "touched",
+                        "status_display": status_label,
+                    }
             self._trace(
                 "box",
                 "register",
@@ -1659,17 +1739,6 @@ class SmartMoneyAlgoProE5:
                 bottom=box.bottom,
                 status=status,
             )
-            if status_key == "new":
-                alert_titles = {
-                    "IDM_OB": "IDM OB Zone Created",
-                    "EXT_OB": "EXT OB Zone Created",
-                    "GOLDEN_ZONE": "Golden Zone Created",
-                }
-                alert_title = alert_titles.get(key)
-                if alert_title:
-                    price_range = f"{format_price(box.bottom)} → {format_price(box.top)}"
-                    message = f"{{ticker}} {box.text} Created, Range: {price_range}"
-                    self.alertcondition(True, alert_title, message)
 
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
         events: Dict[str, Dict[str, Any]] = {}
@@ -1702,10 +1771,20 @@ class SmartMoneyAlgoProE5:
                     }
                     break
 
+        def _set_if_newer(key: str, payload: Dict[str, Any]) -> None:
+            existing = events.get(key)
+            if existing and isinstance(existing.get("time"), (int, float)) and isinstance(
+                payload.get("time"), (int, float)
+            ):
+                if payload["time"] < existing["time"]:
+                    return
+            events[key] = payload
+
         def record_box(
             key: str,
             predicate: Callable[[Box], bool],
             sources: Optional[Sequence[Iterable[Box]]] = None,
+            label: Optional[str] = None,
         ) -> None:
             iterables = sources or (self.boxes,)
             for source in iterables:
@@ -1721,10 +1800,11 @@ class SmartMoneyAlgoProE5:
                     if not self._console_event_within_age(bx.left):
                         continue
                     if predicate(bx):
-                        events[key] = {
-                            "text": bx.text,
+                        name = label or bx.text
+                        payload = {
+                            "text": name,
                             "price": (bx.bottom, bx.top),
-                            "display": f"{bx.text} {format_price(bx.bottom)} → {format_price(bx.top)}",
+                            "display": f"{name} {format_price(bx.bottom)} → {format_price(bx.top)}",
                             "time": bx.left,
                             "time_display": format_timestamp(bx.left),
                             "status": events.get(key, {}).get("status", "active"),
@@ -1733,6 +1813,40 @@ class SmartMoneyAlgoProE5:
                                 self.BOX_STATUS_LABELS.get("active", "active"),
                             ),
                         }
+                        _set_if_newer(key, payload)
+                        return
+
+        def record_line(
+            key: str,
+            predicate: Callable[[Line], bool],
+            sources: Optional[Sequence[Iterable[Line]]] = None,
+            label: Optional[str] = None,
+        ) -> None:
+            iterables = sources or (self.lines,)
+            for source in iterables:
+                if isinstance(source, PineArray):
+                    seq = list(source.values)
+                elif isinstance(source, list):
+                    seq = source
+                else:
+                    seq = list(source)
+                for ln in reversed(seq):
+                    if not isinstance(ln, Line):
+                        continue
+                    event_time = max(getattr(ln, "x1", 0), getattr(ln, "x2", 0))
+                    if not self._console_event_within_age(event_time):
+                        continue
+                    if predicate(ln):
+                        price = ln.get_y1()
+                        name = label or key
+                        payload = {
+                            "text": name,
+                            "price": price,
+                            "display": f"{name} @ {format_price(price)}",
+                            "time": event_time,
+                            "time_display": format_timestamp(event_time),
+                        }
+                        _set_if_newer(key, payload)
                         return
 
         bull_color = self.inputs.structure.bull
@@ -1788,6 +1902,55 @@ class SmartMoneyAlgoProE5:
             sources=(self.hist_ext_boxes, self.boxes),
         )
         record_box("GOLDEN_ZONE", lambda bx: bx.text == "Golden zone")
+
+        liquidity_high_lines = getattr(self, "liquidity_high_lines", PineArray())
+        liquidity_low_lines = getattr(self, "liquidity_low_lines", PineArray())
+        liquidity_high_boxes = getattr(self, "liquidity_high_boxes", PineArray())
+        liquidity_low_boxes = getattr(self, "liquidity_low_boxes", PineArray())
+        high_line_htf = getattr(self, "highLineArrayHTF", PineArray())
+        low_line_htf = getattr(self, "lowLineArrayHTF", PineArray())
+        high_box_htf = getattr(self, "highBoxArrayHTF", PineArray())
+        low_box_htf = getattr(self, "lowBoxArrayHTF", PineArray())
+
+        record_line(
+            "LIQUIDITY_HIGH",
+            lambda ln: True,
+            sources=(liquidity_high_lines, high_line_htf),
+            label="Liquidity High",
+        )
+        record_line(
+            "LIQUIDITY_LOW",
+            lambda ln: True,
+            sources=(liquidity_low_lines, low_line_htf),
+            label="Liquidity Low",
+        )
+        record_box(
+            "LIQUIDITY_HIGH",
+            lambda bx: True,
+            sources=(liquidity_high_boxes, high_box_htf),
+            label="Liquidity High",
+        )
+        record_box(
+            "LIQUIDITY_LOW",
+            lambda bx: True,
+            sources=(liquidity_low_boxes, low_box_htf),
+            label="Liquidity Low",
+        )
+
+        bullish_gap_holder = getattr(self, "bullish_gap_holder", PineArray())
+        bearish_gap_holder = getattr(self, "bearish_gap_holder", PineArray())
+        record_box(
+            "FVG_BULLISH",
+            lambda bx: True,
+            sources=(bullish_gap_holder,),
+            label="FVG Bullish",
+        )
+        record_box(
+            "FVG_BEARISH",
+            lambda bx: True,
+            sources=(bearish_gap_holder,),
+            label="FVG Bearish",
+        )
 
         return events
 
@@ -7097,8 +7260,7 @@ class SmartMoneyAlgoProE5:
         # Order block zone processing ---------------------------------------
         isAlertextidmSell = self.processZones(self.supplyZone, True, self.supplyZoneIsMit)
         isAlertextidmBuy = self.processZones(self.demandZone, False, self.demandZoneIsMit)
-        self.alertcondition(isAlertextidmSell, "IDM EXT Alert Supply", "IDM EXT Alert Supply")
-        self.alertcondition(isAlertextidmBuy, "IDM EXT Alert Demand", "IDM EXT Alert Demand")
+        # IDM EXT alerts intentionally disabled per latest requirement.
 
         # POI sweeps ---------------------------------------------------------
         if self.inputs.order_block.showPOI and self.series.length() > 4:
@@ -7224,6 +7386,7 @@ class SmartMoneyAlgoProE5:
                 self.bxty = 1 if dir_up else -1
                 self.prev_oi1 = float(oi1)
 
+        self._check_future_label_touches(high, low, time_val)
         self._sync_state_mirrors()
 
 
@@ -7390,6 +7553,8 @@ def _bulk_fetch_recent_ohlcv(
     symbols: Sequence[str],
     timeframe: str,
     candle_window: int,
+    max_workers: Optional[int] = None,
+    throttle_s: float = 0.0,
 ) -> Dict[str, Sequence[Sequence[Any]]]:
     """Fetch OHLC candles in parallel when possible to speed up filtering."""
 
@@ -7411,7 +7576,8 @@ def _bulk_fetch_recent_ohlcv(
 
     results: Dict[str, Sequence[Sequence[Any]]] = {}
     endpoint = "https://fapi.binance.com/fapi/v1/klines"
-    max_workers = min(8, max(1, len(unique_symbols)))
+    resolved_workers = max_workers or min(8, max(1, len(unique_symbols)))
+    max_workers = max(1, resolved_workers)
     timeout = (3.05, 10.0)
 
     session: Optional[requests.Session]
@@ -7452,6 +7618,9 @@ def _bulk_fetch_recent_ohlcv(
                 flush=True,
             )
             return _fetch_recent_ohlcv(exchange, symbol, timeframe, candle_window)
+        finally:
+            if throttle_s > 0:
+                time.sleep(throttle_s)
 
         if not isinstance(payload, list):
             return _fetch_recent_ohlcv(exchange, symbol, timeframe, candle_window)
@@ -8617,7 +8786,16 @@ EVENT_DISPLAY_ORDER = [
     ("HIST_IDM_OB", "Hist IDM OB"),
     ("HIST_EXT_OB", "Hist EXT OB"),
     ("GOLDEN_ZONE", "Golden zone"),
+    ("IDM_OB_TOUCHED", "IDM OB Touched"),
+    ("EXT_OB_TOUCHED", "EXT OB Touched"),
+    ("GOLDEN_ZONE_TOUCHED", "Golden zone Touched"),
+    ("FUTURE_BOS_TOUCHED", "Future BOS Touched"),
+    ("FUTURE_CHOCH_TOUCHED", "Future CHOCH Touched"),
     ("X", "X"),
+    ("LIQUIDITY_HIGH", "Liquidity High"),
+    ("LIQUIDITY_LOW", "Liquidity Low"),
+    ("FVG_BULLISH", "FVG Bullish"),
+    ("FVG_BEARISH", "FVG Bearish"),
     ("RED_CIRCLE", "الدوائر الحمراء"),
     ("GREEN_CIRCLE", "الدوائر الخضراء"),
     ("FUTURE_BOS", "ليبل BOS المستقبلي"),
@@ -9174,20 +9352,49 @@ class _CLISettings:
     include_only: str = ""
 
 def _get_secret(name: str) -> Optional[str]:
-    return os.environ.get(name)
+    value = os.environ.get(name)
+    if value:
+        return value
+    if name == "TELEGRAM_BOT_TOKEN":
+        return TELEGRAM_BOT_TOKEN or None
+    if name == "TELEGRAM_CHAT_ID":
+        return TELEGRAM_CHAT_ID or None
+    return None
 
-def _send_tg(cfg: _CLISettings, lines: List[str]) -> None:
+def _send_tg(cfg: _CLISettings, lines: List[str]) -> bool:
     if not cfg.tg_enable:
-        return
+        return False
     token = _get_secret("TELEGRAM_BOT_TOKEN")
     chat_id = _get_secret("TELEGRAM_CHAT_ID")
-    if not token or not chat_id or requests is None:
-        return
+    if not token or not chat_id:
+        print("تحذير: Telegram غير مفعّل لأن التوكن أو الـ chat_id مفقود.", flush=True)
+        return False
+    if requests is None:
+        print("تحذير: مكتبة requests غير متوفرة لإرسال Telegram.", flush=True)
+        return False
+    payload = "\n".join(lines)
+    if not payload.strip():
+        return False
+    max_len = 3900
+    chunks = [payload[i : i + max_len] for i in range(0, len(payload), max_len)]
     try:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        requests.post(url, data={"chat_id": chat_id, "text": "\n".join(lines), "parse_mode": "HTML"}, timeout=8)
-    except Exception:
-        pass
+        for chunk in chunks:
+            response = requests.post(
+                url,
+                data={"chat_id": chat_id, "text": chunk},
+                timeout=8,
+            )
+            if response.status_code != 200:
+                print(
+                    f"تحذير: فشل إرسال Telegram (HTTP {response.status_code}): {response.text}",
+                    flush=True,
+                )
+                return False
+    except Exception as exc:
+        print(f"تحذير: فشل إرسال Telegram: {exc}", flush=True)
+        return False
+    return True
 
 # ----------------------------- Symbol Picker ----------------------------------
 def _build_exchange(market: str):
@@ -9359,26 +9566,52 @@ _AR_KEYS = {
 # Buckets for "latest per logic"
 _LAST_BUCKETS = {
     "BOS": ["bos", "b 0 s"],
+    "BOS+": ["bos+", "bos +", "b o s+"],
     "CHOCH": ["choch", "ch o ch"],
+    "MSS+": ["mss+", "mss +"],
+    "MSS": ["mss"],
     "Golden zone": ["golden zone"],
+    "IDM OB Touched": ["idm ob touched"],
+    "EXT OB Touched": ["ext ob touched"],
+    "Golden zone Touched": ["golden zone touched"],
     "IDM": ["idm @", " i d m "],
     "EXT OB": ["ext ob", "ext_ob", "ext  ob"],
     "IDM OB": ["idm ob"],
     "Hist IDM OB": ["hist idm ob"],
     "Hist EXT OB": ["hist ext ob"],
+    "Future BOS Touched": ["future b o s", "future bos touched"],
+    "Future CHOCH Touched": ["future choch", "future choch touched"],
+    "X": ["x"],
+    "Liquidity High": ["liquidity high"],
+    "Liquidity Low": ["liquidity low"],
+    "FVG Bullish": ["fvg bullish"],
+    "FVG Bearish": ["fvg bearish"],
     "الدوائر الحمراء": ["الدوائر الحمراء", "red circle"],
     "الدوائر الخضراء": ["الدوائر الخضراء", "green circle"],
 }
 # ---- Bind to indicator metrics if available ----
 _METRIC_MAP = {
     "BOS": ["BOS", "bos"],
+    "BOS+": ["BOS_PLUS", "bos_plus"],
     "CHOCH": ["CHOCH", "choch"],
+    "MSS+": ["MSS_PLUS", "mss_plus"],
+    "MSS": ["MSS", "mss"],
     "Golden zone": ["GOLDEN_ZONE", "golden_zone", "GZ"],
+    "IDM OB Touched": ["IDM_OB_TOUCHED", "idm_ob_touched"],
+    "EXT OB Touched": ["EXT_OB_TOUCHED", "ext_ob_touched"],
+    "Golden zone Touched": ["GOLDEN_ZONE_TOUCHED", "golden_zone_touched"],
     "IDM": ["IDM", "idm"],
     "EXT OB": ["EXT_OB", "ext_ob", "EXT-OB"],
     "IDM OB": ["IDM_OB", "idm_ob"],
     "Hist IDM OB": ["HIST_IDM_OB", "hist_idm_ob"],
     "Hist EXT OB": ["HIST_EXT_OB", "hist_ext_ob"],
+    "Future BOS Touched": ["FUTURE_BOS_TOUCHED", "future_bos_touched"],
+    "Future CHOCH Touched": ["FUTURE_CHOCH_TOUCHED", "future_choch_touched"],
+    "X": ["X", "x"],
+    "Liquidity High": ["LIQUIDITY_HIGH", "liquidity_high"],
+    "Liquidity Low": ["LIQUIDITY_LOW", "liquidity_low"],
+    "FVG Bullish": ["FVG_BULLISH", "fvg_bullish"],
+    "FVG Bearish": ["FVG_BEARISH", "fvg_bearish"],
     "الدوائر الحمراء": ["RED_CIRCLE", "red_circle", "RED_CIRCLES"],
     "الدوائر الخضراء": ["GREEN_CIRCLE", "green_circle", "GREEN_CIRCLES"],
 }
@@ -9488,6 +9721,48 @@ def _fetch_pct_change(exchange, symbol):
     except Exception:
         return None
 
+
+def _strip_ansi(text: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", text)
+
+
+def _latest_signal_lines(runtime, *, colorize: bool) -> List[str]:
+    latest = _extract_latest_from_runtime(runtime)
+    if not latest:
+        return []
+    time_to_close: Dict[int, float] = {}
+    last_close: Optional[float] = None
+    try:
+        series = runtime.series
+        times = getattr(series, "time", None)
+        closes = getattr(series, "close", None)
+        if isinstance(times, list) and isinstance(closes, list) and len(times) == len(closes):
+            time_to_close = dict(zip(times, closes))
+        last_close = series.get("close")
+    except Exception:
+        last_close = None
+
+    lines: List[str] = []
+    for name in _LAST_BUCKETS.keys():
+        item = latest.get(name)
+        if not item:
+            continue
+        ts, title = item
+        try:
+            ts_s = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts / 1000)) if ts else "—"
+        except Exception:
+            ts_s = "—"
+        raw_title = title or ""
+        display_title = _colorize_directional_text(raw_title) if colorize else _strip_ansi(raw_title)
+        price = None
+        if isinstance(ts, (int, float)):
+            price = time_to_close.get(int(ts))
+        if price is None:
+            price = last_close
+        price_s = _ar_num(price) if price is not None else "—"
+        lines.append(f"- {name}: {ts_s} UTC  |  {display_title}  |  السعر: {price_s}")
+    return lines
+
 def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
     ln = 0
     try:
@@ -9542,22 +9817,12 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
     print("شموع SCOB       :", c("SCOB"))
 
     print("\nأحدث الإشارات مع الأسعار")
-    if not recent_alerts:
+    latest_lines = _latest_signal_lines(runtime, colorize=True)
+    if not latest_lines:
         print("—")
     else:
-        # Latest per logic bucket
-        latest = _extract_latest_from_runtime(runtime)
-        for name in _LAST_BUCKETS.keys():
-            item = latest.get(name)
-            if not item:
-                continue
-            ts, title = item
-            try:
-                ts_s = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts/1000)) if ts else "—"
-            except Exception:
-                ts_s = "—"
-            colored_title = _colorize_directional_text(title)
-            print(f"- {name}: {ts_s} UTC  |  {colored_title}")
+        for line in latest_lines:
+            print(line)
     if ccxt is None:
         print("ccxt not installed. pip install ccxt", file=sys.stderr)
         return 2
@@ -9758,13 +10023,26 @@ _AR_KEYS = {
 # منطق “آخر حدث لكل بند” / أسماء عربية مطلوبة
 _LAST_BUCKETS = {
     "BOS": ["bos","b 0 s"],
+    "BOS+": ["bos+","bos +","b o s+"],
     "CHOCH": ["choch","ch o ch"],
+    "MSS+": ["mss+","mss +"],
+    "MSS": ["mss"],
     "Golden zone": ["golden zone","gz"],
+    "IDM OB Touched": ["idm ob touched"],
+    "EXT OB Touched": ["ext ob touched"],
+    "Golden zone Touched": ["golden zone touched"],
     "IDM": ["idm"," i d m "],
     "EXT OB": ["ext ob","ext_ob"],
     "IDM OB": ["idm ob","idm_ob"],
     "Hist IDM OB": ["hist idm ob","hist_idm_ob"],
     "Hist EXT OB": ["hist ext ob","hist_ext_ob"],
+    "Future BOS Touched": ["future b o s","future bos touched"],
+    "Future CHOCH Touched": ["future choch","future choch touched"],
+    "X": ["x"],
+    "Liquidity High": ["liquidity high"],
+    "Liquidity Low": ["liquidity low"],
+    "FVG Bullish": ["fvg bullish"],
+    "FVG Bearish": ["fvg bearish"],
     "الدوائر الحمراء": ["الدوائر الحمراء","red circle"],
     "الدوائر الخضراء": ["الدوائر الخضراء","green circle"],
 }
@@ -9811,13 +10089,26 @@ _INT_KEYS = [
 
 _METRIC_MAP = {
     "BOS": ["BOS","bos","b 0 s"],
+    "BOS+": ["BOS_PLUS","bos_plus"],
     "CHOCH": ["CHOCH","choch","ch o ch"],
+    "MSS+": ["MSS_PLUS","mss_plus"],
+    "MSS": ["MSS","mss"],
     "Golden zone": ["GOLDEN_ZONE","golden_zone","gz","golden zone"],
+    "IDM OB Touched": ["IDM_OB_TOUCHED","idm_ob_touched"],
+    "EXT OB Touched": ["EXT_OB_TOUCHED","ext_ob_touched"],
+    "Golden zone Touched": ["GOLDEN_ZONE_TOUCHED","golden_zone_touched"],
     "IDM": ["IDM","idm"," i d m "],
     "EXT OB": ["EXT_OB","ext_ob","ext ob"],
     "IDM OB": ["IDM_OB","idm_ob","idm ob"],
     "Hist IDM OB": ["HIST_IDM_OB","hist_idm_ob","hist idm ob"],
     "Hist EXT OB": ["HIST_EXT_OB","hist_ext_ob","hist ext ob"],
+    "Future BOS Touched": ["FUTURE_BOS_TOUCHED","future_bos_touched"],
+    "Future CHOCH Touched": ["FUTURE_CHOCH_TOUCHED","future_choch_touched"],
+    "X": ["X","x"],
+    "Liquidity High": ["LIQUIDITY_HIGH","liquidity_high"],
+    "Liquidity Low": ["LIQUIDITY_LOW","liquidity_low"],
+    "FVG Bullish": ["FVG_BULLISH","fvg_bullish"],
+    "FVG Bearish": ["FVG_BEARISH","fvg_bearish"],
     "الدوائر الحمراء": ["RED_CIRCLE","red_circle","الدوائر الحمراء","red circle"],
     "الدوائر الخضراء": ["GREEN_CIRCLE","green_circle","الدوائر الخضراء","green circle"],
 }
@@ -9936,28 +10227,76 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
     print("شموع SCOB       :", c("SCOB"))
 
     print("\\nأحدث الإشارات مع الأسعار")
-    latest = _extract_latest_from_runtime(runtime)
-    if not latest:
+    latest_lines = _latest_signal_lines(runtime, colorize=True)
+    if not latest_lines:
         print("—")
     else:
-        for name in _LAST_BUCKETS.keys():
-            item = latest.get(name)
-            if not item: continue
-            ts, title = item
-            try:
-                ts_s = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts/1000)) if ts else "—"
-            except Exception:
-                ts_s = "—"
-            colored_title = _colorize_directional_text(title)
-            print(f"- {name}: {ts_s} UTC  |  {colored_title}")
+        for line in latest_lines:
+            print(line)
 
 # ---------- Live exchange helpers (Futures-only) ----------
 def _build_exchange(_market_forced_usdtm:str="usdtm"):
     return ccxt.binanceusdm({"enableRateLimit": True})
 
 def fetch_ohlcv(ex, symbol, timeframe, limit):
-    ex.load_markets()
+    if not getattr(ex, "markets", None):
+        ex.load_markets()
     return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+
+
+def _candle_rows_to_dicts(candles: Sequence[Sequence[Any]]) -> List[Dict[str, float]]:
+    def _to_float(value: Any) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float("nan")
+
+    def _to_int(value: Any) -> int:
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return 0
+
+    return [
+        {
+            "time": _to_int(c[0]),
+            "open": _to_float(c[1]),
+            "high": _to_float(c[2]),
+            "low": _to_float(c[3]),
+            "close": _to_float(c[4]),
+            "volume": _to_float(c[5]) if len(c) > 5 else float("nan"),
+        }
+        for c in candles
+    ]
+
+
+def _fetch_candles_batch(
+    exchange: Any,
+    symbols: Sequence[str],
+    timeframe: str,
+    limit: int,
+    max_workers: int,
+    throttle_s: float,
+) -> Dict[str, Sequence[Sequence[Any]]]:
+    if not symbols:
+        return {}
+    if requests is None:
+        results: Dict[str, Sequence[Sequence[Any]]] = {}
+        for symbol in symbols:
+            results[symbol] = fetch_ohlcv(exchange, symbol, timeframe, limit)
+            if throttle_s > 0:
+                time.sleep(throttle_s)
+        return results
+    return _bulk_fetch_recent_ohlcv(
+        exchange,
+        symbols,
+        timeframe,
+        limit,
+        max_workers=max_workers,
+        throttle_s=throttle_s,
+    )
+
+
 
 # ---------- Settings & argument parsing ----------
 class Settings:
@@ -9994,6 +10333,9 @@ class Settings:
         self.structure_requires_wick = kw.get("structure_requires_wick", False)
         self.mtf_lookahead = kw.get("mtf_lookahead", False)
         self.zone_type = kw.get("zone_type", "Mother Bar")
+        self.scan_workers = kw.get("scan_workers", EDITOR_AUTORUN_DEFAULTS.scan_workers)
+        self.scan_chunk_size = kw.get("scan_chunk_size", EDITOR_AUTORUN_DEFAULTS.scan_chunk_size)
+        self.scan_throttle = kw.get("scan_throttle", EDITOR_AUTORUN_DEFAULTS.scan_throttle)
         raw_threshold = kw.get("min_change", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_threshold)
         try:
             self.min_change = float(raw_threshold) if raw_threshold is not None else None
@@ -10049,6 +10391,24 @@ def _parse_args_android():
     p.add_argument("--timeframe", "-t", default=EDITOR_AUTORUN_DEFAULTS.timeframe)
     p.add_argument("--limit", "-l", type=int, default=EDITOR_AUTORUN_DEFAULTS.candle_limit)
     p.add_argument("--max-symbols", "-n", type=int, default=EDITOR_AUTORUN_DEFAULTS.max_symbols)
+    p.add_argument(
+        "--scan-workers",
+        type=int,
+        default=EDITOR_AUTORUN_DEFAULTS.scan_workers,
+        help="عدد العمال المتوازيين لجلب الشموع (لزيادة السرعة مع الحفاظ على الحظر).",
+    )
+    p.add_argument(
+        "--scan-chunk-size",
+        type=int,
+        default=EDITOR_AUTORUN_DEFAULTS.scan_chunk_size,
+        help="حجم الدفعة عند جلب الشموع على شكل مجموعات.",
+    )
+    p.add_argument(
+        "--scan-throttle",
+        type=float,
+        default=EDITOR_AUTORUN_DEFAULTS.scan_throttle,
+        help="فاصل زمني بسيط بالثواني بين طلبات الشموع لتقليل الحظر.",
+    )
     p.add_argument("--mitigation", choices=["WICK","CLOSE"], default="CLOSE")
     p.add_argument("--tg", action="store_true", default=False)
     p.add_argument("--symbol", "-s", default="")
@@ -10152,6 +10512,12 @@ def _parse_args_android():
         p.error("--limit must be > 0")
     if args.max_symbols <= 0:
         p.error("--max-symbols must be > 0")
+    if args.scan_workers <= 0:
+        p.error("--scan-workers يجب أن يكون رقمًا موجبًا")
+    if args.scan_chunk_size <= 0:
+        p.error("--scan-chunk-size يجب أن يكون رقمًا موجبًا")
+    if args.scan_throttle < 0:
+        p.error("--scan-throttle يجب أن يكون رقمًا غير سالب")
     if args.recent <= 0:
         p.error("--recent يجب أن يكون رقمًا موجبًا")
     if args.height_candles is not None and args.height_candles <= 0:
@@ -10215,6 +10581,9 @@ def _parse_args_android():
         zone_type=zone_type,
         drop_last_incomplete=args.drop_last,
         max_scan=args.max_symbols,
+        scan_workers=args.scan_workers,
+        scan_chunk_size=args.scan_chunk_size,
+        scan_throttle=args.scan_throttle,
         min_change=args.min_change,
         height_candle_window=args.height_candles,
         height_scope=height_scope,
@@ -10296,6 +10665,11 @@ def _android_cli_entry() -> int:
     recent_window = max(1, args.recent)
 
     ex = _build_exchange(getattr(cfg, "market", 'usdtm'))
+    if not getattr(ex, "markets", None):
+        try:
+            ex.load_markets()
+        except Exception:
+            pass
 
     try:
         SmartMoneyAlgoProE5
@@ -10329,7 +10703,7 @@ def _android_cli_entry() -> int:
         fvg=fvg, liquidity=liq, demand_supply=ds, order_block=ob,
         structure_util=utils, ict_structure=ict,
     )
-    inputs.console.max_age_bars = max(1, recent_window - 1)
+    inputs.console.max_age_bars = max(0, recent_window - 1)
 
     symbol_override = args.symbol or None
     iteration = 0
@@ -10348,56 +10722,72 @@ def _android_cli_entry() -> int:
                     pass
             alerts_total = 0
 
-            for i, sym in enumerate(symbols, 1):
-                try:
-                    candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
-                    if cfg.drop_last_incomplete and candles:
-                        candles = candles[:-1]
-                    runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
-                    runtime._bos_break_source = cfg.bos_confirmation
-                    runtime._strict_close_for_break = cfg.strict_close_for_break
-                    runtime.process([
-                        {"time": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5] if len(c)>5 else float('nan')}
-                        for c in candles
-                    ])
-                except Exception as e:
-                    print(
-                        f"[{i}/{len(symbols)}] {_format_symbol(sym)}: error {e}",
-                        file=sys.stderr,
-                    )
-                    continue
-
-                metrics = runtime.gather_console_metrics()
-                latest_events = metrics.get("latest_events") or {}
-                recent_hits, _ = _collect_recent_event_hits(
-                    runtime.series, latest_events, bars=recent_window
+            total_symbols = len(symbols)
+            chunk_size = max(1, int(cfg.scan_chunk_size))
+            for chunk_start in range(0, total_symbols, chunk_size):
+                chunk = symbols[chunk_start : chunk_start + chunk_size]
+                candle_map = _fetch_candles_batch(
+                    ex,
+                    chunk,
+                    args.timeframe,
+                    args.limit,
+                    int(cfg.scan_workers),
+                    float(cfg.scan_throttle),
                 )
-                if not recent_hits:
-                    if recent_window == 1:
-                        span_phrase = "آخر شمعة واحدة"
-                    elif recent_window == 2:
-                        span_phrase = "آخر شمعتين"
-                    else:
-                        span_phrase = f"آخر {recent_window} شموع"
-                    print(
-                        f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال {span_phrase}"
-                    )
-                    continue
-
-                recent_alerts = list(getattr(runtime, "alerts", []))
-                if recent_window > 0 and hasattr(runtime, "series") and runtime.series.length() > 0:
+                for offset, sym in enumerate(chunk, start=chunk_start + 1):
+                    i = offset
                     try:
-                        cutoff_idx = max(0, runtime.series.length() - recent_window)
-                        cutoff_time = runtime.series.get_time(cutoff_idx)
-                        if cutoff_time:
-                            recent_alerts = [
-                                (ts, title) for ts, title in recent_alerts if ts >= cutoff_time
-                            ]
-                    except Exception:
-                        pass
+                        candles = candle_map.get(sym) or fetch_ohlcv(ex, sym, args.timeframe, args.limit)
+                        if cfg.drop_last_incomplete and candles:
+                            candles = candles[:-1]
+                        runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
+                        runtime._bos_break_source = cfg.bos_confirmation
+                        runtime._strict_close_for_break = cfg.strict_close_for_break
+                        runtime.process(_candle_rows_to_dicts(candles))
+                    except Exception as e:
+                        print(
+                            f"[{i}/{total_symbols}] {_format_symbol(sym)}: error {e}",
+                            file=sys.stderr,
+                        )
+                        continue
 
-                if recent_alerts or args.verbose:
+                    metrics = runtime.gather_console_metrics()
+                    latest_events = metrics.get("latest_events") or {}
+                    recent_hits, _ = _collect_recent_event_hits(
+                        runtime.series, latest_events, bars=recent_window
+                    )
+                    if not recent_hits:
+                        if recent_window == 1:
+                            span_phrase = "آخر شمعة واحدة"
+                        elif recent_window == 2:
+                            span_phrase = "آخر شمعتين"
+                        else:
+                            span_phrase = f"آخر {recent_window} شموع"
+                        print(
+                            f"[{i}/{total_symbols}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال {span_phrase}"
+                        )
+                        continue
+
+                    recent_alerts = list(getattr(runtime, "alerts", []))
+                    if recent_window > 0 and hasattr(runtime, "series") and runtime.series.length() > 0:
+                        try:
+                            cutoff_idx = max(0, runtime.series.length() - recent_window)
+                            cutoff_time = runtime.series.get_time(cutoff_idx)
+                            if cutoff_time:
+                                recent_alerts = [
+                                    (ts, title) for ts, title in recent_alerts if ts >= cutoff_time
+                                ]
+                        except Exception:
+                            pass
+
                     _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
+                    if cfg.tg_enable:
+                        try:
+                            tg_lines = _latest_signal_lines(runtime, colorize=False)
+                            if tg_lines:
+                                _send_tg(cfg, [f"{_format_symbol(sym)} {args.timeframe}"] + tg_lines)
+                        except Exception:
+                            pass
                     alerts_total += len(recent_alerts)
 
             if args.verbose:
