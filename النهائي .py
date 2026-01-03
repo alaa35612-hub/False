@@ -73,6 +73,11 @@ ANSI_SYMBOL = ANSI_VALUE_POS
 ANSI_ALERT_BULL = ANSI_VALUE_POS
 ANSI_ALERT_BEAR = ANSI_VALUE_NEG
 
+# --------------------------- إعدادات تلجرام ---------------------------
+# ضع التوكن والآي دي هنا إذا لم ترغب باستخدام متغيرات البيئة.
+TELEGRAM_BOT_TOKEN = ""
+TELEGRAM_CHAT_ID = ""
+
 ALERT_BULLISH_KEYWORDS = (
     "bull",
     "bullish",
@@ -9183,7 +9188,14 @@ class _CLISettings:
     include_only: str = ""
 
 def _get_secret(name: str) -> Optional[str]:
-    return os.environ.get(name)
+    value = os.environ.get(name)
+    if value:
+        return value
+    if name == "TELEGRAM_BOT_TOKEN":
+        return TELEGRAM_BOT_TOKEN or None
+    if name == "TELEGRAM_CHAT_ID":
+        return TELEGRAM_CHAT_ID or None
+    return None
 
 def _send_tg(cfg: _CLISettings, lines: List[str]) -> None:
     if not cfg.tg_enable:
