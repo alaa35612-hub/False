@@ -1344,7 +1344,6 @@ class SmartMoneyAlgoProE5:
         self.bar_colors: List[Tuple[int, str]] = []
         self.console_event_log: Dict[str, Dict[str, Any]] = {}
         self.console_box_status_tally: Dict[str, Counter[str]] = defaultdict(Counter)
-        self.future_labels: List[Dict[str, Any]] = []
         self.touched_boxes: set[int] = set()
         console_inputs = getattr(self.inputs, "console", None)
         if console_inputs is None:
@@ -1597,10 +1596,6 @@ class SmartMoneyAlgoProE5:
             elif label.color == self.inputs.structure.bull:
                 key = "GREEN_CIRCLE"
         if key:
-            if key == "FUTURE_BOS":
-                self._track_future_label(label, "BOS")
-            elif key == "FUTURE_CHOCH":
-                self._track_future_label(label, "CHOCH")
             if key in ("BOS", "CHOCH"):
                 existing = self.console_event_log.get(key)
                 if existing and existing.get("source") == "confirmed":
@@ -1613,58 +1608,6 @@ class SmartMoneyAlgoProE5:
                 "display": f"{label.text} @ {format_price(label.y)}",
             }
             self._trace("label", "register", timestamp=label.x, key=key, text=label.text, price=label.y)
-
-    def _track_future_label(self, label: Label, label_type: str) -> None:
-        if not isinstance(label, Label):
-            return
-        for item in self.future_labels:
-            if (
-                item.get("type") == label_type
-                and item.get("price") == label.y
-                and item.get("time") == label.x
-                and item.get("text") == label.text
-            ):
-                return
-        self.future_labels.append(
-            {
-                "type": label_type,
-                "price": label.y,
-                "time": label.x,
-                "text": label.text,
-                "touched": False,
-            }
-        )
-
-    def _check_future_label_touches(self, high: float, low: float, time_val: int) -> None:
-        if not self.future_labels:
-            return
-        for item in self.future_labels:
-            if item.get("touched"):
-                continue
-            price = item.get("price")
-            if not isinstance(price, (int, float)):
-                continue
-            if low <= price <= high:
-                item["touched"] = True
-                label_type = item.get("type")
-                key = "FUTURE_CHOCH_TOUCHED" if label_type == "CHOCH" else "FUTURE_BOS_TOUCHED"
-                text = item.get("text") or ("CHoCH -" if label_type == "CHOCH" else "B O S -")
-                display = f"Future {text} touched @ {format_price(price)}"
-                self.console_event_log[key] = {
-                    "text": text,
-                    "price": price,
-                    "time": time_val,
-                    "time_display": format_timestamp(time_val),
-                    "display": display,
-                }
-                self._trace(
-                    "future_label",
-                    "touched",
-                    timestamp=time_val,
-                    key=key,
-                    text=text,
-                    price=price,
-                )
 
     def _register_structure_break_event(
         self,
@@ -7392,7 +7335,6 @@ class SmartMoneyAlgoProE5:
                 self.bxty = 1 if dir_up else -1
                 self.prev_oi1 = float(oi1)
 
-        self._check_future_label_touches(high, low, time_val)
         self._sync_state_mirrors()
 
 
@@ -8795,8 +8737,6 @@ EVENT_DISPLAY_ORDER = [
     ("IDM_OB_TOUCHED", "IDM OB Touched"),
     ("EXT_OB_TOUCHED", "EXT OB Touched"),
     ("GOLDEN_ZONE_TOUCHED", "Golden zone Touched"),
-    ("FUTURE_BOS_TOUCHED", "Future BOS Touched"),
-    ("FUTURE_CHOCH_TOUCHED", "Future CHOCH Touched"),
     ("X", "X"),
     ("LIQUIDITY_HIGH", "Liquidity High"),
     ("LIQUIDITY_LOW", "Liquidity Low"),
@@ -9585,8 +9525,6 @@ _LAST_BUCKETS = {
     "IDM OB": ["idm ob"],
     "Hist IDM OB": ["hist idm ob"],
     "Hist EXT OB": ["hist ext ob"],
-    "Future BOS Touched": ["future b o s", "future bos touched"],
-    "Future CHOCH Touched": ["future choch", "future choch touched"],
     "X": ["x"],
     "Liquidity High": ["liquidity high"],
     "Liquidity Low": ["liquidity low"],
@@ -9611,8 +9549,6 @@ _METRIC_MAP = {
     "IDM OB": ["IDM_OB", "idm_ob"],
     "Hist IDM OB": ["HIST_IDM_OB", "hist_idm_ob"],
     "Hist EXT OB": ["HIST_EXT_OB", "hist_ext_ob"],
-    "Future BOS Touched": ["FUTURE_BOS_TOUCHED", "future_bos_touched"],
-    "Future CHOCH Touched": ["FUTURE_CHOCH_TOUCHED", "future_choch_touched"],
     "X": ["X", "x"],
     "Liquidity High": ["LIQUIDITY_HIGH", "liquidity_high"],
     "Liquidity Low": ["LIQUIDITY_LOW", "liquidity_low"],
@@ -10042,8 +9978,6 @@ _LAST_BUCKETS = {
     "IDM OB": ["idm ob","idm_ob"],
     "Hist IDM OB": ["hist idm ob","hist_idm_ob"],
     "Hist EXT OB": ["hist ext ob","hist_ext_ob"],
-    "Future BOS Touched": ["future b o s","future bos touched"],
-    "Future CHOCH Touched": ["future choch","future choch touched"],
     "X": ["x"],
     "Liquidity High": ["liquidity high"],
     "Liquidity Low": ["liquidity low"],
@@ -10108,8 +10042,6 @@ _METRIC_MAP = {
     "IDM OB": ["IDM_OB","idm_ob","idm ob"],
     "Hist IDM OB": ["HIST_IDM_OB","hist_idm_ob","hist idm ob"],
     "Hist EXT OB": ["HIST_EXT_OB","hist_ext_ob","hist ext ob"],
-    "Future BOS Touched": ["FUTURE_BOS_TOUCHED","future_bos_touched"],
-    "Future CHOCH Touched": ["FUTURE_CHOCH_TOUCHED","future_choch_touched"],
     "X": ["X","x"],
     "Liquidity High": ["LIQUIDITY_HIGH","liquidity_high"],
     "Liquidity Low": ["LIQUIDITY_LOW","liquidity_low"],
