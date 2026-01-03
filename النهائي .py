@@ -1834,6 +1834,37 @@ class SmartMoneyAlgoProE5:
             lambda lbl: f"صعود @ {format_price(lbl.y)}",
         )
 
+        current_high = self.series.get("high")
+        current_low = self.series.get("low")
+        current_time = self.series.get_time()
+
+        def _register_future_touch(event_key: str, touched_key: str) -> None:
+            event = events.get(event_key)
+            if not event:
+                return
+            price = event.get("price")
+            try:
+                price_value = float(price)
+            except (TypeError, ValueError):
+                return
+            try:
+                high_value = float(current_high)
+                low_value = float(current_low)
+            except (TypeError, ValueError):
+                return
+            if low_value <= price_value <= high_value:
+                events[touched_key] = {
+                    "text": event.get("text", touched_key),
+                    "price": price_value,
+                    "time": current_time,
+                    "time_display": format_timestamp(current_time),
+                    "display": f"{event_key.replace('_', ' ')} touched @ {format_price(price_value)}",
+                    "status": "touched",
+                }
+
+        _register_future_touch("FUTURE_BOS", "FUTURE_BOS_TOUCHED")
+        _register_future_touch("FUTURE_CHOCH", "FUTURE_CHOCH_TOUCHED")
+
         record_box("IDM_OB", lambda bx: bx.text == "IDM OB")
         record_box("EXT_OB", lambda bx: bx.text == "EXT OB")
         record_box(
@@ -9516,6 +9547,11 @@ _LAST_BUCKETS = {
     "CHOCH": ["choch", "ch o ch"],
     "MSS+": ["mss+", "mss +"],
     "MSS": ["mss"],
+    "Future BOS": ["future bos", "bos -"],
+    "Future CHOCH": ["future choch", "choch -"],
+    "Future BOS touched": ["future bos touched"],
+    "Future CHOCH touched": ["future choch touched"],
+    "Touched": ["touched"],
     "Golden zone": ["golden zone"],
     "IDM OB Touched": ["idm ob touched"],
     "EXT OB Touched": ["ext ob touched"],
@@ -9540,6 +9576,10 @@ _METRIC_MAP = {
     "CHOCH": ["CHOCH", "choch"],
     "MSS+": ["MSS_PLUS", "mss_plus"],
     "MSS": ["MSS", "mss"],
+    "Future BOS": ["FUTURE_BOS", "future_bos"],
+    "Future CHOCH": ["FUTURE_CHOCH", "future_choch"],
+    "Future BOS touched": ["FUTURE_BOS_TOUCHED", "future_bos_touched"],
+    "Future CHOCH touched": ["FUTURE_CHOCH_TOUCHED", "future_choch_touched"],
     "Golden zone": ["GOLDEN_ZONE", "golden_zone", "GZ"],
     "IDM OB Touched": ["IDM_OB_TOUCHED", "idm_ob_touched"],
     "EXT OB Touched": ["EXT_OB_TOUCHED", "ext_ob_touched"],
@@ -9619,6 +9659,16 @@ def _extract_latest_from_runtime(runtime):
                     result[label] = found
     except Exception:
         pass
+
+    touched_candidates = [
+        item for label, item in result.items() if "touched" in label.lower() and item
+    ]
+    if touched_candidates:
+        latest_touched = max(
+            touched_candidates,
+            key=lambda item: item[0] if isinstance(item[0], (int, float)) else 0,
+        )
+        result.setdefault("Touched", latest_touched)
 
     # 2) Fallback from alerts text if not found
     if (not result) and hasattr(runtime, "alerts"):
@@ -9965,10 +10015,15 @@ _AR_KEYS = {
 # منطق “آخر حدث لكل بند” / أسماء عربية مطلوبة
 _LAST_BUCKETS = {
     "BOS": ["bos","b 0 s"],
-    "BOS+": ["bos+","bos +","b o s+"],
+    "+BOS": ["bos+","bos +","b o s+"],
     "CHOCH": ["choch","ch o ch"],
-    "MSS+": ["mss+","mss +"],
+    "+MSS": ["mss+","mss +"],
     "MSS": ["mss"],
+    "Future BOS": ["future bos","bos -"],
+    "Future CHOCH": ["future choch","choch -"],
+    "Future BOS touched": ["future bos touched"],
+    "Future CHOCH touched": ["future choch touched"],
+    "Touched": ["touched"],
     "Golden zone": ["golden zone","gz"],
     "IDM OB Touched": ["idm ob touched"],
     "EXT OB Touched": ["ext ob touched"],
@@ -10029,10 +10084,14 @@ _INT_KEYS = [
 
 _METRIC_MAP = {
     "BOS": ["BOS","bos","b 0 s"],
-    "BOS+": ["BOS_PLUS","bos_plus"],
+    "+BOS": ["BOS_PLUS","bos_plus"],
     "CHOCH": ["CHOCH","choch","ch o ch"],
-    "MSS+": ["MSS_PLUS","mss_plus"],
+    "+MSS": ["MSS_PLUS","mss_plus"],
     "MSS": ["MSS","mss"],
+    "Future BOS": ["FUTURE_BOS","future_bos"],
+    "Future CHOCH": ["FUTURE_CHOCH","future_choch"],
+    "Future BOS touched": ["FUTURE_BOS_TOUCHED","future_bos_touched"],
+    "Future CHOCH touched": ["FUTURE_CHOCH_TOUCHED","future_choch_touched"],
     "Golden zone": ["GOLDEN_ZONE","golden_zone","gz","golden zone"],
     "IDM OB Touched": ["IDM_OB_TOUCHED","idm_ob_touched"],
     "EXT OB Touched": ["EXT_OB_TOUCHED","ext_ob_touched"],
@@ -10077,24 +10136,53 @@ def _extract_from_metrics_dict(mdict):
     return out
 
 def _extract_latest_from_runtime(runtime):
+    def _merge_latest(dest: Dict[str, Tuple[Any, Any]], src: Dict[str, Tuple[Any, Any]]) -> None:
+        for label, item in src.items():
+            if item is None:
+                continue
+            ts = item[0] if isinstance(item, (list, tuple)) and item else 0
+            existing = dest.get(label)
+            if existing is None:
+                dest[label] = item
+                continue
+            existing_ts = existing[0] if isinstance(existing, (list, tuple)) and existing else 0
+            if isinstance(ts, (int, float)) and isinstance(existing_ts, (int, float)) and ts < existing_ts:
+                continue
+            dest[label] = item
+
+    combined: Dict[str, Tuple[Any, Any]] = {}
     # 1) خصائص مباشرة على الـruntime
     for root_name in ["latest_events","latest","last","markers","events","signals","state","summary"]:
         node = getattr(runtime, root_name, None)
         out = _extract_from_metrics_dict(node)
-        if out: return out
+        if out:
+            _merge_latest(combined, out)
     # 2) gather_console_metrics
     try:
         if hasattr(runtime, "gather_console_metrics"):
             m = runtime.gather_console_metrics() or {}
             out = _extract_from_metrics_dict(m)
-            if out: return out
+            if out:
+                _merge_latest(combined, out)
     except Exception:
         pass
+    if combined:
+        touched_candidates = [
+            item for label, item in combined.items() if "touched" in label.lower() and item
+        ]
+        if touched_candidates:
+            latest_touched = max(
+                touched_candidates,
+                key=lambda item: item[0] if isinstance(item[0], (int, float)) else 0,
+            )
+            combined.setdefault("Touched", latest_touched)
+        return combined
     # 3) سقوط إلى نصوص التنبيهات فقط
     alerts = list(getattr(runtime, "alerts", []))
-    latest = {}
+    latest: Dict[str, Tuple[Any, Any]] = {}
     for name, item in _last_by_keywords(alerts, _LAST_BUCKETS):
-        if item is not None: latest[name] = item
+        if item is not None:
+            latest[name] = item
     return latest
 
 def _fetch_pct_change(exchange, symbol):
@@ -10220,10 +10308,22 @@ def _fetch_candles_batch(
         return {}
     if requests is None:
         results: Dict[str, Sequence[Sequence[Any]]] = {}
-        for symbol in symbols:
-            results[symbol] = fetch_ohlcv(exchange, symbol, timeframe, limit)
+        resolved_workers = max(1, int(max_workers))
+        def _fetch_symbol(sym: str) -> Tuple[str, Sequence[Sequence[Any]]]:
+            data = fetch_ohlcv(exchange, sym, timeframe, limit)
             if throttle_s > 0:
                 time.sleep(throttle_s)
+            return sym, data
+        with concurrent.futures.ThreadPoolExecutor(max_workers=resolved_workers) as pool:
+            future_map = {pool.submit(_fetch_symbol, symbol): symbol for symbol in symbols}
+            for future in concurrent.futures.as_completed(future_map):
+                sym = future_map[future]
+                try:
+                    key, payload = future.result()
+                    results[key] = payload
+                except Exception as exc:  # pragma: no cover - defensive
+                    print(f"تعذر جلب شموع {sym}: {exc}", flush=True)
+                    results[sym] = fetch_ohlcv(exchange, sym, timeframe, limit)
         return results
     return _bulk_fetch_recent_ohlcv(
         exchange,
@@ -10758,6 +10858,9 @@ def __router_main__():
             "-l", str(defaults.candle_limit),
             "--max-symbols", str(defaults.max_symbols),
             "--recent", str(defaults.recent_bars),
+            "--scan-workers", str(defaults.scan_workers),
+            "--scan-chunk-size", str(defaults.scan_chunk_size),
+            "--scan-throttle", str(defaults.scan_throttle),
             "--verbose",
         ]
         if defaults.height_threshold is not None:
