@@ -167,6 +167,11 @@ colorSweep  = input.color(color.gray, "", group = "Structure", inline = 'sweep')
 showTP = false //input.bool(false, 'Show Target profit',group = 'Structure')
 colorTP = color.new(color.purple, 0)  // 0 is full opacity
 
+buy_state_group = "Buy Entry (State Machine)"
+mitigation_source = input.string("Disabled", "Mitigation/OB Tap Source", options = ["Disabled", "Demand Zone Mitigation (IDM EXT Alert Demand)", "Order Flow OB Tested (Major/Minor)"], group = buy_state_group)
+reset_on_choch_down = input.bool(false, "Reset on CHOCH Down", group = buy_state_group)
+reset_after_bars = input.int(0, "Reset after N bars (0=Off)", minval = 0, group = buy_state_group)
+
 
 mergeRatio = 0.1  // Set a default value
 maxBarHistory = 2000  // Default value to avoid errors
@@ -256,6 +261,13 @@ var bool isSweepOBD = false
 var int current_OBD = na
 var float low_MOBD = na
 var float high_MOBD = na
+
+var int buy_state = 0
+var int buy_state_bar = na
+var int last_sweep_bar = na
+var int last_choch_up_bar = na
+var box tracked_bull_fvg = na
+var int tracked_bull_fvg_bar = na
 
 //Array
 var arrTopBotBar = array.new_int(1, time)
@@ -1110,12 +1122,15 @@ if findIDM and isCocDn and isBosDn
         HBar := time
 
 //Check for ChoCh
- 
+event_choch_up = false
+event_choch_down = false
+
 if isCocDn and high > lastH
     if structure_type == "Choch without IDM" and idmHigh == lastH and close > idmHigh
         removeLastLabel(arrIdmLabel, 1)
         removeLastLine(arrIdmLine, 1)
     if close > lastH 
+        event_choch_up := barstate.isconfirmed
         [lstHlPrsIdm_,lstBx_] = drawStructure("ChoCh", true) //Confirm CocUp 
         lstHlPrsIdm := lstHlPrsIdm_
         if not na(lstBx_)
@@ -1139,6 +1154,7 @@ if isCocUp and low < lastL
         removeLastLabel(arrIdmLabel, 1)
         removeLastLine(arrIdmLine, 1)
     if close < lastL
+        event_choch_down := barstate.isconfirmed
         [lstHlPrsIdm_,lstBx_] = drawStructure("ChoCh", false)  //Confirm CocDn
         lstHlPrsIdm := lstHlPrsIdm_
         if not na(lstBx_)
@@ -1975,6 +1991,19 @@ fvg_removed=validate_fvg_func(high,low)
 
 alertcondition(fvg_removed==1,"Bullish FVG Break","Bullish FVG Broken Ez-SMC")
 alertcondition(fvg_removed==-1,"Bearish FVG Break","Bearish FVG Broken Ez-SMC")
+
+new_bull_fvg = fvg_gap == 1 and barstate.isconfirmed
+tracked_bull_fvg_filled = not na(tracked_bull_fvg) and array.indexof(bullishgapholder, tracked_bull_fvg) == -1 and barstate.isconfirmed
+
+if event_choch_up
+    last_choch_up_bar := bar_index
+    tracked_bull_fvg := na
+    tracked_bull_fvg_bar := na
+
+if (buy_state >= 2 or event_choch_up) and new_bull_fvg and (na(last_choch_up_bar) or bar_index >= last_choch_up_bar)
+    if array.size(bullishgapholder) > 0
+        tracked_bull_fvg := array.get(bullishgapholder, array.size(bullishgapholder) - 1)
+        tracked_bull_fvg_bar := bar_index
 
 if array.size(bullishgapholder) > max_fvg
     d_box=array.shift(bullishgapholder)
@@ -3611,6 +3640,53 @@ plotshape(display_third ? bearCond : na, text='Sweep', color=bearColor, textcolo
 //ALERTS
 alertcondition(bullishSFP, title='Bullish Sweep', message='{{ticker}} Bullish Sweep, Price:{{close}}')
 alertcondition(bearishSFP, title='Bearish Sweep', message='{{ticker}} Bearish Sweep, Price:{{close}}')
+
+event_sweep_bull = bullishSFP and barstate.isconfirmed
+
+event_mitigation_tap = switch mitigation_source
+    "Demand Zone Mitigation (IDM EXT Alert Demand)" => isAlertextidmBuy
+    "Order Flow OB Tested (Major/Minor)" => (alertBullOfMajor or alertBullOfMinor)
+    => false
+
+buy_signal = false
+
+if buy_state == 0
+    if event_sweep_bull
+        buy_state := 1
+        buy_state_bar := bar_index
+        last_sweep_bar := bar_index
+if buy_state == 1
+    if event_choch_up
+        buy_state := 2
+        buy_state_bar := bar_index
+if buy_state == 2
+    if tracked_bull_fvg_filled
+        buy_state := 3
+        buy_state_bar := bar_index
+if buy_state == 3
+    if event_mitigation_tap
+        buy_state := 4
+        buy_state_bar := bar_index
+        buy_signal := true
+
+if buy_state == 4
+    buy_state := 0
+
+if reset_on_choch_down and event_choch_down and buy_state != 0
+    buy_state := 0
+    buy_state_bar := na
+    tracked_bull_fvg := na
+    tracked_bull_fvg_bar := na
+
+if reset_after_bars > 0 and buy_state != 0 and not na(buy_state_bar)
+    if bar_index - buy_state_bar >= reset_after_bars
+        buy_state := 0
+        buy_state_bar := na
+        tracked_bull_fvg := na
+        tracked_bull_fvg_bar := na
+
+plotshape(buy_signal, title="Buy", style=shape.labelup, location=location.belowbar, color=color.new(color.green, 0), text="BUY")
+alertcondition(buy_signal, title="Buy Entry", message="BUY: Sweep → CHOCH Up → FVG Fill → OB Tap")
 
 //------------------------------------------------------------------------------
 //  === Zig Zag Channels ===
