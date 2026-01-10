@@ -2,382 +2,337 @@
 // © OpenAI
 
 //@version=5
-indicator(title = "ICT - Internal Range Liquidity MSS Engine", overlay = true, max_bars_back = 5000, max_lines_count = 500, max_boxes_count = 500, max_labels_count = 500)
+indicator(title = "ICT OTE (NY Session)", overlay = true, max_bars_back = 5000, max_lines_count = 100, max_boxes_count = 50, max_labels_count = 200)
 
 // =============== Inputs
-input_group_tf = "Timeframes"
-htf_tf = input.timeframe("15", "HTF Bias TF", group = input_group_tf)
-ltf_tf = input.timeframe("1", "Execution TF (LTF)", group = input_group_tf, tooltip = "LTF is used for alerts/context only; run the script on your execution timeframe for signals.")
+input_group_pivot = "Swing Detection"
+leftBars = input.int(3, "Pivot Left Bars", minval = 1, group = input_group_pivot)
+rightBars = input.int(3, "Pivot Right Bars", minval = 1, group = input_group_pivot)
 
-input_group_pivots = "Pivots"
-pivot_left = input.int(3, "Pivot left", minval = 1, group = input_group_pivots)
-pivot_right = input.int(3, "Pivot right", minval = 1, group = input_group_pivots)
+input_group_levels = "OTE Levels"
+showLevel062 = input.bool(true, "Show 0.62", group = input_group_levels)
+showLevel0705 = input.bool(true, "Show 0.705 (Sweet Spot)", group = input_group_levels)
+showLevel079 = input.bool(true, "Show 0.79", group = input_group_levels)
 
-input_group_liq = "BSL/SSL Liquidity"
-repeat_count = input.int(2, "Repeat count for BSL/SSL", minval = 2, group = input_group_liq)
-price_tolerance_pct = input.float(0.15, "Price tolerance (%)", minval = 0.01, step = 0.01, group = input_group_liq, tooltip = "Percentage tolerance for matching levels.")
-time_tolerance_bars = input.int(8, "Time tolerance (bars)", minval = 1, group = input_group_liq)
-maxDisplayedLevels = input.int(6, "Max levels on chart", minval = 1, group = input_group_liq)
-require_wick = input.bool(true, "Require wick penetration", group = input_group_liq, tooltip = "If true, wick must pierce the level to count as a raid.")
+input_group_zone = "OTE Zone"
+showZone = input.bool(true, "Show Zone (0.62 - 0.79)", group = input_group_zone)
+zoneColor = input.color(color.new(color.teal, 85), "Zone Color", group = input_group_zone)
 
-input_group_mss = "MSS"
-show_mss = input.bool(true, "Show MSS", group = input_group_mss)
+input_group_session = "NY Session"
+nySession = input.session("0830-1100", "NY Window", group = input_group_session)
 
-input_group_fvg = "FVG / OB"
-maxFvgsOnChart = input.int(6, "Max FVG/OB zones", minval = 1, group = input_group_fvg)
+input_group_signals = "Signals"
+entryMode = input.string("Touch0705", "Entry Trigger", options = ["Touch0705", "EnterZone"], group = input_group_signals)
+cancelMode = input.string("CloseBeyond", "Invalidation", options = ["CloseBeyond", "WickBeyond"], group = input_group_signals)
+requirePdSweep = input.bool(true, "Require PDH/PDL Sweep Before Swing", group = input_group_signals, tooltip = "If true, the swing end must occur after price has traded beyond the previous day's high/low.")
 
-input_group_bias = "Bias"
-biasLockBars = input.int(3, "Bias lock bars", minval = 0, group = input_group_bias)
+input_group_inst = "Institutional Numbers"
+instThreshold = input.float(5.0, "Proximity (ticks/points)", minval = 0.0, group = input_group_inst)
 
-input_group_risk = "Risk Management"
-buffer = input.float(0.5, "SL buffer (ticks/pts)", minval = 0, group = input_group_risk)
-rr = input.float(2.0, "Risk:Reward default", minval = 0.1, step = 0.1, group = input_group_risk)
-tp_mode = input.string("FixedRR", "TP Mode", options = ["OppositeLiquidity", "FixedRR", "StructureLevel"], group = input_group_risk)
+input_group_targets = "Targets & Stops"
+showTargets = input.bool(true, "Show Targets", group = input_group_targets)
+showStops = input.bool(true, "Show Stop Loss", group = input_group_targets)
+stopBuffer = input.float(10.0, "Stop Buffer (points/pips)", minval = 0.0, group = input_group_targets)
+showBreakeven = input.bool(true, "Show Move SL to BE after TP1", group = input_group_targets)
+roundTargets = input.bool(true, "Round Targets to Nearest 10 Level", group = input_group_targets)
+minTp1Points = input.float(0.0, "Min TP1 Distance (points)", minval = 0.0, group = input_group_targets)
 
-input_group_alerts = "Alerts"
-alert_on_mss = input.bool(true, "Enable MSS alerts", group = input_group_alerts)
-alert_on_entry = input.bool(true, "Enable entry alerts", group = input_group_alerts)
-alert_on_raids = input.bool(true, "Enable raid alerts", group = input_group_alerts)
-alert_msg_mss = input.string("MSS detected", "MSS alert message", group = input_group_alerts)
-alert_msg_entry = input.string("Entry signal", "Entry alert message", group = input_group_alerts)
-alert_msg_raid = input.string("Liquidity raid", "Raid alert message", group = input_group_alerts)
+input_group_pd = "Previous Day Range"
+showPrevDay = input.bool(true, "Show PDH/PDL", group = input_group_pd)
 
-// =============== Types
+// =============== Helpers
+inNySession = not na(time(timeframe.period, nySession, "America/New_York"))
 
-// Liquidity level for BSL/SSL
-type LiquidityLevel
-    float price
-    int time
-    string level_type
-    bool raided
-    line line_id
-    label label_id
+prevDayHigh = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_on)
+prevDayLow = request.security(syminfo.tickerid, "D", low[1], lookahead = barmerge.lookahead_on)
 
-// Candidate for building liquidity levels
-type LiquidityCandidate
-    float price
-    int first_time
-    int count
-    string level_type
+pivotHigh = ta.pivothigh(high, leftBars, rightBars)
+pivotLow = ta.pivotlow(low, leftBars, rightBars)
 
-// MSS signal
-type MSSSignal
-    string direction
-    int bar_index_confirm
-    float price
-    bool confirmed
-    label label_id
+var float lastPivotHigh = na
+var int lastPivotHighIndex = na
+var float lastPivotLow = na
+var int lastPivotLowIndex = na
 
-// FVG Zone
-type FvgZone
-    float top
-    float bot
-    int created_bar
-    box box_id
-    bool valid
-    string direction
+var float swingStart = na
+var int swingStartIndex = na
+var float swingEnd = na
+var int swingEndIndex = na
+var int swingDir = 0
+var int lastPdHighSweepIndex = na
+var int lastPdLowSweepIndex = na
 
-// OB Zone
-type ObZone
-    float top
-    float bot
-    int created_bar
-    box box_id
-    bool valid
-    string direction
-
-// Entry Signal
-type EntrySignal
-    int bar_index_signal
-    string direction
-    float entry_price
-    float sl_price
-    float tp_price
-    label label_id
-    line sl_line
-    line tp_line
-
-// =============== State containers
-var array<LiquidityLevel> levels = array.new<LiquidityLevel>()
-var array<LiquidityCandidate> candidates = array.new<LiquidityCandidate>()
-var array<FvgZone> fvg_zones = array.new<FvgZone>()
-var array<ObZone> ob_zones = array.new<ObZone>()
-
-var float lastSwingHigh = na
-var float lastSwingLow = na
-var string lastRaidType = ""
-var bool lastRaidReady = false
-var MSSSignal lastMss = MSSSignal.new("", na, na, false, na)
-var int biasLockCounter = 0
-var int lastBias = 0
-
-// =============== Helper logic (no global mutation in functions)
-priceWithinTolerance(basePrice, testPrice, tolerancePct) =>
-    float delta = math.abs(basePrice - testPrice)
-    float allowed = basePrice * (tolerancePct / 100.0)
-    delta <= allowed
-
-// =============== BSL/SSL detection (Liquidity)
-
-pivotHigh = ta.pivothigh(high, pivot_left, pivot_right)
-pivotLow = ta.pivotlow(low, pivot_left, pivot_right)
+if high > prevDayHigh
+    lastPdHighSweepIndex := bar_index
+if low < prevDayLow
+    lastPdLowSweepIndex := bar_index
 
 if not na(pivotHigh)
-    int pivotBar = bar_index - pivot_right
-    float pivotPrice = pivotHigh
-    bool matched = false
-    for idx = 0 to array.size(candidates) - 1
-        LiquidityCandidate c = array.get(candidates, idx)
-        if c.level_type == "BSL" and (bar_index - c.first_time) <= time_tolerance_bars and priceWithinTolerance(c.price, pivotPrice, price_tolerance_pct)
-            c.count += 1
-            array.set(candidates, idx, c)
-            matched := true
-            if c.count >= repeat_count
-                line newLine = line.new(c.first_time, c.price, bar_index, c.price, extend = extend.right, color = color.red, style = line.style_dotted, width = 1)
-                label newLabel = label.new(c.first_time, c.price, "BSL", color = color.new(color.red, 0), textcolor = color.white, style = label.style_label_left)
-                LiquidityLevel lvl = LiquidityLevel.new(c.price, c.first_time, "BSL", false, newLine, newLabel)
-                array.push(levels, lvl)
-                array.remove(candidates, idx)
-                break
-    if not matched
-        LiquidityCandidate c = LiquidityCandidate.new(pivotPrice, pivotBar, 1, "BSL")
-        array.push(candidates, c)
+    int pivotIndex = bar_index - rightBars
+    lastPivotHigh := pivotHigh
+    lastPivotHighIndex := pivotIndex
+    if not na(lastPivotLow) and lastPivotLowIndex < pivotIndex
+        swingDir := 1
+        swingStart := lastPivotLow
+        swingStartIndex := lastPivotLowIndex
+        swingEnd := pivotHigh
+        swingEndIndex := pivotIndex
 
 if not na(pivotLow)
-    int pivotBar = bar_index - pivot_right
-    float pivotPrice = pivotLow
-    bool matched = false
-    for idx = 0 to array.size(candidates) - 1
-        LiquidityCandidate c = array.get(candidates, idx)
-        if c.level_type == "SSL" and (bar_index - c.first_time) <= time_tolerance_bars and priceWithinTolerance(c.price, pivotPrice, price_tolerance_pct)
-            c.count += 1
-            array.set(candidates, idx, c)
-            matched := true
-            if c.count >= repeat_count
-                line newLine = line.new(c.first_time, c.price, bar_index, c.price, extend = extend.right, color = color.green, style = line.style_dotted, width = 1)
-                label newLabel = label.new(c.first_time, c.price, "SSL", color = color.new(color.green, 0), textcolor = color.white, style = label.style_label_left)
-                LiquidityLevel lvl = LiquidityLevel.new(c.price, c.first_time, "SSL", false, newLine, newLabel)
-                array.push(levels, lvl)
-                array.remove(candidates, idx)
-                break
-    if not matched
-        LiquidityCandidate c = LiquidityCandidate.new(pivotPrice, pivotBar, 1, "SSL")
-        array.push(candidates, c)
+    int pivotIndex = bar_index - rightBars
+    lastPivotLow := pivotLow
+    lastPivotLowIndex := pivotIndex
+    if not na(lastPivotHigh) and lastPivotHighIndex < pivotIndex
+        swingDir := -1
+        swingStart := lastPivotHigh
+        swingStartIndex := lastPivotHighIndex
+        swingEnd := pivotLow
+        swingEndIndex := pivotIndex
 
-// Manage level limit
-if array.size(levels) > maxDisplayedLevels
-    LiquidityLevel lvl = array.shift(levels)
-    if not na(lvl.line_id)
-        line.delete(lvl.line_id)
-    if not na(lvl.label_id)
-        label.delete(lvl.label_id)
+bool hasSwing = swingDir != 0 and not na(swingStart) and not na(swingEnd)
+bool sweepOk = not requirePdSweep or (swingDir == 1 ? (not na(lastPdHighSweepIndex) and lastPdHighSweepIndex >= swingStartIndex and lastPdHighSweepIndex <= swingEndIndex) : (not na(lastPdLowSweepIndex) and lastPdLowSweepIndex >= swingStartIndex and lastPdLowSweepIndex <= swingEndIndex))
+bool swingReady = hasSwing and sweepOk
+float swingRange = swingReady ? math.abs(swingEnd - swingStart) : na
 
-// =============== Raid detection
-for idx = 0 to array.size(levels) - 1
-    LiquidityLevel lvl = array.get(levels, idx)
-    if not lvl.raided
-        bool wickRaid = lvl.level_type == "BSL" ? high > lvl.price : low < lvl.price
-        bool bodyRaid = lvl.level_type == "BSL" ? close > lvl.price : close < lvl.price
-        bool raidCondition = (require_wick ? wickRaid : true) and bodyRaid
-        if raidCondition
-            lvl.raided := true
-            lastRaidType := lvl.level_type
-            lastRaidReady := true
-            if not na(lvl.line_id)
-                line.set_color(lvl.line_id, color.gray)
-                line.set_style(lvl.line_id, line.style_dashed)
-            if not na(lvl.label_id)
-                label.delete(lvl.label_id)
-            label raidLabel = label.new(bar_index, lvl.price, "Raid", style = label.style_label_down, color = color.new(color.orange, 0), textcolor = color.black)
-            lvl.label_id := raidLabel
-            array.set(levels, idx, lvl)
-            if alert_on_raids
-                alert(alert_msg_raid + " | " + syminfo.ticker + " | " + timeframe.period + " | " + lvl.level_type + " | " + str.tostring(lvl.price), alert.freq_once_per_bar)
+float fib062 = na
+float fib0705 = na
+float fib079 = na
+float rawTarget1 = na
+float rawTarget2 = na
+float target1 = na
+float target2 = na
+float stopLevel = na
 
-// =============== MSS detection (after raid)
-if not na(pivotHigh)
-    lastSwingHigh := pivotHigh
-if not na(pivotLow)
-    lastSwingLow := pivotLow
+if swingReady
+    if swingDir == 1
+        fib062 := swingEnd - swingRange * 0.62
+        fib0705 := swingEnd - swingRange * 0.705
+        fib079 := swingEnd - swingRange * 0.79
+        rawTarget1 := swingEnd + swingRange * 0.5
+        rawTarget2 := swingEnd + swingRange * 1.0
+        stopLevel := swingStart - stopBuffer
+    if swingDir == -1
+        fib062 := swingEnd + swingRange * 0.62
+        fib0705 := swingEnd + swingRange * 0.705
+        fib079 := swingEnd + swingRange * 0.79
+        rawTarget1 := swingEnd - swingRange * 0.5
+        rawTarget2 := swingEnd - swingRange * 1.0
+        stopLevel := swingStart + stopBuffer
 
-bool bullishMss = false
-bool bearishMss = false
+if swingReady
+    target1 := roundTargets ? (swingDir == 1 ? math.floor(rawTarget1 / 10.0) * 10.0 : math.ceil(rawTarget1 / 10.0) * 10.0) : rawTarget1
+    target2 := roundTargets ? (swingDir == 1 ? math.floor(rawTarget2 / 10.0) * 10.0 : math.ceil(rawTarget2 / 10.0) * 10.0) : rawTarget2
 
-if lastRaidReady and lastRaidType == "SSL" and not na(lastSwingHigh)
-    bullishMss := close > lastSwingHigh
-if lastRaidReady and lastRaidType == "BSL" and not na(lastSwingLow)
-    bearishMss := close < lastSwingLow
+// =============== Institutional numbers (00, 20, 50, 80)
+tickIndex = math.round(close / syminfo.mintick)
+instDigits = tickIndex % 100
+instDistance = math.min(math.abs(instDigits - 0), math.min(math.abs(instDigits - 20), math.min(math.abs(instDigits - 50), math.abs(instDigits - 80))))
+instConfluence = instDistance <= instThreshold
 
-if bullishMss
-    lastMss := MSSSignal.new("bullish", bar_index, close, true, na)
-    lastRaidReady := false
-    if show_mss
-        label mssLabel = label.new(bar_index, close, "🔼", style = label.style_label_up, color = color.new(color.green, 0), textcolor = color.white)
-        lastMss.label_id := mssLabel
-    if alert_on_mss
-        alert(alert_msg_mss + " | " + syminfo.ticker + " | " + timeframe.period + " | bullish | " + str.tostring(close), alert.freq_once_per_bar)
+// =============== Signals
+zoneUpper = swingReady ? math.max(fib062, fib079) : na
+zoneLower = swingReady ? math.min(fib062, fib079) : na
+zoneTouched = swingReady and low <= zoneUpper and high >= zoneLower
+sweetTouched = swingReady and low <= fib0705 and high >= fib0705
 
-if bearishMss
-    lastMss := MSSSignal.new("bearish", bar_index, close, true, na)
-    lastRaidReady := false
-    if show_mss
-        label mssLabel = label.new(bar_index, close, "🔽", style = label.style_label_down, color = color.new(color.red, 0), textcolor = color.white)
-        lastMss.label_id := mssLabel
-    if alert_on_mss
-        alert(alert_msg_mss + " | " + syminfo.ticker + " | " + timeframe.period + " | bearish | " + str.tostring(close), alert.freq_once_per_bar)
+bullZone = swingReady and swingDir == 1 and zoneTouched
+bearZone = swingReady and swingDir == -1 and zoneTouched
 
-// =============== HTF Bias (MTF)
-htfBiasRaw = request.security(syminfo.tickerid, htf_tf, () =>
-    float ph = ta.pivothigh(high, pivot_left, pivot_right)
-    float pl = ta.pivotlow(low, pivot_left, pivot_right)
-    float lastPh = ta.valuewhen(not na(ph), ph, 0)
-    float prevPh = ta.valuewhen(not na(ph), ph, 1)
-    float lastPl = ta.valuewhen(not na(pl), pl, 0)
-    float prevPl = ta.valuewhen(not na(pl), pl, 1)
-    int bias = lastPh > prevPh and lastPl > prevPl ? 1 : lastPh < prevPh and lastPl < prevPl ? -1 : 0
-    bias
-)
+bullEntry = swingReady and swingDir == 1 and inNySession and ((entryMode == "Touch0705" and sweetTouched) or (entryMode == "EnterZone" and zoneTouched))
+bearEntry = swingReady and swingDir == -1 and inNySession and ((entryMode == "Touch0705" and sweetTouched) or (entryMode == "EnterZone" and zoneTouched))
 
-if htfBiasRaw != lastBias
-    if biasLockCounter == 0
-        lastBias := htfBiasRaw
-        biasLockCounter := biasLockBars
+bullInvalid = swingReady and swingDir == 1 and ((cancelMode == "CloseBeyond" and close < fib079) or (cancelMode == "WickBeyond" and low < fib079))
+bearInvalid = swingReady and swingDir == -1 and ((cancelMode == "CloseBeyond" and close > fib079) or (cancelMode == "WickBeyond" and high > fib079))
+tp1Valid = swingReady and (minTp1Points <= 0.0 or math.abs(target1 - fib0705) >= minTp1Points)
+
+// =============== Drawing (single updated objects)
+var line line062 = na
+var line line0705 = na
+var line line079 = na
+var box zoneBox = na
+var label sweetLabel = na
+var label swingLabel = na
+var line tp1Line = na
+var line tp2Line = na
+var line slLine = na
+var line pdhLine = na
+var line pdlLine = na
+
+if barstate.islast
+    if showPrevDay
+        if na(pdhLine)
+            pdhLine := line.new(bar_index - 1, prevDayHigh, bar_index, prevDayHigh, extend = extend.right, color = color.new(color.gray, 30), style = line.style_dotted)
+        else
+            line.set_xy1(pdhLine, bar_index - 1, prevDayHigh)
+            line.set_xy2(pdhLine, bar_index, prevDayHigh)
+        if na(pdlLine)
+            pdlLine := line.new(bar_index - 1, prevDayLow, bar_index, prevDayLow, extend = extend.right, color = color.new(color.gray, 30), style = line.style_dotted)
+        else
+            line.set_xy1(pdlLine, bar_index - 1, prevDayLow)
+            line.set_xy2(pdlLine, bar_index, prevDayLow)
     else
-        biasLockCounter -= 1
-else
-    if biasLockCounter > 0
-        biasLockCounter -= 1
+        if not na(pdhLine)
+            line.delete(pdhLine)
+            pdhLine := na
+        if not na(pdlLine)
+            line.delete(pdlLine)
+            pdlLine := na
 
-string htfBias = lastBias == 1 ? "bullish" : lastBias == -1 ? "bearish" : "neutral"
+    if swingReady
+        if showLevel062
+            if na(line062)
+                line062 := line.new(bar_index - 1, fib062, bar_index, fib062, extend = extend.right, color = color.new(color.teal, 0))
+            else
+                line.set_xy1(line062, bar_index - 1, fib062)
+                line.set_xy2(line062, bar_index, fib062)
+        else if not na(line062)
+            line.delete(line062)
+            line062 := na
 
-// =============== FVG & OB after MSS
+        if showLevel0705
+            if na(line0705)
+                line0705 := line.new(bar_index - 1, fib0705, bar_index, fib0705, extend = extend.right, color = color.new(color.yellow, 0), width = 2)
+            else
+                line.set_xy1(line0705, bar_index - 1, fib0705)
+                line.set_xy2(line0705, bar_index, fib0705)
+        else if not na(line0705)
+            line.delete(line0705)
+            line0705 := na
 
-bool canCreateZones = lastMss.confirmed and ((lastMss.direction == "bullish" and htfBias == "bullish") or (lastMss.direction == "bearish" and htfBias == "bearish"))
+        if showLevel079
+            if na(line079)
+                line079 := line.new(bar_index - 1, fib079, bar_index, fib079, extend = extend.right, color = color.new(color.orange, 0))
+            else
+                line.set_xy1(line079, bar_index - 1, fib079)
+                line.set_xy2(line079, bar_index, fib079)
+        else if not na(line079)
+            line.delete(line079)
+            line079 := na
 
-if canCreateZones
-    // FVG detection
-    bool bullishFvg = low > high[2]
-    bool bearishFvg = high < low[2]
-    if bullishFvg and lastMss.direction == "bullish"
-        float top = low
-        float bot = high[2]
-        box fvgBox = box.new(bar_index - 2, top, bar_index, bot, bgcolor = color.new(color.green, 85), border_color = color.new(color.green, 40), extend = extend.right)
-        FvgZone fvg = FvgZone.new(top, bot, bar_index, fvgBox, true, "bullish")
-        array.push(fvg_zones, fvg)
-    if bearishFvg and lastMss.direction == "bearish"
-        float top = low[2]
-        float bot = high
-        box fvgBox = box.new(bar_index - 2, top, bar_index, bot, bgcolor = color.new(color.red, 85), border_color = color.new(color.red, 40), extend = extend.right)
-        FvgZone fvg = FvgZone.new(top, bot, bar_index, fvgBox, true, "bearish")
-        array.push(fvg_zones, fvg)
+        if showZone
+            if na(zoneBox)
+                zoneBox := box.new(left = bar_index - 1, top = math.max(fib062, fib079), right = bar_index, bottom = math.min(fib062, fib079), bgcolor = zoneColor, border_color = color.new(color.teal, 40))
+            else
+                box.set_left(zoneBox, bar_index - 1)
+                box.set_right(zoneBox, bar_index)
+                box.set_top(zoneBox, math.max(fib062, fib079))
+                box.set_bottom(zoneBox, math.min(fib062, fib079))
+        else if not na(zoneBox)
+            box.delete(zoneBox)
+            zoneBox := na
 
-    // OB detection (last opposite candle)
-    int lastOppIndex = lastMss.direction == "bullish" ? ta.valuewhen(close < open, bar_index, 0) : ta.valuewhen(close > open, bar_index, 0)
-    float lastOppOpen = lastMss.direction == "bullish" ? ta.valuewhen(close < open, open, 0) : ta.valuewhen(close > open, open, 0)
-    float lastOppClose = lastMss.direction == "bullish" ? ta.valuewhen(close < open, close, 0) : ta.valuewhen(close > open, close, 0)
-    if not na(lastOppIndex)
-        float top = math.max(lastOppOpen, lastOppClose)
-        float bot = math.min(lastOppOpen, lastOppClose)
-        box obBox = box.new(lastOppIndex, top, lastOppIndex + 1, bot, bgcolor = color.new(color.blue, 85), border_color = color.new(color.blue, 40), extend = extend.right)
-        ObZone ob = ObZone.new(top, bot, lastOppIndex, obBox, true, lastMss.direction)
-        array.push(ob_zones, ob)
+        if showLevel0705
+            if na(sweetLabel)
+                sweetLabel := label.new(bar_index, fib0705, "OTE Sweet Spot", style = label.style_label_left, color = color.new(color.yellow, 0), textcolor = color.black)
+            else
+                label.set_xy(sweetLabel, bar_index, fib0705)
+        else if not na(sweetLabel)
+            label.delete(sweetLabel)
+            sweetLabel := na
 
-// Manage zone limits
-while array.size(fvg_zones) > maxFvgsOnChart
-    FvgZone fvg = array.shift(fvg_zones)
-    if not na(fvg.box_id)
-        box.delete(fvg.box_id)
+        if na(swingLabel)
+            swingLabel := label.new(bar_index, close, swingDir == 1 ? "Bullish Swing" : "Bearish Swing", style = label.style_label_left, color = color.new(color.blue, 0), textcolor = color.white)
+        else
+            label.set_text(swingLabel, swingDir == 1 ? "Bullish Swing" : "Bearish Swing")
+            label.set_xy(swingLabel, bar_index, close)
 
-while array.size(ob_zones) > maxFvgsOnChart
-    ObZone ob = array.shift(ob_zones)
-    if not na(ob.box_id)
-        box.delete(ob.box_id)
+        if showTargets
+            if na(tp1Line)
+                tp1Line := line.new(bar_index - 1, target1, bar_index, target1, extend = extend.right, color = color.new(color.green, 0), style = line.style_dashed)
+            else
+                line.set_xy1(tp1Line, bar_index - 1, target1)
+                line.set_xy2(tp1Line, bar_index, target1)
+            if not tp1Valid
+                line.set_color(tp1Line, color.new(color.green, 70))
+            else
+                line.set_color(tp1Line, color.new(color.green, 0))
 
-// Invalidate zones if filled and closed outside
-for idx = 0 to array.size(fvg_zones) - 1
-    FvgZone fvg = array.get(fvg_zones, idx)
-    if fvg.valid
-        bool touched = low <= fvg.top and high >= fvg.bot
-        bool closedOutside = close > fvg.top or close < fvg.bot
-        if touched and closedOutside
-            fvg.valid := false
-            if not na(fvg.box_id)
-                box.delete(fvg.box_id)
-            array.set(fvg_zones, idx, fvg)
+            if na(tp2Line)
+                tp2Line := line.new(bar_index - 1, target2, bar_index, target2, extend = extend.right, color = color.new(color.green, 20), style = line.style_dashed)
+            else
+                line.set_xy1(tp2Line, bar_index - 1, target2)
+                line.set_xy2(tp2Line, bar_index, target2)
+        else
+            if not na(tp1Line)
+                line.delete(tp1Line)
+                tp1Line := na
+            if not na(tp2Line)
+                line.delete(tp2Line)
+                tp2Line := na
 
-for idx = 0 to array.size(ob_zones) - 1
-    ObZone ob = array.get(ob_zones, idx)
-    if ob.valid
-        bool touched = low <= ob.top and high >= ob.bot
-        bool closedOutside = close > ob.top or close < ob.bot
-        if touched and closedOutside
-            ob.valid := false
-            if not na(ob.box_id)
-                box.delete(ob.box_id)
-            array.set(ob_zones, idx, ob)
+        if showStops
+            if na(slLine)
+                slLine := line.new(bar_index - 1, stopLevel, bar_index, stopLevel, extend = extend.right, color = color.new(color.red, 0), style = line.style_dotted)
+            else
+                line.set_xy1(slLine, bar_index - 1, stopLevel)
+                line.set_xy2(slLine, bar_index, stopLevel)
+        else if not na(slLine)
+            line.delete(slLine)
+            slLine := na
+    else
+        if not na(line062)
+            line.delete(line062)
+            line062 := na
+        if not na(line0705)
+            line.delete(line0705)
+            line0705 := na
+        if not na(line079)
+            line.delete(line079)
+            line079 := na
+        if not na(zoneBox)
+            box.delete(zoneBox)
+            zoneBox := na
+        if not na(sweetLabel)
+            label.delete(sweetLabel)
+            sweetLabel := na
+        if not na(swingLabel)
+            label.delete(swingLabel)
+            swingLabel := na
+        if not na(tp1Line)
+            line.delete(tp1Line)
+            tp1Line := na
+        if not na(tp2Line)
+            line.delete(tp2Line)
+            tp2Line := na
+        if not na(slLine)
+            line.delete(slLine)
+            slLine := na
 
-// =============== Entry/Exit logic
+// =============== Labels & alerts
+plotshape(bullEntry, title = "Bullish Entry", style = shape.labelup, text = "BUY", color = color.new(color.green, 0), textcolor = color.white, location = location.belowbar, size = size.tiny)
+plotshape(bearEntry, title = "Bearish Entry", style = shape.labeldown, text = "SELL", color = color.new(color.red, 0), textcolor = color.white, location = location.abovebar, size = size.tiny)
 
-float lastLiquidityPrice = na
-string lastLiquidityType = ""
-for idx = 0 to array.size(levels) - 1
-    LiquidityLevel lvl = array.get(levels, idx)
-    if lvl.raided
-        lastLiquidityPrice := lvl.price
-        lastLiquidityType := lvl.level_type
+plotshape(instConfluence, title = "Institutional Confluence", style = shape.circle, color = color.new(color.purple, 0), size = size.tiny, location = location.abovebar)
 
-bool bullishEntry = htfBias == "bullish" and lastLiquidityType == "SSL" and lastMss.confirmed and lastMss.direction == "bullish"
-bool bearishEntry = htfBias == "bearish" and lastLiquidityType == "BSL" and lastMss.confirmed and lastMss.direction == "bearish"
+var int lastSwingKey = na
+var bool breakevenShown = false
+int swingKey = swingReady ? (swingStartIndex * 100000 + swingEndIndex) : na
+if swingKey != lastSwingKey
+    breakevenShown := false
+    lastSwingKey := swingKey
 
-bool fvgTouchedBull = false
-bool fvgTouchedBear = false
-for idx = 0 to array.size(fvg_zones) - 1
-    FvgZone fvg = array.get(fvg_zones, idx)
-    if fvg.valid and fvg.direction == "bullish"
-        if low <= fvg.top and high >= fvg.bot
-            fvgTouchedBull := true
-    if fvg.valid and fvg.direction == "bearish"
-        if low <= fvg.top and high >= fvg.bot
-            fvgTouchedBear := true
+if showBreakeven and showTargets and tp1Valid and not breakevenShown
+    bool tp1Hit = swingDir == 1 ? high >= target1 : low <= target1
+    if tp1Hit
+        label.new(bar_index, target1, "Move SL to Breakeven", style = label.style_label_up, color = color.new(color.green, 0), textcolor = color.white)
+        breakevenShown := true
 
-bool obTouchedBull = false
-bool obTouchedBear = false
-for idx = 0 to array.size(ob_zones) - 1
-    ObZone ob = array.get(ob_zones, idx)
-    if ob.valid and ob.direction == "bullish"
-        if low <= ob.top and high >= ob.bot
-            obTouchedBull := true
-    if ob.valid and ob.direction == "bearish"
-        if low <= ob.top and high >= ob.bot
-            obTouchedBear := true
+// Alerts
+alertcondition(inNySession and (bullZone or bearZone), title = "Entered OTE Zone", message = "Price entered OTE zone within NY window")
+alertcondition(inNySession and (bullEntry or bearEntry), title = "Touch 0.705 / OTE Entry", message = "Price interacted with OTE sweet spot within NY window")
+alertcondition(instConfluence, title = "Institutional Confluence", message = "Price near institutional number (00/20/50/80)")
+alertcondition(tp1Valid and (swingDir == 1 ? high >= target1 : low <= target1), title = "Target 1 Hit", message = "OTE Target 1 reached")
+alertcondition(swingReady and (swingDir == 1 ? high >= target2 : low <= target2), title = "Target 2 Hit", message = "OTE Target 2 reached")
+alertcondition(bullInvalid or bearInvalid, title = "OTE Invalidated", message = "OTE model invalidated (0.79 broken)")
 
-bool entryBuy = bullishEntry and (fvgTouchedBull or obTouchedBull)
-bool entrySell = bearishEntry and (fvgTouchedBear or obTouchedBear)
-
-float entryPrice = close
-float slPrice = na
-float tpPrice = na
-
-if entryBuy
-    slPrice := lastLiquidityPrice - buffer
-    tpPrice := tp_mode == "FixedRR" ? entryPrice + (entryPrice - slPrice) * rr : entryPrice + (entryPrice - slPrice)
-    label entryLabel = label.new(bar_index, entryPrice, "BUY", style = label.style_label_up, color = color.new(color.green, 0), textcolor = color.white)
-    line slLine = line.new(bar_index, slPrice, bar_index + 1, slPrice, extend = extend.right, color = color.red)
-    line tpLine = line.new(bar_index, tpPrice, bar_index + 1, tpPrice, extend = extend.right, color = color.green)
-    EntrySignal signal = EntrySignal.new(bar_index, "buy", entryPrice, slPrice, tpPrice, entryLabel, slLine, tpLine)
-    if alert_on_entry
-        alert(alert_msg_entry + " | " + syminfo.ticker + " | " + timeframe.period + " | BUY | " + str.tostring(entryPrice) + " | SL " + str.tostring(slPrice) + " | TP " + str.tostring(tpPrice), alert.freq_once_per_bar)
-
-if entrySell
-    slPrice := lastLiquidityPrice + buffer
-    tpPrice := tp_mode == "FixedRR" ? entryPrice - (slPrice - entryPrice) * rr : entryPrice - (slPrice - entryPrice)
-    label entryLabel = label.new(bar_index, entryPrice, "SELL", style = label.style_label_down, color = color.new(color.red, 0), textcolor = color.white)
-    line slLine = line.new(bar_index, slPrice, bar_index + 1, slPrice, extend = extend.right, color = color.red)
-    line tpLine = line.new(bar_index, tpPrice, bar_index + 1, tpPrice, extend = extend.right, color = color.green)
-    EntrySignal signal = EntrySignal.new(bar_index, "sell", entryPrice, slPrice, tpPrice, entryLabel, slLine, tpLine)
-    if alert_on_entry
-        alert(alert_msg_entry + " | " + syminfo.ticker + " | " + timeframe.period + " | SELL | " + str.tostring(entryPrice) + " | SL " + str.tostring(slPrice) + " | TP " + str.tostring(tpPrice), alert.freq_once_per_bar)
-
-// =============== Plots for debug
-plotchar(htfBias == "bullish", title = "HTF Bias Bullish", char = "B", location = location.top, color = color.new(color.green, 0))
-plotchar(htfBias == "bearish", title = "HTF Bias Bearish", char = "S", location = location.top, color = color.new(color.red, 0))
+// =============== Info
+var label infoLabel = na
+if barstate.islast
+    string dirText = swingDir == 1 ? "Bullish" : swingDir == -1 ? "Bearish" : "N/A"
+    string sweepText = requirePdSweep ? (sweepOk ? "PD Sweep: Yes" : "PD Sweep: No") : "PD Sweep: Off"
+    string infoText = "Current Swing: " + dirText + "\nNY Window: " + (inNySession ? "Active" : "Inactive") + "\n" + sweepText
+    if na(infoLabel)
+        infoLabel := label.new(bar_index, close, infoText, style = label.style_label_left, color = color.new(color.gray, 10), textcolor = color.white)
+    else
+        label.set_text(infoLabel, infoText)
+        label.set_xy(infoLabel, bar_index, close)
