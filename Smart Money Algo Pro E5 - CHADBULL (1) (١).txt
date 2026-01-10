@@ -167,6 +167,19 @@ colorSweep  = input.color(color.gray, "", group = "Structure", inline = 'sweep')
 showTP = false //input.bool(false, 'Show Target profit',group = 'Structure')
 colorTP = color.new(color.purple, 0)  // 0 is full opacity
 
+buy_state_group = "Buy Entry (State Machine)"
+mitigation_source = input.string("Demand Zone Mitigation (IDM EXT Alert Demand)", "Mitigation/OB Tap Source", options = ["Demand Zone Mitigation (IDM EXT Alert Demand)", "Order Flow OB Tested (Major/Minor)", "Golden Zone Tap (OTE)"], group = buy_state_group)
+reset_on_choch_down = input.bool(false, "Reset on CHOCH Down", group = buy_state_group)
+reset_after_bars = input.int(0, "Reset after N bars (0=Off)", minval = 0, group = buy_state_group)
+show_golden_entry = input.bool(false, "Show Golden Zone Entry", group = buy_state_group)
+
+entry_signals_group = "Entry Signals"
+show_entry_hist_ext_ob = input.bool(true, "Entry: Hist EXT OB", group = entry_signals_group)
+show_entry_hist_idm_ob = input.bool(true, "Entry: Hist IDM OB", group = entry_signals_group)
+show_entry_ext_ob = input.bool(true, "Entry: EXT OB", group = entry_signals_group)
+show_entry_idm_ob = input.bool(true, "Entry: IDM OB", group = entry_signals_group)
+show_entry_fvg = input.bool(true, "Entry: FVG Fill", group = entry_signals_group)
+
 
 mergeRatio = 0.1  // Set a default value
 maxBarHistory = 2000  // Default value to avoid errors
@@ -256,6 +269,18 @@ var bool isSweepOBD = false
 var int current_OBD = na
 var float low_MOBD = na
 var float high_MOBD = na
+
+var int buy_state = 0
+var int buy_state_bar = na
+var int last_sweep_bar = na
+var int last_choch_up_bar = na
+var box tracked_bull_fvg = na
+var int tracked_bull_fvg_bar = na
+var box golden_zone_box = na
+var box last_hist_ext_ob = na
+var box last_hist_idm_ob = na
+var box last_ext_ob = na
+var box last_idm_ob = na
 
 //Array
 var arrTopBotBar = array.new_int(1, time)
@@ -470,6 +495,7 @@ drawIDM(bool trend) =>
     [x, y] = getDirection(trend, idmLBar, idmHBar, idmLow, idmHigh)
     //label.new(bar_index,low)
     box lstBx_ = na
+    box histBx_ = na
     if trend
         idx = -1
         float lstPrs = na
@@ -482,6 +508,7 @@ drawIDM(bool trend) =>
         if idx != -1
             lstBxIdm.set_text("Hist IDM OB")
             lstBx_ := demandZone.get(idx)
+            histBx_ := lstBxIdm
             if showIdmob
                 demandZone.get(idx).set_text("IDM OB")
                 demandZone.get(idx).set_text_color(clrtxtextbulliem)
@@ -501,6 +528,7 @@ drawIDM(bool trend) =>
         if idx != -1
             lstBxIdm.set_text("Hist IDM OB")
             lstBx_ := supplyZone.get(idx)
+            histBx_ := lstBxIdm
             if showIdmob
                 supplyZone.get(idx).set_text("IDM OB")
                 supplyZone.get(idx).set_text_color(clrtxtextbeariem)
@@ -519,13 +547,14 @@ drawIDM(bool trend) =>
     array.clear(trend ? arrIdmLow : arrIdmHigh)    
     array.clear(trend ? arrIdmLBar : arrIdmHBar) 
 
-    lstBx_
+    [lstBx_, histBx_]
 
 var box lstBx = na
  
 drawStructure(name, trend) =>
     [x, y] = getDirection(trend, lastHBar, lastLBar, lastH, lastL)
     box lstBx_ = na
+    box histBx_ = na
     if trend
         // label.new(bar_index,lstHlPrs)
         // label.new(bar_index,y)  
@@ -546,6 +575,7 @@ drawStructure(name, trend) =>
         if idx != -1
             lstBx.set_text("Hist EXT OB")
             lstBx_ := demandZone.get(idx)
+            histBx_ := lstBx
             if showExob
                 demandZone.get(idx).set_text("EXT OB")
                 demandZone.get(idx).set_text_color(clrtxtextbull)
@@ -567,6 +597,7 @@ drawStructure(name, trend) =>
         if idx != -1
             lstBx.set_text("Hist EXT OB")
             lstBx_ := supplyZone.get(idx)
+            histBx_ := lstBx
             if showExob
                 supplyZone.get(idx).set_text("EXT OB")
                 supplyZone.get(idx).set_text_color(clrtxtextbear)
@@ -588,7 +619,7 @@ drawStructure(name, trend) =>
         array.push(arrBCLine,ln)
         array.push(arrBCLabel,lbl)
 
-    [lstHlPrs,lstBx_]
+    [lstHlPrs,lstBx_,histBx_]
 
 drawLiveStrc(bool condition, bool direction, color color1, color color2, string txt, int length, label lbl, line ln) =>
     var line _ln = ln
@@ -940,6 +971,15 @@ processZones(zones, isSupply,zonesmit) =>
 
     isAlertextidm
 
+boxTap(boxRef) =>
+    tapped = false
+    if not na(boxRef)
+        topZone = box.get_top(boxRef)
+        botZone = box.get_bottom(boxRef)
+        if low <= topZone and high >= botZone
+            tapped := true
+    tapped
+
 scob(zones, isSupply) =>
     [topZone, botZone, leftZone] = marginZone(getNLastValue(zones, 1))
 
@@ -1079,9 +1119,11 @@ if findIDM and isCocUp and isCocUp
         lastH := H
         lastHBar := HBar
         lstHlPrs := labelHL(true) //Confirm HH
-        lstBx_ = drawIDM(true)
+        [lstBx_, histIdm_] = drawIDM(true)
         if not na(lstBx_)
             lstBxIdm := lstBx_
+        last_idm_ob := lstBx_
+        last_hist_idm_ob := histIdm_
         updateLastHLValue()
         H_lastH := getNLastValue(arrLastH, 1)
         L := low
@@ -1102,24 +1144,31 @@ if findIDM and isCocDn and isBosDn
         lastLBar := LBar
         lstHlPrs := labelHL(false) //Confirm LL
         updateLastHLValue()
-        lstBx_ = drawIDM(false) 
+        [lstBx_, histIdm_] = drawIDM(false) 
         if not na(lstBx_)
             lstBxIdm := lstBx_
+        last_idm_ob := lstBx_
+        last_hist_idm_ob := histIdm_
         L_lastL := getNLastValue(arrLastL, 1)
         H := high
         HBar := time
 
 //Check for ChoCh
- 
+event_choch_up = false
+event_choch_down = false
+
 if isCocDn and high > lastH
     if structure_type == "Choch without IDM" and idmHigh == lastH and close > idmHigh
         removeLastLabel(arrIdmLabel, 1)
         removeLastLine(arrIdmLine, 1)
     if close > lastH 
-        [lstHlPrsIdm_,lstBx_] = drawStructure("ChoCh", true) //Confirm CocUp 
+        event_choch_up := barstate.isconfirmed
+        [lstHlPrsIdm_,lstBx_,histExt_] = drawStructure("ChoCh", true) //Confirm CocUp 
         lstHlPrsIdm := lstHlPrsIdm_
         if not na(lstBx_)
             lstBx := lstBx_
+        last_ext_ob := lstBx_
+        last_hist_ext_ob := histExt_
         findIDM := true
         isBosUp := true
         isCocUp := true
@@ -1139,10 +1188,13 @@ if isCocUp and low < lastL
         removeLastLabel(arrIdmLabel, 1)
         removeLastLine(arrIdmLine, 1)
     if close < lastL
-        [lstHlPrsIdm_,lstBx_] = drawStructure("ChoCh", false)  //Confirm CocDn
+        event_choch_down := barstate.isconfirmed
+        [lstHlPrsIdm_,lstBx_,histExt_] = drawStructure("ChoCh", false)  //Confirm CocDn
         lstHlPrsIdm := lstHlPrsIdm_
         if not na(lstBx_)
             lstBx := lstBx_
+        last_ext_ob := lstBx_
+        last_hist_ext_ob := histExt_
         findIDM := true
         isBosUp := false
         isCocUp := false
@@ -1168,10 +1220,12 @@ if not findIDM and not isBosUp and isCocUp
             isCocDn := false
             isPrevBos := true
             lstHlPrs := labelHL(false) //Confirm HL
-            [lstHlPrsIdm_,lstBx_] = drawStructure("BOS", true)  //Confirm BosUp
+            [lstHlPrsIdm_,lstBx_,histExt_] = drawStructure("BOS", true)  //Confirm BosUp
             lstHlPrsIdm := lstHlPrsIdm_
             if not na(lstBx_)
                 lstBx := lstBx_
+            last_ext_ob := lstBx_
+            last_hist_ext_ob := histExt_
 
             lastL := L
             lastLBar := LBar
@@ -1190,10 +1244,12 @@ if not findIDM and not isBosDn and isCocDn
             isCocDn := true
             isPrevBos := true
             lstHlPrs := labelHL(true) //Confirm LH
-            [lstHlPrsIdm_,lstBx_] = drawStructure("BOS", false)  //Confirm BosDn
+            [lstHlPrsIdm_,lstBx_,histExt_] = drawStructure("BOS", false)  //Confirm BosDn
             lstHlPrsIdm := lstHlPrsIdm_
             if not na(lstBx_)
                 lstBx := lstBx_
+            last_ext_ob := lstBx_
+            last_hist_ext_ob := histExt_
 
             lastH := H
             lastHBar := HBar
@@ -1276,20 +1332,19 @@ if isOTE
     // linefill.new(o1,o2,oteclr)
     // var arrOte = array.new_box(0)
     
-    var box bxf = na
-    bxf.set_right(time)
     var bxty  = 0
-    minb = math.min(bxf.get_top(),bxf.get_bottom())
-    maxb = math.max(bxf.get_top(),bxf.get_bottom())
-    if not  na(bxf)
+    if not na(golden_zone_box)
+        golden_zone_box.set_right(time)
+        minb = math.min(golden_zone_box.get_top(),golden_zone_box.get_bottom())
+        maxb = math.max(golden_zone_box.get_top(),golden_zone_box.get_bottom())
         // if bxty == 0 
         //     if high < minb  
         //         bxty := -1
         //     if low > maxb  
         //         bxty := 1
         if (bxty == 1 and low < minb) or (bxty == -1 and high > maxb)
-            bxf.delete()
-            bxf := na
+            golden_zone_box.delete()
+            golden_zone_box := na
             bxty := 0
 
      
@@ -1297,12 +1352,12 @@ if isOTE
     [ot,oi1,dir] = drawPrevStrc(true, "", mid_label1, mid_line1,ote1)
     [ob,_,_] = drawPrevStrc(true, "", mid_label2, mid_line2,ote2)
     if not na(oi1) and (bxty == 0 ? oi1 != oi1[1] : true)//and (oi1 != oi1[1] or na(ot[1] or ot != ot[1]))
-        // if bxf.get_left() == oi1 and arrOte.size() > 0
+        // if golden_zone_box.get_left() == oi1 and arrOte.size() > 0
         //     arrOte.get(0).delete()
         
-        bxf.delete()
-        bxf := box.new(oi1,ot,time,ob,xloc = xloc.bar_time,border_color = na,bgcolor = oteclr,text = "Golden zone",text_color = color.new(oteclr,20),text_halign = text.align_center,text_size = sizGd)
-        // arrOte.unshift(bxf)
+        golden_zone_box.delete()
+        golden_zone_box := box.new(oi1,ot,time,ob,xloc = xloc.bar_time,border_color = na,bgcolor = oteclr,text = "Golden zone",text_color = color.new(oteclr,20),text_halign = text.align_center,text_size = sizGd)
+        // arrOte.unshift(golden_zone_box)
         // if arrOte.size() > maxOTECount  
         //     arrOte.pop().delete()
              
@@ -1975,6 +2030,19 @@ fvg_removed=validate_fvg_func(high,low)
 
 alertcondition(fvg_removed==1,"Bullish FVG Break","Bullish FVG Broken Ez-SMC")
 alertcondition(fvg_removed==-1,"Bearish FVG Break","Bearish FVG Broken Ez-SMC")
+
+new_bull_fvg = fvg_gap == 1 and barstate.isconfirmed
+tracked_bull_fvg_filled = not na(tracked_bull_fvg) and array.indexof(bullishgapholder, tracked_bull_fvg) == -1 and barstate.isconfirmed
+
+if event_choch_up
+    last_choch_up_bar := bar_index
+    tracked_bull_fvg := na
+    tracked_bull_fvg_bar := na
+
+if (buy_state >= 2 or event_choch_up) and new_bull_fvg and (na(last_choch_up_bar) or bar_index >= last_choch_up_bar)
+    if array.size(bullishgapholder) > 0
+        tracked_bull_fvg := array.get(bullishgapholder, array.size(bullishgapholder) - 1)
+        tracked_bull_fvg_bar := bar_index
 
 if array.size(bullishgapholder) > max_fvg
     d_box=array.shift(bullishgapholder)
@@ -3445,11 +3513,11 @@ else if close < bx.get_bottom()
 //Range detection bgcolor
 bgcolor(detect_css)
 
-plot(display_third ? max2 : na, 'Range Top'
-  , max2 != max2[1] ? na : os == 0 ? unbrokenCss : os == 1 ? upCss : dnCss)
-
-plot(display_third ? min2 : na, 'Range Bottom'
-  , min2 != min2[1] ? na : os == 0 ? unbrokenCss : os == 1 ? upCss : dnCss)
+// plot(display_third ? max2 : na, 'Range Top'
+//   , max2 != max2[1] ? na : os == 0 ? unbrokenCss : os == 1 ? upCss : dnCss)
+//
+// plot(display_third ? min2 : na, 'Range Bottom'
+//   , min2 != min2[1] ? na : os == 0 ? unbrokenCss : os == 1 ? upCss : dnCss)
 
 //-----------------------------------------------------------------------------}
 //-----------------------------------------------------------------------------}
@@ -3519,6 +3587,141 @@ bearishSFP = high > pHighVal and close < pHighVal and open < pHighVal and high =
 
 bullCond = bullishSFP[3] and (close > pLowVal) and  (close[1] > pLowVal[1]) and (close[2] > pLowVal[2]) and bar_index >= bullSignalIndex + cooldownPeriod
 bearCond = bearishSFP[3] and (close < pHighVal) and  (close[1] < pHighVal[1]) and (close[2] < pHighVal[2]) and bar_index >= bearSignalIndex + cooldownPeriod
+
+//==============================
+// ICT Signals Layer (Flexible)
+// Paste this right AFTER:
+// isAlertextidmSell = processZones(...)
+// isAlertextidmBuy  = processZones(...)
+//==============================
+groupIct = "ICT Signals Layer"
+
+showSignals   = input.bool(true,  "Show Entry Signals", group=groupIct)
+requireBias   = input.bool(false, "Require Bias (stateful)", group=groupIct)
+requireIDM    = input.bool(true,  "Require IDM Mitigation", group=groupIct)
+requireSweep  = input.bool(false, "Require Sweep", group=groupIct)
+
+structureMode = input.string("MSS or BOS", "Structure Mode",
+     options=["MSS","BOS","MSS or BOS"], group=groupIct)
+
+confirmedOnly = input.bool(true, "Confirmed bars only", group=groupIct)
+
+// Lookback windows (THIS is what usually makes signals appear)
+lbStructure   = input.int(20, "Structure lookback bars (0 = same bar only)", minval=0, group=groupIct)
+lbIDM         = input.int(5,  "IDM lookback bars (0 = same bar only)", minval=0, group=groupIct)
+lbSweep       = input.int(10, "Sweep lookback bars (0 = same bar only)", minval=0, group=groupIct)
+
+// Anti-spam
+onePerSide    = input.bool(true, "One signal per side until opposite", group=groupIct)
+
+// Optional debug
+debugLayer    = input.bool(false, "Debug (plot components)", group=groupIct)
+
+okBar = confirmedOnly ? barstate.isconfirmed : true
+
+// --------------------
+// Bias (stateful)
+// --------------------
+bullBiasEvent = (alertBullOfMajor or alertBullOfMinor)
+bearBiasEvent = (alertBearOfMajor or alertBearOfMinor)
+
+var int biasState = 0
+if bullBiasEvent
+    biasState := 1
+else if bearBiasEvent
+    biasState := -1
+
+bullBias = biasState == 1
+bearBias = biasState == -1
+
+// --------------------
+// Structure (combine internal + external)
+// --------------------
+bullMSS_any = (bull_mss or bull_mss_)
+bearMSS_any = (bear_mss or bear_mss_)
+bullBOS_any = (bull_bos or bull_bos_)
+bearBOS_any = (bear_bos or bear_bos_)
+
+bullStrEvent = structureMode == "MSS" ? bullMSS_any :
+     structureMode == "BOS" ? bullBOS_any : (bullMSS_any or bullBOS_any)
+
+bearStrEvent = structureMode == "MSS" ? bearMSS_any :
+     structureMode == "BOS" ? bearBOS_any : (bearMSS_any or bearBOS_any)
+
+bsBull = ta.barssince(bullStrEvent)
+bsBear = ta.barssince(bearStrEvent)
+
+bullStrOK = lbStructure == 0 ? bullStrEvent : (bsBull >= 0 and bsBull <= lbStructure)
+bearStrOK = lbStructure == 0 ? bearStrEvent : (bsBear >= 0 and bsBear <= lbStructure)
+
+// --------------------
+// IDM (allow lookback)
+// --------------------
+bsIDMBuy  = ta.barssince(isAlertextidmBuy)
+bsIDMSell = ta.barssince(isAlertextidmSell)
+
+idmBuyOK  = lbIDM == 0 ? isAlertextidmBuy  : (bsIDMBuy  >= 0 and bsIDMBuy  <= lbIDM)
+idmSellOK = lbIDM == 0 ? isAlertextidmSell : (bsIDMSell >= 0 and bsIDMSell <= lbIDM)
+
+// --------------------
+// Sweep (optional lookback)
+// --------------------
+bsSwBull = ta.barssince(bullCond)
+bsSwBear = ta.barssince(bearCond)
+
+sweepBuyOK  = lbSweep == 0 ? bullCond : (bsSwBull >= 0 and bsSwBull <= lbSweep)
+sweepSellOK = lbSweep == 0 ? bearCond : (bsSwBear >= 0 and bsSwBear <= lbSweep)
+
+// --------------------
+// Final Signals (Flexible)
+// --------------------
+buyRaw =
+     showSignals and okBar and
+     (requireBias  ? bullBias   : true) and
+     bullStrOK and
+     (requireIDM   ? idmBuyOK   : true) and
+     (requireSweep ? sweepBuyOK : true)
+
+sellRaw =
+     showSignals and okBar and
+     (requireBias  ? bearBias    : true) and
+     bearStrOK and
+     (requireIDM   ? idmSellOK   : true) and
+     (requireSweep ? sweepSellOK : true)
+
+// Edge trigger (only when it turns true)
+buyEdge  = buyRaw  and not buyRaw[1]
+sellEdge = sellRaw and not sellRaw[1]
+
+// One-per-side until opposite (optional)
+var int lastSide = 0
+buySignal  = buyEdge  and (not onePerSide or lastSide != 1)
+sellSignal = sellEdge and (not onePerSide or lastSide != -1)
+
+if buySignal
+    lastSide := 1
+if sellSignal
+    lastSide := -1
+
+// --------------------
+// Plots
+// --------------------
+plotshape(buySignal, title="ICT BUY",  style=shape.labelup,   location=location.belowbar, text="BUY",  size=size.tiny)
+plotshape(sellSignal, title="ICT SELL", style=shape.labeldown, location=location.abovebar, text="SELL", size=size.tiny)
+
+// --------------------
+// Alerts
+// --------------------
+alertcondition(buySignal,  title="ICT BUY Entry",  message="{{ticker}} ICT BUY Entry | Price: {{close}}")
+alertcondition(sellSignal, title="ICT SELL Entry", message="{{ticker}} ICT SELL Entry | Price: {{close}}")
+
+// --------------------
+// Debug (disabled to avoid extra plots)
+// --------------------
+// plotchar(debugLayer ? bullStrEvent : na, title="DBG bullStrEvent", char="S", location=location.bottom)
+// plotchar(debugLayer ? isAlertextidmBuy : na, title="DBG idmBuy", char="I", location=location.bottom)
+// plotchar(debugLayer ? bullBiasEvent : na, title="DBG bullBiasEvent", char="B", location=location.bottom)
+// plotchar(debugLayer ? buyRaw : na, title="DBG buyRaw", char="▲", location=location.bottom)
 
 //Check Swing H/L Stopper
 var int swingLowCounter = 0
@@ -3611,6 +3814,67 @@ plotshape(display_third ? bearCond : na, text='Sweep', color=bearColor, textcolo
 //ALERTS
 alertcondition(bullishSFP, title='Bullish Sweep', message='{{ticker}} Bullish Sweep, Price:{{close}}')
 alertcondition(bearishSFP, title='Bearish Sweep', message='{{ticker}} Bearish Sweep, Price:{{close}}')
+
+event_sweep_bull = bullishSFP and barstate.isconfirmed
+
+golden_zone_tap = isOTE and not na(golden_zone_box) and barstate.isconfirmed and low <= math.max(golden_zone_box.get_top(), golden_zone_box.get_bottom()) and high >= math.min(golden_zone_box.get_top(), golden_zone_box.get_bottom())
+
+entry_hist_ext_ob = show_entry_hist_ext_ob and barstate.isconfirmed and boxTap(last_hist_ext_ob)
+entry_hist_idm_ob = show_entry_hist_idm_ob and barstate.isconfirmed and boxTap(last_hist_idm_ob)
+entry_ext_ob = show_entry_ext_ob and barstate.isconfirmed and boxTap(last_ext_ob)
+entry_idm_ob = show_entry_idm_ob and barstate.isconfirmed and boxTap(last_idm_ob)
+entry_fvg = show_entry_fvg and barstate.isconfirmed and fvg_removed == 1
+
+event_fvg_fill = fvg_removed == 1 and barstate.isconfirmed
+
+event_mitigation_tap = switch mitigation_source
+    "Demand Zone Mitigation (IDM EXT Alert Demand)" => isAlertextidmBuy
+    "Order Flow OB Tested (Major/Minor)" => (alertBullOfMajor or alertBullOfMinor)
+    "Golden Zone Tap (OTE)" => golden_zone_tap
+    => false
+
+golden_entry_signal = show_golden_entry and golden_zone_tap
+
+buy_signal = false
+
+if buy_state == 0
+    if event_sweep_bull
+        buy_state := 1
+        buy_state_bar := bar_index
+        last_sweep_bar := bar_index
+if buy_state == 1
+    if event_choch_up
+        buy_state := 2
+        buy_state_bar := bar_index
+if buy_state == 2
+    if event_fvg_fill
+        buy_state := 3
+        buy_state_bar := bar_index
+        buy_signal := true
+
+if buy_state == 3
+    buy_state := 0
+
+if reset_on_choch_down and event_choch_down and buy_state != 0
+    buy_state := 0
+    buy_state_bar := na
+    tracked_bull_fvg := na
+    tracked_bull_fvg_bar := na
+
+if reset_after_bars > 0 and buy_state != 0 and not na(buy_state_bar)
+    if bar_index - buy_state_bar >= reset_after_bars
+        buy_state := 0
+        buy_state_bar := na
+        tracked_bull_fvg := na
+        tracked_bull_fvg_bar := na
+
+alertcondition(buy_signal, title="Buy Entry", message="BUY: Sweep → CHOCH Up → FVG Fill")
+alertcondition(golden_entry_signal, title="Golden Zone Entry", message="Golden Zone Entry (OTE Tap)")
+alertcondition(entry_hist_ext_ob, title="Entry Hist EXT OB", message="Entry: Hist EXT OB Tap")
+alertcondition(entry_hist_idm_ob, title="Entry Hist IDM OB", message="Entry: Hist IDM OB Tap")
+alertcondition(entry_ext_ob, title="Entry EXT OB", message="Entry: EXT OB Tap")
+alertcondition(entry_idm_ob, title="Entry IDM OB", message="Entry: IDM OB Tap")
+alertcondition(entry_fvg, title="Entry FVG Fill", message="Entry: Bullish FVG Fill")
 
 //------------------------------------------------------------------------------
 //  === Zig Zag Channels ===
@@ -3720,10 +3984,10 @@ if barstate.islast and extend and display_third
           ,color=dncol,style=line.style_dotted,extend=extend.right)[1])
           
 //------------------------------------------------------------------------------
-plot(display_third and btm ? low[length1] : top_ ? high[length1] : na,'Circles'
-  ,color = btm ? dncol : upcol
-  ,style=plot.style_circles
-  ,offset=-length1)
+// plot(display_third and btm ? low[length1] : top_ ? high[length1] : na,'Circles'
+//   ,color = btm ? dncol : upcol
+//   ,style=plot.style_circles
+//   ,offset=-length1)
 
 //-----------------------------------------------------------------------------}
 
