@@ -495,6 +495,7 @@ drawIDM(bool trend) =>
     [x, y] = getDirection(trend, idmLBar, idmHBar, idmLow, idmHigh)
     //label.new(bar_index,low)
     box lstBx_ = na
+    box histBx_ = na
     if trend
         idx = -1
         float lstPrs = na
@@ -507,8 +508,7 @@ drawIDM(bool trend) =>
         if idx != -1
             lstBxIdm.set_text("Hist IDM OB")
             lstBx_ := demandZone.get(idx)
-            last_hist_idm_ob := lstBxIdm
-            last_idm_ob := lstBx_
+            histBx_ := lstBxIdm
             if showIdmob
                 demandZone.get(idx).set_text("IDM OB")
                 demandZone.get(idx).set_text_color(clrtxtextbulliem)
@@ -528,8 +528,7 @@ drawIDM(bool trend) =>
         if idx != -1
             lstBxIdm.set_text("Hist IDM OB")
             lstBx_ := supplyZone.get(idx)
-            last_hist_idm_ob := lstBxIdm
-            last_idm_ob := lstBx_
+            histBx_ := lstBxIdm
             if showIdmob
                 supplyZone.get(idx).set_text("IDM OB")
                 supplyZone.get(idx).set_text_color(clrtxtextbeariem)
@@ -548,13 +547,14 @@ drawIDM(bool trend) =>
     array.clear(trend ? arrIdmLow : arrIdmHigh)    
     array.clear(trend ? arrIdmLBar : arrIdmHBar) 
 
-    lstBx_
+    [lstBx_, histBx_]
 
 var box lstBx = na
  
 drawStructure(name, trend) =>
     [x, y] = getDirection(trend, lastHBar, lastLBar, lastH, lastL)
     box lstBx_ = na
+    box histBx_ = na
     if trend
         // label.new(bar_index,lstHlPrs)
         // label.new(bar_index,y)  
@@ -575,8 +575,7 @@ drawStructure(name, trend) =>
         if idx != -1
             lstBx.set_text("Hist EXT OB")
             lstBx_ := demandZone.get(idx)
-            last_hist_ext_ob := lstBx
-            last_ext_ob := lstBx_
+            histBx_ := lstBx
             if showExob
                 demandZone.get(idx).set_text("EXT OB")
                 demandZone.get(idx).set_text_color(clrtxtextbull)
@@ -598,8 +597,7 @@ drawStructure(name, trend) =>
         if idx != -1
             lstBx.set_text("Hist EXT OB")
             lstBx_ := supplyZone.get(idx)
-            last_hist_ext_ob := lstBx
-            last_ext_ob := lstBx_
+            histBx_ := lstBx
             if showExob
                 supplyZone.get(idx).set_text("EXT OB")
                 supplyZone.get(idx).set_text_color(clrtxtextbear)
@@ -621,7 +619,7 @@ drawStructure(name, trend) =>
         array.push(arrBCLine,ln)
         array.push(arrBCLabel,lbl)
 
-    [lstHlPrs,lstBx_]
+    [lstHlPrs,lstBx_,histBx_]
 
 drawLiveStrc(bool condition, bool direction, color color1, color color2, string txt, int length, label lbl, line ln) =>
     var line _ln = ln
@@ -1121,9 +1119,11 @@ if findIDM and isCocUp and isCocUp
         lastH := H
         lastHBar := HBar
         lstHlPrs := labelHL(true) //Confirm HH
-        lstBx_ = drawIDM(true)
+        [lstBx_, histIdm_] = drawIDM(true)
         if not na(lstBx_)
             lstBxIdm := lstBx_
+        last_idm_ob := lstBx_
+        last_hist_idm_ob := histIdm_
         updateLastHLValue()
         H_lastH := getNLastValue(arrLastH, 1)
         L := low
@@ -1144,9 +1144,11 @@ if findIDM and isCocDn and isBosDn
         lastLBar := LBar
         lstHlPrs := labelHL(false) //Confirm LL
         updateLastHLValue()
-        lstBx_ = drawIDM(false) 
+        [lstBx_, histIdm_] = drawIDM(false) 
         if not na(lstBx_)
             lstBxIdm := lstBx_
+        last_idm_ob := lstBx_
+        last_hist_idm_ob := histIdm_
         L_lastL := getNLastValue(arrLastL, 1)
         H := high
         HBar := time
@@ -1161,10 +1163,12 @@ if isCocDn and high > lastH
         removeLastLine(arrIdmLine, 1)
     if close > lastH 
         event_choch_up := barstate.isconfirmed
-        [lstHlPrsIdm_,lstBx_] = drawStructure("ChoCh", true) //Confirm CocUp 
+        [lstHlPrsIdm_,lstBx_,histExt_] = drawStructure("ChoCh", true) //Confirm CocUp 
         lstHlPrsIdm := lstHlPrsIdm_
         if not na(lstBx_)
             lstBx := lstBx_
+        last_ext_ob := lstBx_
+        last_hist_ext_ob := histExt_
         findIDM := true
         isBosUp := true
         isCocUp := true
@@ -1185,10 +1189,12 @@ if isCocUp and low < lastL
         removeLastLine(arrIdmLine, 1)
     if close < lastL
         event_choch_down := barstate.isconfirmed
-        [lstHlPrsIdm_,lstBx_] = drawStructure("ChoCh", false)  //Confirm CocDn
+        [lstHlPrsIdm_,lstBx_,histExt_] = drawStructure("ChoCh", false)  //Confirm CocDn
         lstHlPrsIdm := lstHlPrsIdm_
         if not na(lstBx_)
             lstBx := lstBx_
+        last_ext_ob := lstBx_
+        last_hist_ext_ob := histExt_
         findIDM := true
         isBosUp := false
         isCocUp := false
@@ -1214,10 +1220,12 @@ if not findIDM and not isBosUp and isCocUp
             isCocDn := false
             isPrevBos := true
             lstHlPrs := labelHL(false) //Confirm HL
-            [lstHlPrsIdm_,lstBx_] = drawStructure("BOS", true)  //Confirm BosUp
+            [lstHlPrsIdm_,lstBx_,histExt_] = drawStructure("BOS", true)  //Confirm BosUp
             lstHlPrsIdm := lstHlPrsIdm_
             if not na(lstBx_)
                 lstBx := lstBx_
+            last_ext_ob := lstBx_
+            last_hist_ext_ob := histExt_
 
             lastL := L
             lastLBar := LBar
@@ -1236,10 +1244,12 @@ if not findIDM and not isBosDn and isCocDn
             isCocDn := true
             isPrevBos := true
             lstHlPrs := labelHL(true) //Confirm LH
-            [lstHlPrsIdm_,lstBx_] = drawStructure("BOS", false)  //Confirm BosDn
+            [lstHlPrsIdm_,lstBx_,histExt_] = drawStructure("BOS", false)  //Confirm BosDn
             lstHlPrsIdm := lstHlPrsIdm_
             if not na(lstBx_)
                 lstBx := lstBx_
+            last_ext_ob := lstBx_
+            last_hist_ext_ob := histExt_
 
             lastH := H
             lastHBar := HBar
