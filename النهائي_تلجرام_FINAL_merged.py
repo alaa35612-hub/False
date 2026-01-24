@@ -7,16 +7,16 @@ requested by the user: Pullback, Market Structure, Order Block (including Zone
 Type and SCOB), Order Flow, Candle, and Structure utilities (PDH/PDL/MID/OTE).
 
 The implementation mirrors the Pine Script execution order so the resulting
-state, labels, boxes, lines, and alerts match the behaviour of the original
-indicator when fed with the same OHLCV series.  Features that belong to other
+state, labels, boxes, and lines match the behaviour of the original indicator
+when fed with the same OHLCV series.  Features that belong to other
 packages in the Pine file are intentionally omitted, per the latest user
 instruction.
 
 The script can be invoked directly or through ``main()`` which handles command
-line arguments, Binance USDT-M scanning via ``ccxt`` (read-only), and report
-generation inside ``FINAL_REPORT_SMART_MONEY_ANALYSIS.md``.  The code is
-organised to expose the intermediate state so tests can validate structural
-parity against the Pine logic.
+line arguments and report generation inside
+``FINAL_REPORT_SMART_MONEY_ANALYSIS.md``.  The code is organised to expose the
+intermediate state so tests can validate structural parity against the Pine
+logic.
 """
 
 from __future__ import annotations
@@ -82,7 +82,7 @@ def _save_json_set(path: Path, data: set[str]) -> None:
     try:
         path.write_text(json.dumps(sorted(data), ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
-        # Never crash scanner due to cache IO
+        # Never crash due to cache IO
         pass
 
 def _fmt_price_key(v: float) -> str:
@@ -145,25 +145,6 @@ ANSI_HEADER_COLORS = [
 ]
 
 
-@dataclass(frozen=True)
-class _EditorAutorunDefaults:
-    timeframe: str = "15m"
-    candle_limit: int = 500
-    max_symbols: int = 600
-    recent_bars: int = 2
-    continuous_scan: bool = True
-    scan_interval: float = 14.0
-    height_metric: str = "percentage"
-    height_scope: Optional[str] = None
-    height_threshold: Optional[float] = None
-    height_candle_window: Optional[int] = None
-
-
-# لتفعيل التشغيل المستمر افتراضيًا يمكنك تعديل المتغير التالي إلى True
-# كما يمكن تحديد فترة الانتظار بين الدورات من المتغير الذي يليه.
-AUTORUN_CONTINUOUS_SCAN = True
-AUTORUN_SCAN_INTERVAL = 0.0
-
 # -----------------------------------------------------------------------------
 # Telegram Settings (عدّل هذه القيم من أعلى الملف)
 # -----------------------------------------------------------------------------
@@ -197,18 +178,13 @@ except Exception:
     pass
 
 
-EDITOR_AUTORUN_DEFAULTS = _EditorAutorunDefaults(
-    continuous_scan=AUTORUN_CONTINUOUS_SCAN,
-    scan_interval=AUTORUN_SCAN_INTERVAL,
-)
-
 
 @dataclass(frozen=True)
 class BinanceSymbolSelectorConfig:
     """User-facing switches controlling Binance symbol prioritisation."""
 
     # ``فلتر الارتفاع`` configuration lives here so users can adjust the
-    # prioritisation thresholds without hunting through the scanner logic.
+    # prioritisation thresholds without hunting through the selector logic.
     # Leave the numeric fields ``None`` to disable any implicit defaults—the
     # user supplies the preferred threshold, timeframe scope, and candle
     # window explicitly when they wish to enable the filter.
@@ -1393,7 +1369,7 @@ class SmartMoneyAlgoProE5:
         self.series = SeriesAccessor()
         self.base_tf_seconds: Optional[int] = _parse_timeframe_to_seconds(base_timeframe, None)
         self.base_timeframe = base_timeframe or ""
-        self.ticker: str = ""  # set by scanner (symbol) for persistent OB de-dup
+        self.ticker: str = ""  # set by symbol for persistent OB de-dup
         self.security_series: Dict[str, SecuritySeries] = {}
         self.ob_volume_history: Dict[str, PineArray] = {}
         self.ob_valid_history: Dict[str, bool] = {}
@@ -1404,7 +1380,6 @@ class SmartMoneyAlgoProE5:
         self.labels: List[Label] = []
         self.lines: List[Line] = []
         self.boxes: List[Box] = []
-        self.alerts: List[Tuple[int, str]] = []
         self.bar_colors: List[Tuple[int, str]] = []
         self.console_event_log: Dict[str, Dict[str, Any]] = {}
         self.console_box_status_tally: Dict[str, Counter[str]] = defaultdict(Counter)
@@ -1505,19 +1480,6 @@ class SmartMoneyAlgoProE5:
         self._register_box_event(box, status="archived")
         self._trace("box.archive", "archive", timestamp=box.right, text=hist_text)
 
-    def alertcondition(self, condition: bool, title: str, message: Optional[str] = None) -> None:
-        if condition:
-            timestamp = self.series.get_time(0)
-            text = title if message is None else f"{title} :: {message}"
-            self.alerts.append((timestamp, text))
-            self._trace(
-                "alertcondition",
-                "trigger",
-                timestamp=timestamp,
-                title=title,
-                alert_message=message,
-            )
-
     def _eval_condition(
         self,
         name: str,
@@ -1596,7 +1558,6 @@ class SmartMoneyAlgoProE5:
         bullish_gap_holder = getattr(self, "bullish_gap_holder", PineArray())
         bearish_gap_holder = getattr(self, "bearish_gap_holder", PineArray())
         metrics = {
-            "alerts": len(self.alerts),
             "labels": len(self.labels),
             "lines": len(self.lines),
             "boxes": len(self.boxes),
@@ -1628,7 +1589,6 @@ class SmartMoneyAlgoProE5:
         metrics["ext_ob_new"] = _status_total(ext_counter, "new")
         metrics["ext_ob_touched"] = _status_total(ext_counter, "touched", "retest")
         metrics["current_price"] = self.series.get("close")
-        metrics["latest_events"] = self._collect_latest_console_events()
         return metrics
 
     def _register_label_event(self, label: Label) -> None:
@@ -1711,7 +1671,7 @@ class SmartMoneyAlgoProE5:
             status_label = self.BOX_STATUS_LABELS.get(status, status)
             status_key = status if isinstance(status, str) and status else "active"
             tally = self.console_box_status_tally[key]
-            # De-dup first touch / first retest across scanner runs (runtime is rebuilt per symbol).
+            # De-dup first touch / first retest across runs (runtime is rebuilt per symbol).
             # This mirrors the "touched/retested cache" behaviour in the 3d updated script.
             if key in ("IDM_OB", "EXT_OB") and status_key in ("touched", "retest"):
                 sym = getattr(self, "ticker", "") or ""
@@ -1748,147 +1708,6 @@ class SmartMoneyAlgoProE5:
                 bottom=box.bottom,
                 status=status,
             )
-            if key in ("IDM_OB", "EXT_OB") and status_key in ("touched", "retest"):
-                sym = getattr(self, "ticker", "") or ""
-                prefix = f"{sym} " if sym else ""
-                price_range = f"{format_price(box.bottom)} → {format_price(box.top)}"
-                self.alertcondition(
-                    True,
-                    f"{prefix}{box.text} {status_label}",
-                    f"{prefix}{box.text} {status_label}: {price_range}",
-                )
-
-            if status_key == "new":
-                alert_titles = {
-                    "IDM_OB": "IDM OB Zone Created",
-                    "EXT_OB": "EXT OB Zone Created",
-                    "GOLDEN_ZONE": "Golden Zone Created",
-                }
-                alert_title = alert_titles.get(key)
-                if alert_title:
-                    price_range = f"{format_price(box.bottom)} → {format_price(box.top)}"
-                    message = f"{{ticker}} {box.text} Created, Range: {price_range}"
-                    self.alertcondition(True, alert_title, message)
-
-    def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
-        events: Dict[str, Dict[str, Any]] = {}
-        for key, value in self.console_event_log.items():
-            payload = value.copy()
-            if "time" in payload and "time_display" not in payload:
-                payload["time_display"] = format_timestamp(payload.get("time"))
-            if not self._console_event_within_age(payload.get("time")):
-                continue
-            events[key] = payload
-
-        def record_label(
-            key: str,
-            predicate: Callable[[Label], bool],
-            formatter: Optional[Callable[[Label], str]] = None,
-        ) -> None:
-            for lbl in reversed(self.labels):
-                if not isinstance(lbl, Label):
-                    continue
-                if not self._console_event_within_age(lbl.x):
-                    continue
-                if predicate(lbl):
-                    display = formatter(lbl) if formatter else f"{lbl.text} @ {format_price(lbl.y)}"
-                    events[key] = {
-                        "text": lbl.text,
-                        "price": lbl.y,
-                        "display": display,
-                        "time": lbl.x,
-                        "time_display": format_timestamp(lbl.x),
-                    }
-                    break
-
-        def record_box(
-            key: str,
-            predicate: Callable[[Box], bool],
-            sources: Optional[Sequence[Iterable[Box]]] = None,
-        ) -> None:
-            iterables = sources or (self.boxes,)
-            for source in iterables:
-                if isinstance(source, PineArray):
-                    seq = list(source.values)
-                elif isinstance(source, list):
-                    seq = source
-                else:
-                    seq = list(source)
-                for bx in reversed(seq):
-                    if not isinstance(bx, Box):
-                        continue
-                    if not self._console_event_within_age(bx.left):
-                        continue
-                    if predicate(bx):
-                        events[key] = {
-                            "text": bx.text,
-                            "price": (bx.bottom, bx.top),
-                            "display": f"{bx.text} {format_price(bx.bottom)} → {format_price(bx.top)}",
-                            "time": bx.left,
-                            "time_display": format_timestamp(bx.left),
-                            "status": events.get(key, {}).get("status", "active"),
-                            "status_display": events.get(key, {}).get(
-                                "status_display",
-                                self.BOX_STATUS_LABELS.get("active", "active"),
-                            ),
-                        }
-                        return
-
-        bull_color = self.inputs.structure.bull
-        bear_color = self.inputs.structure.bear
-
-        def _text_equals(label: Label, target: str, *, allow_hyphen: bool = False) -> bool:
-            text = label.text.strip()
-            if not allow_hyphen and "-" in text:
-                return False
-            if text == target:
-                return True
-            collapsed = text.replace(" ", "")
-            return collapsed == target.replace(" ", "")
-
-        record_label("BOS", lambda lbl: _text_equals(lbl, "BOS") or _text_equals(lbl, "B O S"))
-        record_label("BOS_PLUS", lambda lbl: _text_equals(lbl, "BOS+", allow_hyphen=True))
-        record_label("CHOCH", lambda lbl: _text_equals(lbl, self.CHOCH_TEXT))
-        record_label("MSS_PLUS", lambda lbl: _text_equals(lbl, "MSS+", allow_hyphen=True))
-        record_label("MSS", lambda lbl: _text_equals(lbl, "MSS") and "+" not in lbl.text)
-        record_label("IDM", lambda lbl: _text_equals(lbl, self.IDM_TEXT))
-        record_label(
-            "FUTURE_BOS",
-            lambda lbl: lbl.text.startswith(f"{self.BOS_TEXT} -"),
-            lambda lbl: lbl.text,
-        )
-        record_label(
-            "FUTURE_CHOCH",
-            lambda lbl: lbl.text.startswith(f"{self.CHOCH_TEXT} -"),
-            lambda lbl: lbl.text,
-        )
-        record_label("X", lambda lbl: lbl.text.strip() == "X")
-        record_label(
-            "RED_CIRCLE",
-            lambda lbl: lbl.style == "label.style_circle" and lbl.color == bear_color,
-            lambda lbl: f"هبوط @ {format_price(lbl.y)}",
-        )
-        record_label(
-            "GREEN_CIRCLE",
-            lambda lbl: lbl.style == "label.style_circle" and lbl.color == bull_color,
-            lambda lbl: f"صعود @ {format_price(lbl.y)}",
-        )
-
-        record_box("IDM_OB", lambda bx: bx.text == "IDM OB")
-        record_box("EXT_OB", lambda bx: bx.text == "EXT OB")
-        record_box(
-            "HIST_IDM_OB",
-            lambda bx: bx.text == "Hist IDM OB",
-            sources=(self.hist_idm_boxes, self.boxes),
-        )
-        record_box(
-            "HIST_EXT_OB",
-            lambda bx: bx.text == "Hist EXT OB",
-            sources=(self.hist_ext_boxes, self.boxes),
-        )
-        record_box("GOLDEN_ZONE", lambda bx: bx.text == "Golden zone")
-
-        return events
 
     def _sync_state_mirrors(self) -> None:
         """Mirror Pine ``var``/``array`` structures into dedicated containers."""
@@ -2067,7 +1886,6 @@ class SmartMoneyAlgoProE5:
                 "labels": [],
                 "lines": [],
                 "boxes": [],
-                "alerts": [],
                 "bar_colors": [],
             }
 
@@ -2083,10 +1901,6 @@ class SmartMoneyAlgoProE5:
             "labels": [_serialize_label(lbl) for lbl in self.labels],
             "lines": [_serialize_line(ln) for ln in self.lines],
             "boxes": [_serialize_box(bx) for bx in self.boxes],
-            "alerts": [
-                {"time": time_val, "title": title}
-                for time_val, title in self.alerts
-            ],
             "bar_colors": [
                 {"time": time_val, "color": color}
                 for time_val, color in self.bar_colors
@@ -2899,11 +2713,6 @@ class SmartMoneyAlgoProE5:
                 if level.line is not None:
                     level.line.set_color(new_color)
                 if sr.enableBreakAlerts and level.last_break_alert_time != current_time:
-                    self.alertcondition(
-                        True,
-                        f"{level.timeframe} {level.rs_type} Break",
-                        f"{level.rs_type} Break {level.timeframe}",
-                    )
                     level.last_break_alert_time = current_time
             else:
                 touch = False
@@ -2941,11 +2750,6 @@ class SmartMoneyAlgoProE5:
                         level.last_retest_bar = bar_index
                         level.last_retest_time = current_time
                         if sr.enableRetestAlerts and level.last_retest_alert_time != current_time:
-                            self.alertcondition(
-                                True,
-                                f"{level.timeframe} {level.rs_type} Retest",
-                                f"{level.rs_type} Retest {level.timeframe}",
-                            )
                             level.last_retest_alert_time = current_time
         else:
             if sr.expandLines:
@@ -3589,14 +3393,6 @@ class SmartMoneyAlgoProE5:
                 self.high_eqh_pre = high_value
                 self.eq_top_x = eq_high[0]
 
-        self.alertcondition(bull_mss, "Bullish MSS", "Bullish MSS Found Ez-SMC")
-        self.alertcondition(bear_mss, "Bearish MSS", "Bearish MSS Found Ez-SMC")
-        self.alertcondition(bull_bos, "Bullish BOS", "Bullish BOS Found Ez-SMC")
-        self.alertcondition(bear_bos, "Bearish BOS", "Bearish MSS Found Ez-SMC")
-        self.alertcondition(bull_mss_ext, "Bullish MSS+", "Bullish MSS+ Found Ez-SMC")
-        self.alertcondition(bear_mss_ext, "Bearish MSS+", "Bearish MSS+ Found Ez-SMC")
-        self.alertcondition(bear_bos_ext, "Bearish BOS+", "Bearish BOS+ Found Ez-SMC")
-        self.alertcondition(bull_bos_ext, "Bullish BOS+", "Bullish BOS+ Found Ez-SMC")
 
     def _update_key_levels(self, open_: float, high: float, low: float) -> None:
         kl = self.inputs.key_levels
@@ -4515,26 +4311,6 @@ class SmartMoneyAlgoProE5:
         seconds = _parse_timeframe_to_seconds(timeframe, self.base_tf_seconds)
         key = self._security_key(timeframe, seconds)
         valid, volume_, b_volume, s_volume, top_val, bottom_val, left_val, type_val, _type = result
-        self.alertcondition(
-            _type == "External Bearish",
-            "Bearish External OB",
-            "Bearish External OB Found Ez-SMC",
-        )
-        self.alertcondition(
-            _type == "External Bullish",
-            "Bullish External OB",
-            "Bullish External OB Found Ez-SMC",
-        )
-        self.alertcondition(
-            _type == "Internal Bearish",
-            "Bearish Internal OB",
-            "Bearish Internal OB Found Ez-SMC",
-        )
-        self.alertcondition(
-            _type == "Internal Bullish",
-            "Bullish Internal OB",
-            "Bullish Internal OB Found Ez-SMC",
-        )
         prev_valid = self.ob_valid_history.get(key, False)
         self.ob_valid_history[key] = valid
         if valid and not prev_valid:
@@ -4807,8 +4583,6 @@ class SmartMoneyAlgoProE5:
 
         self.bullish_OB_Break = bull_base or bull_mtf
         self.bearish_OB_Break = bear_base or bear_mtf
-        self.alertcondition(self.bullish_OB_Break, "Bullish OB Break", "Bullish OB Broken Ez-SMC")
-        self.alertcondition(self.bearish_OB_Break, "Bearish OB Break", "Bearish OB Broken Ez-SMC")
 
     @staticmethod
     def _canonical_mitigation(value: str) -> str:
@@ -5160,10 +4934,6 @@ class SmartMoneyAlgoProE5:
         self._fvg_trim(self.bearish_low_holder, fvg.max_fvg)
         self._fvg_trim(self.bearish_label_holder, fvg.max_fvg)
 
-        self.alertcondition(self.fvg_gap == 1, "Bullish FVG", "Bullish FVG Found Ez-SMC")
-        self.alertcondition(self.fvg_gap == -1, "Bearish FVG", "Bearish FVG Found Ez-SMC")
-        self.alertcondition(self.fvg_removed == 1, "Bullish FVG Break", "Bullish FVG Broken Ez-SMC")
-        self.alertcondition(self.fvg_removed == -1, "Bearish FVG Break", "Bearish FVG Broken Ez-SMC")
 
     def _update_liquidity(self) -> None:
         liq = self.inputs.liquidity
@@ -5267,18 +5037,6 @@ class SmartMoneyAlgoProE5:
         self._liquidity_extend_boxes(self.highBoxArrayHTF, extend_time)
         self._liquidity_extend_boxes(self.lowBoxArrayHTF, extend_time)
 
-        self.alertcondition(created_high, "High Liquidity Level", "High Liquidity Level Found Ez-SMC")
-        self.alertcondition(created_low, "Low Liquidity Level", "Low Liquidity Level Found Ez-SMC")
-        self.alertcondition(
-            high_line_alert or high_box_alert,
-            "High Liquidity Level Break",
-            "High Liquidity Level Broken Ez-SMC",
-        )
-        self.alertcondition(
-            low_line_alert or low_box_alert,
-            "Low Liquidity Level Break",
-            "Low Liquidity Level Broken Ez-SMC",
-        )
 
     def _update_swing_detection(self) -> None:
         inputs = self.inputs.swing_detection
@@ -5571,8 +5329,6 @@ class SmartMoneyAlgoProE5:
                 x2_time = self.series.get_time(4) if length > 4 else time_val
                 self.highLine.set_x2(x2_time)
 
-        self.alertcondition(bullishSFP, "Bullish Sweep", "{{ticker}} Bullish Sweep, Price:{{close}}")
-        self.alertcondition(bearishSFP, "Bearish Sweep", "{{ticker}} Bearish Sweep, Price:{{close}}")
 
     def _update_candlestick_patterns(self) -> None:
         if self.series.length() < 2:
@@ -5680,11 +5436,6 @@ class SmartMoneyAlgoProE5:
                 "color.white",
                 tooltip,
             )
-            self.alertcondition(
-                True,
-                "New pattern detected",
-                "New Engulfing – Bullish pattern detected",
-            )
 
         if bearish_engulfing and display_third:
             tooltip = (
@@ -5705,11 +5456,6 @@ class SmartMoneyAlgoProE5:
                 "size.auto",
                 "color.white",
                 tooltip,
-            )
-            self.alertcondition(
-                True,
-                "New pattern detected",
-                "New Engulfing – Bearish pattern detected",
             )
 
         self.candle_black_body_history.append(black_body)
@@ -7188,16 +6934,10 @@ class SmartMoneyAlgoProE5:
         alertBullOfMinor, alertBearOfMinor = self.getProcess(
             self.arrOBBulls, self.arrOBBears, self.arrOBBullisVs, self.arrOBBearisVs
         )
-        self.alertcondition(alertBullOfMajor, "Major Bullish order flow", "Major Bullish order flow")
-        self.alertcondition(alertBearOfMajor, "Major Bearish order flow", "Major Bearish order flow")
-        self.alertcondition(alertBullOfMinor, "Minor Bullish order flow", "Minor Bullish order flow")
-        self.alertcondition(alertBearOfMinor, "Minor Bearish order flow", "Minor Bearish order flow")
 
         # Order block zone processing ---------------------------------------
         isAlertextidmSell = self.processZones(self.supplyZone, True, self.supplyZoneIsMit)
         isAlertextidmBuy = self.processZones(self.demandZone, False, self.demandZoneIsMit)
-        self.alertcondition(isAlertextidmSell, "IDM EXT Alert Supply", "IDM EXT Alert Supply")
-        self.alertcondition(isAlertextidmBuy, "IDM EXT Alert Demand", "IDM EXT Alert Demand")
 
         # POI sweeps ---------------------------------------------------------
         if self.inputs.order_block.showPOI and self.series.length() > 4:
@@ -7327,7 +7067,7 @@ class SmartMoneyAlgoProE5:
 
 
 # ----------------------------------------------------------------------------
-# Binance scanner and report generation
+# Report generation
 # ----------------------------------------------------------------------------
 
 
@@ -8363,7 +8103,7 @@ def format_pullback_section(source: str, inventory: PullbackInventory) -> str:
     lines.append("7. التسلسل الزمني (Top→Down) مع «⟪…⟫»")
     lines.extend(inventory.timeline or ["- غير متاح"])
 
-    lines.append("8. المخرجات البصرية/التنبيهات المتعلقة بـPullback")
+    lines.append("8. المخرجات البصرية المتعلقة بـPullback")
     if inventory.outputs:
         for output in inventory.outputs:
             lines.append(f"- {output['context']}::{output['type']} {output['quote']}")
@@ -8482,7 +8222,6 @@ def generate_pullback_report(
 def render_report(
     runtime: SmartMoneyAlgoProE5,
     outfile: Path,
-    scanner_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
     pullback_section = textwrap.dedent(
@@ -8505,7 +8244,6 @@ def render_report(
 
         ### الكيانات
         - خطوط الهيكل: {sum(1 for line in runtime.lines if line.style in ("line.style_dashed", "line.style_dotted"))}
-        - تنبيهات الهيكل: {sum(1 for _, title in runtime.alerts if "BOS" in title or "ChoCh" in title)}
         """
     ).strip()
 
@@ -8519,7 +8257,6 @@ def render_report(
 
         ### المناطق الفعالة
         - إجمالي الصناديق: {len(runtime.boxes)}
-        - تنبيهات IDM EXT: {sum(1 for _, title in runtime.alerts if "IDM EXT" in title)}
         """
     ).strip()
 
@@ -8532,7 +8269,6 @@ def render_report(
 
         ### إشارات الشموع
         - ألوان الأعمدة المسجلة: {len(runtime.bar_colors)}
-        - تنبيهات Order Flow: {sum(1 for _, title in runtime.alerts if "order flow" in title.lower())}
         """
     ).strip()
 
@@ -8559,22 +8295,17 @@ def render_report(
 
     coverage_table = textwrap.dedent(
         """
-        | الحزمة | المدخلات | المتغيرات | المصفوفات | الدوال | التنبيهات | العناصر المرسومة |
-        |--------|----------|-----------|-----------|--------|-----------|--------------------|
-        | Pullback | 3 | 6 | 4 | 3 | 0 | {pullback_draws} |
-        | Market Structure | 6 | 18 | 12 | 10 | {ms_alerts} | {ms_draws} |
-        | Order Block | 18 | 22 | 16 | 12 | {ob_alerts} | {len_boxes} |
-        | SCOB | 3 | 5 | 4 | 4 | {scob_alerts} | {bar_colors} |
+        | الحزمة | المدخلات | المتغيرات | المصفوفات | الدوال | العناصر المرسومة |
+        |--------|----------|-----------|-----------|--------|--------------------|
+        | Pullback | 3 | 6 | 4 | 3 | {pullback_draws} |
+        | Market Structure | 6 | 18 | 12 | 10 | {ms_draws} |
+        | Order Block | 18 | 22 | 16 | 12 | {len_boxes} |
+        | SCOB | 3 | 5 | 4 | 4 | {bar_colors} |
         """
     ).format(
         pullback_draws=sum(1 for lbl in runtime.labels if lbl.text in ("HH", "HL", "LH", "LL")),
-        ms_alerts=sum(1 for _, title in runtime.alerts if "BOS" in title or "ChoCh" in title),
         ms_draws=sum(1 for line in runtime.lines if line.style in ("line.style_dashed", "line.style_dotted")),
-        ob_alerts=sum(
-            1 for _, title in runtime.alerts if "IDM EXT" in title or "OB Break" in title
-        ),
         len_boxes=len(runtime.boxes),
-        scob_alerts=sum(1 for _, title in runtime.alerts if "order flow" in title.lower()),
         bar_colors=len(runtime.bar_colors),
     )
 
@@ -8603,27 +8334,6 @@ def render_report(
 
     full_settings_section = "## الإعدادات الكاملة\n" + "\n".join(full_settings_lines)
 
-    scanner_section = ""
-    if scanner_rows:
-        rows = "\n".join(
-            f"| {row['symbol']} | {row['timeframe']} | {row.get('candles', '')} | "
-            f"{row.get('alerts', 0)} | {row.get('boxes', 0)} | "
-            f"{row.get('metrics', {}).get('demand_zones', 0)} | {row.get('metrics', {}).get('supply_zones', 0)} | "
-            f"{row.get('metrics', {}).get('bullish_fvg', 0)} | {row.get('metrics', {}).get('bearish_fvg', 0)} | "
-            f"{row.get('metrics', {}).get('order_flow_boxes', 0)} | {row.get('metrics', {}).get('scob_colored_bars', 0)} |"
-            for row in scanner_rows
-        )
-        scanner_section = textwrap.dedent(
-            f"""
-## ماسح Binance USDT-M
-
-| الرمز | الإطار الزمني | الشموع | التنبيهات | الصناديق | مناطق الطلب | مناطق العرض | FVG صاعدة | FVG هابطة | Order Flow | SCOB |
-|-------|---------------|--------|-----------|-----------|-------------|--------------|-----------|-----------|------------|------|
-{rows}
-
-"""
-        )
-
     content = textwrap.dedent(
         f"""
 # FINAL_REPORT_SMART_MONEY_ANALYSIS
@@ -8631,7 +8341,7 @@ def render_report(
 **المؤشر**: Smart Money Algo Pro E5 - CHADBULL
 **التاريخ**: {now}
 
-{scanner_section}## فهرس المحتويات
+    ## فهرس المحتويات
 1. [Pullback](#pullback)
 2. [Market Structure](#market-structure)
 3. [Order Block](#order-block)
@@ -8672,123 +8382,7 @@ def run_runtime_from_file(
         candles = candles[-bars:]
     runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe if timeframe else None)
     runtime.process(candles)
-    triggers = _detect_new_formations_and_touches(runtime, args.timeframe, cfg.formation_lookback)
-    if triggers:
-        for _ln in triggers:
-            print("  →", _ln)
-        if cfg.tg_enable:
-            try:
-                _send_tg(cfg, [f"{sym} {args.timeframe}"] + triggers)
-            except Exception:
-                pass
     render_report(runtime, outfile)
-
-
-METRIC_LABELS = [
-    ("alerts", "عدد التنبيهات"),
-    ("pullback_arrows", "إشارات Pullback"),
-    ("choch_labels", "علامات CHoCH"),
-    ("bos_labels", "علامات BOS"),
-    ("idm_labels", "علامات IDM"),
-    ("demand_zones", "مناطق الطلب"),
-    ("supply_zones", "مناطق العرض"),
-    ("idm_ob_new", "IDM OB تم إنشائها حديثاً"),
-    ("idm_ob_touched", "IDM OB تم ملامستها"),
-    ("ext_ob_new", "EXT OB تم إنشائها حديثاً"),
-    ("ext_ob_touched", "EXT OB تم ملامستها"),
-    ("bullish_fvg", "فجوات FVG صاعدة"),
-    ("bearish_fvg", "فجوات FVG هابطة"),
-    ("order_flow_boxes", "صناديق Order Flow"),
-    ("liquidity_objects", "مستويات السيولة"),
-    ("scob_colored_bars", "شموع SCOB"),
-]
-
-
-EVENT_DISPLAY_ORDER = [
-    ("BOS", "BOS"),
-    ("BOS_PLUS", "BOS+"),
-    ("CHOCH", "CHOCH"),
-    ("MSS_PLUS", "MSS+"),
-    ("MSS", "MSS"),
-    ("IDM", "IDM"),
-    ("IDM_OB", "IDM OB"),
-    ("EXT_OB", "EXT OB"),
-    ("HIST_IDM_OB", "Hist IDM OB"),
-    ("HIST_EXT_OB", "Hist EXT OB"),
-    ("GOLDEN_ZONE", "Golden zone"),
-    ("X", "X"),
-    ("RED_CIRCLE", "الدوائر الحمراء"),
-    ("GREEN_CIRCLE", "الدوائر الخضراء"),
-    ("FUTURE_BOS", "ليبل BOS المستقبلي"),
-    ("FUTURE_CHOCH", "ليبل CHOCH المستقبلي"),
-]
-
-
-def print_symbol_summary(index: int, symbol: str, timeframe: str, candle_count: int, metrics: Dict[str, Any]) -> None:
-    header_color = ANSI_HEADER_COLORS[index % len(ANSI_HEADER_COLORS)]
-    symbol_display = _format_symbol(symbol)
-    header_lines = [
-        f"{header_color}{ANSI_BOLD}════ تحليل {symbol_display}{header_color}{ANSI_BOLD} ({timeframe}) ════{ANSI_RESET}",
-        f"{ANSI_DIM}عدد الشموع: {candle_count}{ANSI_RESET}",
-    ]
-    price_value = metrics.get("current_price")
-    if isinstance(price_value, (int, float)):
-        price_value = float(price_value)
-        if not math.isnan(price_value):
-            header_lines.append(f"{ANSI_DIM}السعر الحالي: {format_price(price_value)}{ANSI_RESET}")
-    elif isinstance(price_value, str):
-        header_lines.append(f"{ANSI_DIM}السعر الحالي: {price_value}{ANSI_RESET}")
-    change_value = metrics.get("daily_change_percent")
-    if isinstance(change_value, (int, float)):
-        header_lines.append(
-            f"{ANSI_DIM}تغير 24 ساعة: {change_value:+.2f}%{ANSI_RESET}"
-        )
-    header = "\n".join(header_lines)
-    print(header, flush=True)
-    for key, label in METRIC_LABELS:
-        value = metrics.get(key, 0)
-        value_color = ANSI_VALUE_POS if value > 0 else ANSI_VALUE_ZERO
-        print(
-            f"  {ANSI_LABEL}{label:<26}{ANSI_RESET}: {value_color}{value}{ANSI_RESET}",
-            flush=True,
-        )
-    latest_events = metrics.get("latest_events") or {}
-    print(f"{ANSI_BOLD}أحدث الإشارات مع الأسعار{ANSI_RESET}", flush=True)
-    for key, label in EVENT_DISPLAY_ORDER:
-        event = latest_events.get(key)
-        if event:
-            display_text = event.get("display")
-            if display_text is None:
-                price = event.get("price")
-                if isinstance(price, tuple):
-                    display_text = " → ".join(format_price(p) for p in price)
-                else:
-                    display_text = format_price(price if isinstance(price, (int, float)) else None)
-            status_display = event.get("status_display")
-            if status_display:
-                display_text = f"{display_text} [{status_display}]"
-            time_display = event.get("time_display") or format_timestamp(event.get("time"))
-            if time_display and time_display != "—":
-                display_text = f"{display_text} | {time_display}"
-            direction_hint = _resolve_direction(
-                event.get("direction"),
-                event.get("direction_display"),
-                event.get("status"),
-                event.get("text"),
-                display_text,
-            )
-            colored_display = _colorize_directional_text(
-                display_text,
-                direction=direction_hint,
-                fallback=ANSI_VALUE_POS,
-            )
-        else:
-            colored_display = _colorize_directional_text("—", direction=None, fallback=ANSI_VALUE_ZERO)
-        print(
-            f"  {ANSI_LABEL}{label:<26}{ANSI_RESET}: {colored_display}",
-            flush=True,
-        )
-    print(f"{ANSI_DIM}{'-'*48}{ANSI_RESET}", flush=True)
 
 
 def print_trace_comparison(result: TraceComparisonResult) -> None:
@@ -8810,194 +8404,12 @@ def print_trace_comparison(result: TraceComparisonResult) -> None:
             print(f"  - ... {extra} اختلافات إضافية", flush=True)
 
 
-def _extract_daily_change_percent(ticker: Dict[str, Any]) -> Optional[float]:
-    """Return the 24h percentage change if available."""
-
-    value = ticker.get("percentage") if isinstance(ticker, dict) else None
-    if value is None:
-        open_price = ticker.get("open") if isinstance(ticker, dict) else None
-        last_price = ticker.get("last") if isinstance(ticker, dict) else None
-        if open_price and last_price and open_price != 0:
-            value = ((float(last_price) - float(open_price)) / float(open_price)) * 100.0
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _collect_recent_event_hits(
-    series: Any,
-    latest_events: Any,
-    *,
-    bars: int = 2,
-) -> Tuple[List[str], List[int]]:
-    """Identify latest-event keys that fall within the most recent candles."""
-
-    if bars <= 0:
-        return [], []
-
-    recent_times: List[int] = []
-    if hasattr(series, "get_time"):
-        for offset in range(bars):
-            try:
-                ts = series.get_time(offset)
-            except Exception:
-                ts = None
-            if isinstance(ts, (int, float)) and ts > 0:
-                recent_times.append(int(ts))
-
-    if not recent_times or not isinstance(latest_events, dict):
-        return [], recent_times
-
-    hits: List[str] = []
-    for key, payload in latest_events.items():
-        timestamp: Optional[Union[int, float]] = None
-        if isinstance(payload, dict):
-            timestamp = payload.get("time") or payload.get("ts") or payload.get("timestamp")
-        if isinstance(timestamp, (int, float)) and int(timestamp) in recent_times:
-            hits.append(str(key))
-    return hits, recent_times
-
-
-def scan_binance(
-    timeframe: str,
-    limit: int,
-    symbols: Optional[List[str]],
-    concurrency: int,
-    tracer: Optional[ExecutionTracer] = None,
-    *,
-    min_daily_change: float = 0.0,
-    inputs: Optional[IndicatorInputs] = None,
-    recent_window_bars: Optional[int] = None,
-    max_symbols: Optional[int] = None,
-    symbol_selector: Optional[BinanceSymbolSelectorConfig] = None,
-) -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
-    if ccxt is None:
-        raise RuntimeError("ccxt is not available")
-    exchange = ccxt.binanceusdm({"enableRateLimit": True})
-    all_symbols = symbols or fetch_binance_usdtm_symbols(
-        exchange,
-        limit=max_symbols,
-        selector=symbol_selector,
-    )
-    if max_symbols and max_symbols > 0:
-        all_symbols = all_symbols[: int(max_symbols)]
-    summaries: List[Dict[str, Any]] = []
-    primary_runtime: Optional[SmartMoneyAlgoProE5] = None
-    window = recent_window_bars
-    if window is None:
-        console_inputs = getattr(inputs, "console", None) if inputs else None
-        if console_inputs is not None and getattr(console_inputs, "max_age_bars", None) is not None:
-            try:
-                window = int(console_inputs.max_age_bars) + 1
-            except Exception:
-                window = 2
-        else:
-            window = 2
-    window = max(1, int(window))
-    for idx, symbol in enumerate(all_symbols):
-        try:
-            ticker = exchange.fetch_ticker(symbol)
-        except Exception as exc:
-            print(
-                f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ticker: {exc}",
-                file=sys.stderr,
-                flush=True,
-            )
-            continue
-        daily_change = _extract_daily_change_percent(ticker)
-        if min_daily_change > 0.0 and daily_change is not None and daily_change <= min_daily_change:
-            print(
-                f"تخطي {_format_symbol(symbol)} (تغير 24 ساعة {daily_change:.2f}% ≤ الحد الأدنى {min_daily_change:.2f}%)",
-                flush=True,
-            )
-            if tracer and tracer.enabled:
-                tracer.log(
-                    "scan",
-                    "symbol_skipped_daily_change",
-                    timestamp=None,
-                    symbol=symbol,
-                    change=daily_change,
-                    threshold=min_daily_change,
-                )
-            continue
-        candles = fetch_ohlcv(exchange, symbol, timeframe, limit)
-        runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
-        runtime.process(candles)
-        metrics = runtime.gather_console_metrics()
-        latest_events = metrics.get("latest_events") or {}
-        recent_hits, recent_times = _collect_recent_event_hits(
-            runtime.series, latest_events, bars=window
-        )
-        if not recent_hits:
-            print(
-                f"تخطي {_format_symbol(symbol)} لعدم وجود أحداث خلال آخر {window} شموع",
-                flush=True,
-            )
-            if tracer and tracer.enabled:
-                tracer.log(
-                    "scan",
-                    "symbol_skipped_stale_events",
-                    timestamp=runtime.series.get_time(0) or None,
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    reference_times=recent_times,
-                    window=window,
-                )
-            continue
-
-        metrics["daily_change_percent"] = daily_change
-        summaries.append(
-            {
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "candles": len(candles),
-                "alerts": metrics.get("alerts", len(runtime.alerts)),
-                "boxes": metrics.get("boxes", len(runtime.boxes)),
-                "metrics": metrics,
-            }
-        )
-        print_symbol_summary(idx, symbol, timeframe, len(candles), metrics)
-        if tracer and tracer.enabled:
-            tracer.log(
-                "scan",
-                "symbol_complete",
-                timestamp=runtime.series.get_time(0),
-                symbol=symbol,
-                timeframe=timeframe,
-                candles=len(candles),
-            )
-        if primary_runtime is None:
-            primary_runtime = runtime
-    if primary_runtime is None:
-        primary_runtime = SmartMoneyAlgoProE5(inputs=inputs, tracer=tracer)
-        primary_runtime.process([])
-    return primary_runtime, summaries
-
-
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Smart Money Algo Pro E5 Python port")
     parser.add_argument("--data", type=Path, help="JSON file with OHLCV candles", required=False)
     parser.add_argument("--outfile", type=Path, default=Path("FINAL_REPORT_SMART_MONEY_ANALYSIS.md"))
-    parser.add_argument("--timeframe", type=str, default="1h", help="Timeframe used when scanning Binance")
-    parser.add_argument("--analysis-timeframe", type=str, default="", help="Override base timeframe when using --data or --no-scan")
-    parser.add_argument(
-        "--lookback",
-        type=int,
-        default=0,
-        help="Number of candles to request per symbol when scanning (0 = full history)",
-    )
+    parser.add_argument("--analysis-timeframe", type=str, default="", help="Override base timeframe when using --data")
     parser.add_argument("--bars", type=int, default=0, help="Limit number of candles to analyse from --data source")
-    parser.add_argument("--symbols", type=str, default="")
-    parser.add_argument("--concurrency", type=int, default=3)
-    parser.add_argument(
-        "--min-daily-change",
-        type=float,
-        default=0.0,
-        help="الحد الأدنى لتغير 24 ساعة (٪) لاختيار الرمز عند مسح Binance، 0 لتعطيل الفلتر",
-    )
     parser.add_argument(
         "--pullback-report",
         action="store_true",
@@ -9009,7 +8421,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=Path("Smart Money Algo Pro E5 - CHADBULL.txt"),
         help="مسار ملف Pine الأصلي لاستخراج منطق Pullback",
     )
-    parser.add_argument("--no-scan", action="store_true")
     parser.add_argument("--trace", action="store_true", help="Enable execution tracing")
     parser.add_argument("--trace-file", type=Path, help="Write execution trace to JSON file")
     parser.add_argument("--compare-trace", type=Path, help="قارن التتبع الحالي بملف JSON مرجعي")
@@ -9019,34 +8430,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=1,
         help="Ignore console events older than this many completed bars (minimum 1)",
     )
-    parser.add_argument(
-        "--continuous",
-        "--continuous-scan",
-        dest="continuous_scan",
-        action=_OptionalBoolAction,
-        default=False,
-        help="تشغيل ماسح Binance في حلقة متواصلة بدون توقف (يدعم true/false)",
-    )
-    parser.add_argument(
-        "--no-continuous",
-        "--no-continuous-scan",
-        dest="continuous_scan",
-        action="store_false",
-        help="تعطيل حلقة المسح المستمرة",
-    )
-    parser.add_argument(
-        "--scan-interval",
-        type=float,
-        default=0.0,
-        help="عدد الثواني للانتظار قبل إعادة تشغيل المسح عند تفعيل --continuous-scan",
-    )
     args = parser.parse_args(argv)
-    if args.min_daily_change < 0.0:
-        parser.error("--min-daily-change يجب أن يكون رقمًا غير سالب")
     if args.max_age_bars <= 0:
         parser.error("--max-age-bars يجب أن يكون رقمًا موجبًا")
-    if args.scan_interval < 0.0:
-        parser.error("--scan-interval يجب أن يكون رقمًا غير سالب")
 
     def log(stage: str) -> None:
         print(stage, flush=True)
@@ -9101,2177 +8487,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         tracer.emit()
         return 0
 
-    if args.no_scan:
-        log("Foundation")
-        log("Inventory")
-        runtime = SmartMoneyAlgoProE5(
-            inputs=indicator_inputs,
-            base_timeframe=args.analysis_timeframe or None,
-            tracer=tracer,
-        )
-        log("Timeline")
-        runtime.process([])
-        perform_comparison()
-        log("Rendering")
-        render_report(runtime, args.outfile)
-        log("Coverage")
-        tracer.emit()
-        return 0
-
-    manual_symbols = [s.strip() for s in args.symbols.split(",") if s.strip()] or None
-
-    iteration = 0
-    try:
-        while True:
-            iteration += 1
-            tracer.clear()
-            start = time.time()
-            if args.continuous_scan and iteration > 1:
-                print(f"\nإعادة تشغيل المسح (الدورة {iteration})", flush=True)
-            log("Foundation")
-            log("Inventory")
-            log("Timeline")
-            runtime, summaries = scan_binance(
-                args.timeframe,
-                args.lookback,
-                manual_symbols,
-                args.concurrency,
-                tracer,
-                min_daily_change=args.min_daily_change,
-                inputs=indicator_inputs,
-            )
-            perform_comparison()
-            log("Rendering")
-            render_report(runtime, args.outfile, summaries)
-            elapsed = time.time() - start
-            log(f"Coverage ({elapsed:.2f}s)")
-            tracer.emit()
-            if not args.continuous_scan:
-                print(
-                    "اكتمل المسح بعد دورة واحدة لأن خيار التشغيل المستمر غير مُفعّل."
-                    " لتفعيل الحلقة استخدم --continuous-scan=true أو فعّل المتغير"
-                    " AUTORUN_CONTINUOUS_SCAN في أعلى الملف.",
-                    flush=True,
-                )
-                break
-            if args.scan_interval > 0.0:
-                print(
-                    f"انتظار {args.scan_interval:.2f} ثانية قبل تشغيل المسح التالي",
-                    flush=True,
-                )
-                time.sleep(args.scan_interval)
-    except KeyboardInterrupt:
-        print("تم إيقاف المسح من قبل المستخدم.", flush=True)
+    log("Foundation")
+    log("Inventory")
+    runtime = SmartMoneyAlgoProE5(
+        inputs=indicator_inputs,
+        base_timeframe=args.analysis_timeframe or None,
+        tracer=tracer,
+    )
+    log("Timeline")
+    runtime.process([])
+    perform_comparison()
+    log("Rendering")
+    render_report(runtime, args.outfile)
+    log("Coverage")
+    tracer.emit()
     return 0
 
-
-# ============================================================================
-# Embedded Binance symbol picker + live scanner CLI (non-invasive)
-# - لا تغييرات على منطق المؤشر؛ كل شيء هنا مستقل ويستدعي الواجهات العامة فقط
-# ============================================================================
-
-# ----------------------------- Filters & Helpers -----------------------------
-_MEME_BASES = {
-    "DOGE","SHIB","PEPE","FLOKI","BONK","WIF","BABYDOGE","MOG","DEGEN","PONKE","BODEN","MEME",
-    "AIDOGE","MEOW","GME","TOSHI","HOPPY","KITTY","LADYS","CREAM","PIPI","JEET","CHILLGUY","HUAHUA"
-}
-_DEFAULT_EXCLUDE_PATTERNS = "INU,DOGE,PEPE,FLOKI,BONK,SHIB,BABY,CAT,MOON,MEME"
-
-
-def _pct_24h(t: Dict) -> float:
-    v = t.get("percentage")
-    if v is None and isinstance(t.get("info"), dict):
-        v = t["info"].get("priceChangePercent")
-    try:
-        return float(v)
-    except Exception:
-        return 0.0
-
-def _qv_24h(t: Dict) -> float:
-    v = t.get("quoteVolume")
-    if v is None and isinstance(t.get("info"), dict):
-        v = t["info"].get("quoteVolume")
-    try:
-        return float(v) if v is not None else 0.0
-    except Exception:
-        return 0.0
-
-def _base(sym: str) -> str:
-    if "/" in sym:
-        return sym.split("/")[0]
-    if sym.endswith("USDT"):
-        return sym[:-4]
-    return sym
-
-def _normalize_list(csv_like: str) -> List[str]:
-    if not csv_like:
-        return []
-    return [x.strip().upper() for x in csv_like.split(",") if x.strip()]
-
-
-def _parse_bool_token(token: str) -> bool:
-    normalized = token.strip().lower()
-    if normalized in {"1", "true", "yes", "on", "y", "enable", "enabled"}:
-        return True
-    if normalized in {"0", "false", "no", "off", "n", "disable", "disabled"}:
-        return False
-    raise ValueError(f"قيمة منطقية غير صالحة: {token!r}")
-
-
-class _OptionalBoolAction(argparse.Action):
-    """argparse action allowing ``--flag`` or ``--flag=false`` patterns."""
-
-    def __init__(self, option_strings, dest, **kwargs):  # type: ignore[override]
-        if "nargs" in kwargs:
-            raise ValueError("_OptionalBoolAction لا يدعم تحديد nargs")
-        kwargs.setdefault("default", False)
-        super().__init__(option_strings, dest, nargs="?", **kwargs)
-
-    def __call__(self, parser, namespace, values, option_string=None):  # type: ignore[override]
-        if values is None:
-            setattr(namespace, self.dest, True)
-            return
-        try:
-            parsed = _parse_bool_token(str(values))
-        except ValueError as exc:
-            parser.error(str(exc))
-        setattr(namespace, self.dest, parsed)
-
-
-# ----------------------------- CLI Settings ----------------------------------
-@dataclass
-class _CLISettings:
-    # indicator toggles that exist in port (wired where safe)
-    showHL: bool = False
-    showMn: bool = False
-    showISOB: bool = True
-    showMajoinMiner: bool = False
-    showCircleHL: bool = True
-    showSMC: bool = True
-    lengSMC: int = 40
-    swing_size: int = 10
-    show_fvg: bool = True
-    show_liquidity: bool = True
-    liquidity_display_limit: int = 20
-    drop_last_incomplete: bool = False
-    # extra structure toggles used by android entry
-    show_ote: bool = True
-    show_mark_x: bool = True
-    # continuous scan controls (Android/Editor autorun)
-    continuous_scan: bool = False
-    continuous_interval: float = 0.0
-    # scanner controls
-    tg_enable: bool = False
-    tg_title_prefix: str = "SMC Alert"
-    tg_bot_token: str = ""      # Bot Token (يمكن تركه فارغًا لاستخدام متغيرات البيئة/أعلى الملف)
-    tg_chat_id: str = ""        # Chat ID
-    tg_mirror_stdout: bool = False
-    tg_parse_mode: str = ""     # "", "HTML", "MarkdownV2" ...
-    tg_disable_web_preview: bool = True
-    tg_mirror_flush_seconds: float = 2.0
-    tg_mirror_max_lines: int = 25
-    # matching indicator behavior
-    ob_test_mode: str = "CLOSE"  # goes to demand_supply.mittigation_filt (canonicalized inside)
-    zone_type: str = "Mother Bar"  # goes to order_block.poi_type
-    bos_confirmation: str = "Close"
-    strict_close_for_break: bool = False
-    # filters
-    market: str = "usdtm"         # {usdtm, spot}
-    min_change: float = 5.0       # ≥ %
-    min_volume: float = 30_000_000.0  # ≥ USDT
-    max_scan: int = 600          # after filtering & sorting
-    allow_meme: bool = False
-    exclude_symbols: str = ""
-    exclude_patterns: str = _DEFAULT_EXCLUDE_PATTERNS
-    include_only: str = ""
-
-def _get_secret(name: str) -> Optional[str]:
-    return os.environ.get(name)
-
-def _tg_chunk_text(text: str, limit: int) -> List[str]:
-    """Split text into Telegram-safe chunks (Telegram hard limit ~4096 chars)."""
-    if limit <= 0:
-        return [text]
-    if len(text) <= limit:
-        return [text]
-    chunks: List[str] = []
-    cur: List[str] = []
-    cur_len = 0
-    for line in text.splitlines():
-        # +1 for newline
-        ln = line
-        add_len = len(ln) + 1
-        if cur and (cur_len + add_len) > limit:
-            chunks.append("\n".join(cur))
-            cur = [ln]
-            cur_len = len(ln)
-        else:
-            cur.append(ln)
-            cur_len += add_len
-        # handle extremely long single line
-        if len(ln) > limit:
-            # flush current
-            if cur:
-                chunks.append("\n".join(cur[:-1]))
-            big = ln
-            for i in range(0, len(big), limit):
-                chunks.append(big[i:i+limit])
-            cur = []
-            cur_len = 0
-    if cur:
-        chunks.append("\n".join(cur))
-    return [c for c in chunks if c.strip()]
-
-def _send_tg(cfg: _CLISettings, lines: List[str]) -> None:
-    """Send message lines to Telegram if enabled.
-
-    Token/Chat ID priority:
-    1) cfg.tg_bot_token / cfg.tg_chat_id
-    2) environment variables TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
-    3) top-of-file globals TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
-    """
-    if not getattr(cfg, "tg_enable", False):
-        return
-
-    token = (
-        (getattr(cfg, "tg_bot_token", "") or "").strip()
-        or (_get_secret("TELEGRAM_BOT_TOKEN") or "").strip()
-        or str(globals().get("TELEGRAM_BOT_TOKEN", "") or "").strip()
-    )
-    chat_id = (
-        (getattr(cfg, "tg_chat_id", "") or "").strip()
-        or (_get_secret("TELEGRAM_CHAT_ID") or "").strip()
-        or str(globals().get("TELEGRAM_CHAT_ID", "") or "").strip()
-    )
-    if not token or not chat_id:
-        return
-
-    parse_mode = (getattr(cfg, "tg_parse_mode", "") or "").strip()
-    disable_preview = bool(getattr(cfg, "tg_disable_web_preview", True))
-    max_chars = int(
-        getattr(cfg, "tg_max_message_chars", 3800)
-        if hasattr(cfg, "tg_max_message_chars")
-        else 3800
-    )
-
-    raw_text = "\n".join([ln.rstrip() for ln in lines if isinstance(ln, str)]).strip()
-    if not raw_text:
-        return
-
-    # Strip ANSI color codes (Telegram doesn't render them)
-    try:
-        raw_text = re.sub(r"\x1b\[[0-9;]*m", "", raw_text)
-    except Exception:
-        pass
-
-    # If HTML parse mode is enabled, escape to avoid breaking Telegram formatting.
-    if parse_mode.upper() == "HTML":
-        try:
-            import html
-            raw_text = html.escape(raw_text)
-        except Exception:
-            pass
-
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-
-    def _post(payload: dict) -> None:
-        """POST to Telegram using requests if available, otherwise urllib."""
-        if requests is not None:
-            r = requests.post(url, data=payload, timeout=15)
-            try:
-                if getattr(r, 'status_code', 200) >= 400:
-                    raise RuntimeError(f"HTTP {r.status_code}: {getattr(r, 'text', '')[:300]}")
-            except Exception as _e:
-                raise
-            return
-        # stdlib fallback
-        import urllib.parse
-        import urllib.request
-        data = urllib.parse.urlencode(payload).encode("utf-8")
-        req = urllib.request.Request(url, data=data, method="POST")
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            status = getattr(resp, 'status', 200)
-            body = resp.read().decode('utf-8', 'ignore') if hasattr(resp, 'read') else ''
-            if status >= 400:
-                raise RuntimeError(f"HTTP {status}: {body[:300]}")
-            # ok
-            return
-
-    try:
-        for chunk in _tg_chunk_text(raw_text, max_chars):
-            payload = {"chat_id": chat_id, "text": chunk}
-            if parse_mode:
-                payload["parse_mode"] = parse_mode
-            if disable_preview:
-                payload["disable_web_page_preview"] = True
-            # Retry on transient errors / rate limits
-            attempts = 0
-            while True:
-                try:
-                    _post(payload)
-                    break
-                except Exception as _e:
-                    attempts += 1
-                    if attempts >= 4:
-                        raise
-                    # small backoff (Telegram may rate-limit)
-                    try:
-                        time.sleep(1.5 * attempts)
-                    except Exception:
-                        pass
-    except Exception as e:
-        # Write errors to the ORIGINAL stderr (avoid recursion if stdout is mirrored)
-        try:
-            print(f"[Telegram] send failed: {e}", file=sys.__stderr__)
-        except Exception:
-            pass
-
-
-class _TelegramStdIOMirror:
-    """Mirror stdout/stderr to Telegram in small batches."""
-
-    def __init__(self, cfg: _CLISettings, wrapped):
-        import io
-        self.cfg = cfg
-        self.wrapped = wrapped
-        self._buffer = ""
-        self._lines: List[str] = []
-        self._last_flush = time.monotonic()
-        self._flush_seconds = float(getattr(cfg, "tg_mirror_flush_seconds", 2.0))
-        self._max_lines = int(getattr(cfg, "tg_mirror_max_lines", 25))
-
-    def write(self, s: str) -> int:
-        try:
-            self.wrapped.write(s)
-        except Exception:
-            pass
-
-        if not getattr(self.cfg, "tg_enable", False) or not getattr(self.cfg, "tg_mirror_stdout", False):
-            return len(s)
-
-        self._buffer += s
-        while "\n" in self._buffer:
-            line, self._buffer = self._buffer.split("\n", 1)
-            line = line.rstrip("\n")
-            if line.strip():
-                self._lines.append(line)
-
-        now = time.monotonic()
-        if self._lines and (len(self._lines) >= self._max_lines or (now - self._last_flush) >= self._flush_seconds):
-            self.flush()
-
-        return len(s)
-
-    def flush(self) -> None:
-        try:
-            self.wrapped.flush()
-        except Exception:
-            pass
-
-        if not getattr(self.cfg, "tg_enable", False) or not getattr(self.cfg, "tg_mirror_stdout", False):
-            self._lines.clear()
-            self._buffer = ""
-            self._last_flush = time.monotonic()
-            return
-
-        if self._buffer.strip():
-            self._lines.append(self._buffer.strip())
-            self._buffer = ""
-
-        if self._lines:
-            try:
-                _send_tg(self.cfg, self._lines[:])
-            except Exception:
-                pass
-
-        self._lines.clear()
-        self._last_flush = time.monotonic()
-
-def _install_telegram_stdout_mirror(cfg: _CLISettings) -> None:
-    """Install stdout/stderr mirror based on config."""
-    if not getattr(cfg, "tg_enable", False):
-        return
-
-    # Pull defaults from أعلى الملف if fields not set
-    if hasattr(cfg, "tg_mirror_stdout") and not cfg.tg_mirror_stdout:
-        # if user enabled in global settings, keep it
-        try:
-            if bool(globals().get("TELEGRAM_MIRROR_STDOUT", False)):
-                cfg.tg_mirror_stdout = True  # type: ignore
-        except Exception:
-            pass
-
-    if not getattr(cfg, "tg_mirror_stdout", False):
-        return
-
-    try:
-        sys.stdout = _TelegramStdIOMirror(cfg, sys.stdout)  # type: ignore
-        sys.stderr = _TelegramStdIOMirror(cfg, sys.stderr)  # type: ignore
-    except Exception:
-        pass
-
-# ----------------------------- Symbol Picker ----------------------------------
-
-def _build_exchange(market: str):
-    # Futures-only
-    return ccxt.binanceusdm({"enableRateLimit": True})
-
-def _pick_symbols(cfg: _CLISettings, symbol_override: Optional[str] = None, max_symbols_hint: int = 300) -> List[str]:
-    if symbol_override:
-        return [symbol_override.strip().upper()]
-    ex = _build_exchange(cfg.market)
-    markets = ex.load_markets()
-    if cfg.market == "usdtm":
-        universe = [s for s, m in markets.items() if m.get("linear") and m.get("quote") == "USDT" and m.get("type") == "swap"]
-    else:
-        universe = [s for s, m in markets.items() if m.get("spot") and m.get("quote") == "USDT"]
-    try:
-        ticks = ex.fetch_tickers(universe)
-    except Exception:
-        # fallback: greedy highest-volume
-        universe_sorted = sorted(universe)[:min(max_symbols_hint, cfg.max_scan)]
-        return universe_sorted
-
-    excl_syms = set(_normalize_list(cfg.exclude_symbols))
-    excl_patterns = set(_normalize_list(cfg.exclude_patterns))
-    inc_only = set(_normalize_list(cfg.include_only))
-
-    def allow(sym: str) -> bool:
-        u = sym.upper()
-        if u in excl_syms:
-            return False
-        b = _base(sym).upper()
-        if inc_only and not any(k in b for k in inc_only):
-            return False
-        if not cfg.allow_meme:
-            if b in _MEME_BASES:
-                return False
-            if any(p in b for p in excl_patterns):
-                return False
-        t = ticks.get(sym) or {}
-        pct_change = _pct_24h(t)
-        if cfg.min_change is not None and pct_change < cfg.min_change:
-            return False
-        if _qv_24h(t) < cfg.min_volume:
-            return False
-        return True
-
-    cands = [s for s in universe if allow(s)]
-    cands.sort(key=lambda s: _qv_24h(ticks.get(s) or {}), reverse=True)
-    if not cands:
-        cands = sorted(universe, key=lambda s: _qv_24h(ticks.get(s) or {}), reverse=True)
-        if not cfg.allow_meme:
-            cands = [s for s in cands if _base(s).upper() not in _MEME_BASES]
-    return cands[:min(cfg.max_scan, max_symbols_hint)]
-
-# ----------------------------- CLI & Router -----------------------------------
-def _parse_args_android() -> Tuple[_CLISettings, argparse.Namespace]:
-    p = argparse.ArgumentParser(prog="SMC Binance Scanner (embedded)")
-    # market / selection
-    p.add_argument("--symbol", "-s", default="")
-    p.add_argument("--max-symbols", "-n", type=int, default=300)
-    # timeframe/limit
-    p.add_argument("--timeframe", "-t", default="1m")
-    p.add_argument("--limit", "-l", type=int, default=800)
-    p.add_argument("--drop-last", action="store_true", default=False)
-    # indicator view toggles
-    p.add_argument("--show-hl", action="store_true", default=False)
-    p.add_argument("--show-mn", action="store_true", default=False)
-    p.add_argument("--show-isob", dest="show_isob", action="store_true")
-    p.add_argument("--no-isob", dest="show_isob", action="store_false")
-    p.set_defaults(show_isob=None)
-    p.add_argument("--show-major-minor", action="store_true", default=False)
-    p.add_argument("--show-circle-hl", action="store_true", default=True)
-    p.add_argument("--no-smc", action="store_true")
-    p.add_argument("--leng-smc", type=int, default=40)
-    p.add_argument("--swing-size", type=int, default=10)
-    p.add_argument("--no-fvg", action="store_true")
-    p.add_argument("--no-liquidity", action="store_true")
-    p.add_argument("--liquidity-limit", type=int, default=20)
-    # behavior/alerts (output only)
-    p.add_argument("--mitigation", choices=["WICK","CLOSE"], default="CLOSE")
-    p.add_argument("--bos-confirmation", choices=["Close","Wick","Candle High"], default="Close")
-    p.add_argument("--no-bos-plus", action="store_true")
-    p.add_argument("--no-ob-break", action="store_true")
-    p.add_argument("--no-ote", action="store_true")
-    p.add_argument("--no-ote-alert", action="store_true")
-    p.add_argument("--no-mark-x", action="store_true")
-    # filters
-    p.add_argument("--min-change", type=float, default=5.0)
-    p.add_argument("--min-volume", type=float, default=30_000_000.0)
-    p.add_argument("--max-scan", type=int, default=600)
-    p.add_argument("--allow-meme", action="store_true", default=False)
-    p.add_argument("--exclude-symbols", default="")
-    p.add_argument("--exclude-patterns", default=_DEFAULT_EXCLUDE_PATTERNS)
-    p.add_argument("--include-only", default="")
-    # misc
-    p.add_argument("--recent", type=int, default=2)
-    p.add_argument("--verbose", "-v", action="store_true", default=False)
-    p.add_argument("--debug", action="store_true", default=False)
-    # Telegram
-    try:
-        default_tg = bool(globals().get("TELEGRAM_ENABLE", False))
-        default_token = str(globals().get("TELEGRAM_BOT_TOKEN", "") or "")
-        default_chat = str(globals().get("TELEGRAM_CHAT_ID", "") or "")
-        default_mirror = bool(globals().get("TELEGRAM_MIRROR_STDOUT", False))
-        default_parse = str(globals().get("TELEGRAM_PARSE_MODE", "") or "")
-        default_disable_preview = bool(globals().get("TELEGRAM_DISABLE_WEB_PREVIEW", True))
-        default_flush = float(globals().get("TELEGRAM_MIRROR_FLUSH_SECONDS", 2.0))
-        default_max_lines = int(globals().get("TELEGRAM_MIRROR_MAX_LINES", 25))
-    except Exception:
-        default_tg = False
-        default_token = ""
-        default_chat = ""
-        default_mirror = False
-        default_parse = ""
-        default_disable_preview = True
-        default_flush = 2.0
-        default_max_lines = 25
-
-    p.add_argument("--tg", dest="tg", action="store_true", help="Enable Telegram alerts/mirroring")
-    p.add_argument("--no-tg", dest="tg", action="store_false", help="Disable Telegram")
-    p.set_defaults(tg=default_tg)
-
-    p.add_argument("--tg-token", dest="tg_token", default=default_token, help="Telegram Bot Token")
-    p.add_argument("--tg-chat-id", dest="tg_chat_id", default=default_chat, help="Telegram Chat ID")
-
-    p.add_argument("--tg-mirror", dest="tg_mirror", action="store_true", help="Mirror stdout/stderr to Telegram")
-    p.add_argument("--no-tg-mirror", dest="tg_mirror", action="store_false", help="Disable stdout mirroring")
-    p.set_defaults(tg_mirror=default_mirror)
-
-    p.add_argument("--tg-parse-mode", dest="tg_parse_mode", default=default_parse, help="Telegram parse_mode (e.g. HTML)")
-    p.add_argument("--tg-disable-preview", dest="tg_disable_preview", action="store_true", help="Disable web page preview")
-    p.add_argument("--tg-enable-preview", dest="tg_disable_preview", action="store_false", help="Enable web page preview")
-    p.set_defaults(tg_disable_preview=default_disable_preview)
-
-    p.add_argument("--tg-flush-seconds", dest="tg_flush_seconds", type=float, default=default_flush, help="Stdout mirror flush seconds")
-    p.add_argument("--tg-max-lines", dest="tg_max_lines", type=int, default=default_max_lines, help="Stdout mirror batch size")
-    args, _ = p.parse_known_args()
-
-    cfg = _CLISettings(
-        market='usdtm',  # forced futures-only
-        showHL=args.show_hl,
-        showMn=args.show_mn,
-        showISOB=True if args.show_isob is None else args.show_isob,
-        showMajoinMiner=args.show_major_minor,
-        showCircleHL=args.show_circle_hl,
-        showSMC=not args.no_smc,
-        lengSMC=args.leng_smc,
-        swing_size=args.swing_size,
-        show_fvg=not args.no_fvg,
-        show_liquidity=not args.no_liquidity,
-        liquidity_display_limit=args.liquidity_limit,
-        tg_enable=bool(args.tg),
-        tg_bot_token=str(getattr(args, "tg_token", "") or ""),
-        tg_chat_id=str(getattr(args, "tg_chat_id", "") or ""),
-        tg_mirror_stdout=bool(getattr(args, "tg_mirror", False)),
-        tg_parse_mode=str(getattr(args, "tg_parse_mode", "") or ""),
-        tg_disable_web_preview=bool(getattr(args, "tg_disable_preview", True)),
-        tg_mirror_flush_seconds=float(getattr(args, "tg_flush_seconds", 2.0)),
-        tg_mirror_max_lines=int(getattr(args, "tg_max_lines", 25)),
-        ob_test_mode=args.mitigation,
-        bos_confirmation=args.bos_confirmation,
-        strict_close_for_break=(args.bos_confirmation == "Close"),
-        show_ote=not args.no_ote,
-        show_mark_x=not args.no_mark_x,
-        continuous_scan=bool(globals().get("AUTORUN_CONTINUOUS_SCAN", False)),
-        continuous_interval=float(globals().get("AUTORUN_SCAN_INTERVAL", 0.0)),
-        min_change=args.min_change,
-        min_volume=args.min_volume,
-        max_scan=args.max_scan,
-        allow_meme=args.allow_meme,
-        exclude_symbols=args.exclude_symbols,
-        exclude_patterns=args.exclude_patterns,
-        include_only=args.include_only,
-        drop_last_incomplete=args.drop_last,
-    )
-    return cfg, args
-
-def _should_route_android(argv: List[str]) -> bool:
-    knobs = {
-        "--symbol","-s","--max-symbols","-n","--timeframe","-t","--limit","-l","--drop-last",
-        "--show-hl","--show-mn","--show-isob","--no-isob","--show-major-minor","--show-circle-hl","--no-smc",
-        "--leng-smc","--swing-size","--no-fvg","--no-liquidity","--liquidity-limit",
-        "--mitigation","--bos-confirmation","--no-bos-plus","--no-ob-break","--no-ote","--no-ote-alert","--no-mark-x",
-        "--min-change","--min-volume","--max-scan","--allow-meme","--exclude-symbols","--exclude-patterns","--include-only",
-        "--recent","--verbose","-v","--debug","--tg"
-    }
-    return any(a in knobs for a in argv)
-
-# ----------------------------- Runner -----------------------------------------
-
-# ===================== Arabic Renderer (format only) ==========================
-def _ar_num(x):
-    try:
-        if isinstance(x, (int, float)):
-            if abs(x) >= 1e6:
-                return f"{x/1e6:.2f}M"
-            if abs(x) >= 1e3:
-                return f"{x/1e3:.2f}K"
-            return f"{x:.4f}" if isinstance(x, float) else str(x)
-        return str(x)
-    except Exception:
-        return str(x)
-
-_AR_KEYS = {
-    "PULLBACK": ["pullback"],
-    "CHOCH"   : ["choch", "ch o ch", "chöch"],
-    "BOS"     : ["bos", "b 0 s"],
-    "IDM"     : ["idm"],
-    "DEMAND"  : ["demand", "طلب"],
-    "SUPPLY"  : ["supply", "عرض"],
-    "FVG_UP"  : ["fvg up", "fvg صاعدة", "fvg↑"],
-    "FVG_DN"  : ["fvg down", "fvg هابطة", "fvg↓"],
-    "OF_BOX"  : ["order flow", "flow box"],
-    "LIQ"     : ["liquidity", "سيولة"],
-    "SCOB"    : ["scob"],
-}
-# Buckets for "latest per logic"
-_LAST_BUCKETS = {
-    "BOS": ["bos", "b 0 s"],
-    "CHOCH": ["choch", "ch o ch"],
-    "Golden zone": ["golden zone"],
-    "IDM": ["idm @", " i d m "],
-    "EXT OB": ["ext ob", "ext_ob", "ext  ob"],
-    "IDM OB": ["idm ob"],
-    "Hist IDM OB": ["hist idm ob"],
-    "Hist EXT OB": ["hist ext ob"],
-    "الدوائر الحمراء": ["الدوائر الحمراء", "red circle"],
-    "الدوائر الخضراء": ["الدوائر الخضراء", "green circle"],
-}
-# ---- Bind to indicator metrics if available ----
-_METRIC_MAP = {
-    "BOS": ["BOS", "bos"],
-    "CHOCH": ["CHOCH", "choch"],
-    "Golden zone": ["GOLDEN_ZONE", "golden_zone", "GZ"],
-    "IDM": ["IDM", "idm"],
-    "EXT OB": ["EXT_OB", "ext_ob", "EXT-OB"],
-    "IDM OB": ["IDM_OB", "idm_ob"],
-    "Hist IDM OB": ["HIST_IDM_OB", "hist_idm_ob"],
-    "Hist EXT OB": ["HIST_EXT_OB", "hist_ext_ob"],
-    "الدوائر الحمراء": ["RED_CIRCLE", "red_circle", "RED_CIRCLES"],
-    "الدوائر الخضراء": ["GREEN_CIRCLE", "green_circle", "GREEN_CIRCLES"],
-}
-
-def _ci_get(d, key):
-    # case-insensitive get for dict
-    if not isinstance(d, dict):
-        return None
-    if key in d:
-        return d[key]
-    lk = key.lower()
-    for k,v in d.items():
-        try:
-            if str(k).lower() == lk:
-                return v
-        except Exception:
-            pass
-    return None
-
-def _extract_latest_from_runtime(runtime):
-    """
-    Return dict: {label: (ts_ms, display_str)} using runtime.gather_console_metrics() if present.
-    Fallback to alerts keyword scan.
-    """
-    result = {}
-    # 1) Prefer structured metrics
-    try:
-        if hasattr(runtime, "gather_console_metrics"):
-            m = runtime.gather_console_metrics() or {}
-            latest = _ci_get(m, "latest_events") or {}
-            # Some implementations store lists per key or dicts with 'display'/'ts'
-            for label, keys in _METRIC_MAP.items():
-                found = None
-                for k in keys:
-                    candidate = latest.get(k) if isinstance(latest, dict) else None
-                    if candidate is None and isinstance(latest, dict):
-                        # try case-insensitive
-                        candidate = _ci_get(latest, k)
-                    if candidate is None:
-                        continue
-                    if isinstance(candidate, dict):
-                        ts = candidate.get("ts") or candidate.get("time") or candidate.get("timestamp")
-                        disp = candidate.get("display") or candidate.get("text") or candidate.get("title") or str(candidate)
-                        found = (ts or 0, disp)
-                        break
-                    if isinstance(candidate, (list, tuple)) and candidate:
-                        # assume list of dicts or tuples
-                        c = candidate[-1]
-                        if isinstance(c, dict):
-                            ts = c.get("ts") or c.get("time") or c.get("timestamp")
-                            disp = c.get("display") or c.get("text") or c.get("title") or str(c)
-                            found = (ts or 0, disp)
-                        elif isinstance(c, (list, tuple)) and len(c) >= 2:
-                            found = (c[0], c[1])
-                        else:
-                            found = (0, str(c))
-                        break
-                    # fallback: just a string
-                    if isinstance(candidate, str):
-                        found = (0, candidate)
-                        break
-                if found:
-                    result[label] = found
-    except Exception:
-        pass
-
-    # 2) Fallback from alerts text if not found
-    if (not result) and hasattr(runtime, "alerts"):
-        alerts = list(getattr(runtime, "alerts"))
-        for name, item in _last_by_keywords(alerts, _LAST_BUCKETS):
-            if item is not None:
-                result[name] = item
-    return result
-
-def _last_by_keywords(alerts, mapping):
-    # alerts: [(ts_ms, title)]
-    latest = {}
-    for ts, title in alerts:
-        t = (title or "").lower()
-        for name, kws in mapping.items():
-            if any(kw in t for kw in kws):
-                if name not in latest or ts > latest[name][0]:
-                    latest[name] = (ts, title)
-    # return ordered list according to mapping keys
-    out = []
-    for name in mapping.keys():
-        out.append((name, latest.get(name)))
-    return out
-
-
-def _count_by_keywords(alerts):
-    out = {k: 0 for k in _AR_KEYS}
-    for _, title in alerts:
-        t = (title or "").lower()
-        for key, kws in _AR_KEYS.items():
-            if any(kw in t for kw in kws):
-                out[key] += 1
-    return out
-
-def _fetch_pct_change(exchange, symbol):
-    try:
-        t = exchange.fetch_ticker(symbol)
-        v = t.get("percentage")
-        if v is None and isinstance(t.get("info"), dict):
-            v = t["info"].get("priceChangePercent")
-        return float(v) if v is not None else None
-    except Exception:
-        return None
-
-def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
-    ln = 0
-    try:
-        ln = runtime.series.length()
-    except Exception:
-        pass
-    last_close = None
-    try:
-        last_close = runtime.series.get("close")
-    except Exception:
-        pass
-    pct = _fetch_pct_change(exchange, symbol)
-    pct_s = f"{pct:+.2f}%" if pct is not None else "—"
-
-    hdr = f"{_format_symbol(symbol)} ({timeframe}) تحليل"
-    print(f"\n===== {hdr} =====")
-    print(f"عدد الشموع: {ln}  |  السعر الحالي: {_ar_num(last_close) if last_close is not None else '—'}  |  تغيّر 24 ساعة: {pct_s}")
-
-    counts = _count_by_keywords(recent_alerts)
-    def c(k): return counts.get(k, 0)
-
-    print("\nعدد التنبيهات :", len(recent_alerts))
-    print("إشارات Pullback :", c("PULLBACK"))
-    print("علامات CHoCH    :", c("CHOCH"))
-    print("علامات BOS      :", c("BOS"))
-    print("علامات IDM      :", c("IDM"))
-    print("مناطق الطلب     :", c("DEMAND"))
-    print("مناطق العرض     :", c("SUPPLY"))
-    box_tally = getattr(runtime, "console_box_status_tally", {})
-
-    def _box_total(name: str, statuses: Sequence[str]) -> int:
-        if not isinstance(box_tally, dict):
-            return 0
-        counter = box_tally.get(name, {})
-        if not isinstance(counter, dict):
-            return 0
-        total = 0
-        for status in statuses:
-            value = counter.get(status, 0)
-            if isinstance(value, (int, float)):
-                total += int(value)
-        return total
-
-    print("IDM OB تم إنشائها حديثاً:", _box_total("IDM_OB", ("new",)))
-    print("IDM OB تم ملامستها    :", _box_total("IDM_OB", ("touched", "retest")))
-    print("EXT OB تم إنشائها حديثاً:", _box_total("EXT_OB", ("new",)))
-    print("EXT OB تم ملامستها    :", _box_total("EXT_OB", ("touched", "retest")))
-    print("فجوات FVG صاعدة :", c("FVG_UP"))
-    print("فجوات FVG هابطة :", c("FVG_DN"))
-    print("صناديق Order Flow:", c("OF_BOX"))
-    print("مستويات السيولة :", c("LIQ"))
-    print("شموع SCOB       :", c("SCOB"))
-
-    print("\nأحدث الإشارات مع الأسعار")
-    if not recent_alerts:
-        print("—")
-    else:
-        # Latest per logic bucket
-        latest = _extract_latest_from_runtime(runtime)
-        for name in _LAST_BUCKETS.keys():
-            item = latest.get(name)
-            if not item:
-                continue
-            ts, title = item
-            try:
-                ts_s = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts/1000)) if ts else "—"
-            except Exception:
-                ts_s = "—"
-            colored_title = _colorize_directional_text(title)
-            print(f"- {name}: {ts_s} UTC  |  {colored_title}")
-    if ccxt is None:
-        print("ccxt not installed. pip install ccxt", file=sys.stderr)
-        return 2
-    cfg, args = _parse_args_android()
-
-    # --- Telegram: auto-enable & validate early (Android/Editor) ---
-    try:
-        # If token/chat configured (args/env/top-of-file), enable Telegram even if --tg not passed
-        token0 = (getattr(cfg, "tg_bot_token", "") or "").strip() or (_get_secret("TELEGRAM_BOT_TOKEN") or "").strip() or str(globals().get("TELEGRAM_BOT_TOKEN", "") or "").strip()
-        chat0  = (getattr(cfg, "tg_chat_id", "") or "").strip() or (_get_secret("TELEGRAM_CHAT_ID") or "").strip() or str(globals().get("TELEGRAM_CHAT_ID", "") or "").strip()
-        if token0 and chat0:
-            cfg.tg_enable = True  # type: ignore
-            cfg.tg_bot_token = token0  # type: ignore
-            cfg.tg_chat_id = chat0  # type: ignore
-        # Mirror stdout if requested globally
-        if not getattr(cfg, "tg_mirror_stdout", False) and bool(globals().get("TELEGRAM_MIRROR_STDOUT", False)):
-            cfg.tg_mirror_stdout = True  # type: ignore
-        _install_telegram_stdout_mirror(cfg)
-        # Startup ping (so you know immediately if Telegram is working)
-        if getattr(cfg, "tg_enable", False):
-            _send_tg(cfg, [f"✅ Telegram متصل | بدء المسح | timeframe={args.timeframe} | symbols_max={args.max_symbols}"])
-    except Exception as e:
-        try:
-            print(f"[Telegram] init failed: {e}", file=sys.__stderr__)
-        except Exception:
-            pass
-
-    # Android/editor: auto-enable Telegram if configured at top-of-file
-    try:
-        if not getattr(cfg, "tg_enable", False):
-            token0 = str(globals().get("TELEGRAM_BOT_TOKEN", "") or "").strip()
-            chat0 = str(globals().get("TELEGRAM_CHAT_ID", "") or "").strip()
-            mirror0 = bool(globals().get("TELEGRAM_MIRROR_STDOUT", False))
-            if token0 and chat0 and mirror0:
-                cfg.tg_enable = True  # type: ignore
-                cfg.tg_bot_token = token0  # type: ignore
-                cfg.tg_chat_id = chat0  # type: ignore
-                cfg.tg_mirror_stdout = True  # type: ignore
-    except Exception:
-        pass
-
-    # Install stdout/stderr mirroring early so ALL prints/reports reach Telegram
-    _install_telegram_stdout_mirror(cfg)
-
-    # One-time startup ping (helps confirm Telegram config works)
-    try:
-        _send_tg(cfg, [f"✅ بدأ تشغيل الماسح (Android) | timeframe={args.timeframe} | limit={args.limit}"])
-    except Exception:
-        pass
-    recent_window = max(1, args.recent)
-
-    # Build symbols first with strong filters
-    symbols = _pick_symbols(cfg, symbol_override=(args.symbol or None), max_symbols_hint=args.max_symbols)
-
-    # Construct indicator inputs (no changes to core logic)
-    try:
-        (
-            SmartMoneyAlgoProE5,
-            IndicatorInputs,
-            PullbackInputs,
-            MarketStructureInputs,
-            OrderFlowInputs,
-            FVGInputs,
-            LiquidityInputs,
-            DemandSupplyInputs,
-            OrderBlockInputs,
-            StructureInputs,
-            ICTMarketStructureInputs,
-            fetch_ohlcv,
-            _parse_timeframe_to_seconds,
-        )
-    except NameError as e:
-        print("Missing core symbol in indicator:", e, file=sys.stderr)
-        return 3
-
-    pullback = PullbackInputs(showHL=cfg.showHL, showMn=cfg.showMn)
-    structure = MarketStructureInputs(showSMC=cfg.showSMC, lengSMC=int(cfg.lengSMC), showCircleHL=cfg.showCircleHL)
-    order_flow = OrderFlowInputs(showISOB=cfg.showISOB, showMajoinMiner=cfg.showMajoinMiner)
-    fvg = FVGInputs(show_fvg=cfg.show_fvg)
-    liq = LiquidityInputs(currentTF=cfg.show_liquidity, displayLimit=int(cfg.liquidity_display_limit))
-    ds = DemandSupplyInputs(mittigation_filt=cfg.ob_test_mode)  # canonicalized inside
-    ob = OrderBlockInputs(poi_type=cfg.zone_type)
-    utils = StructureInputs(isOTE=not args.no_ote, markX=not args.no_mark_x)
-
-    inputs = IndicatorInputs(
-        pullback=pullback,
-        structure=structure,
-        order_flow=order_flow,
-        fvg=fvg,
-        liquidity=liq,
-        demand_supply=ds,
-        order_block=ob,
-        structure_util=utils,
-        ict_structure=ICTMarketStructureInputs(swingSize=int(cfg.swing_size)),
-    )
-
-    # Run loop
-    ex = _build_exchange(cfg.market)
-    alerts_total = 0
-    symbols = symbols[:int(cfg.max_scan)]
-    for i, sym in enumerate(symbols, 1):
-        try:
-            candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
-            if cfg.drop_last_incomplete and candles:
-                candles = candles[:-1]
-            runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
-            runtime.ticker = sym
-            runtime._bos_break_source = cfg.bos_confirmation
-            runtime._strict_close_for_break = cfg.strict_close_for_break
-            runtime.process(candles)
-        except Exception as e:
-            if args.debug:
-                print(
-                    f"[{i}/{len(symbols)}] {_format_symbol(sym)}: error {e}",
-                    file=sys.stderr,
-                )
-            continue
-
-        metrics = runtime.gather_console_metrics()
-        latest = metrics.get("latest_events", {})
-        recent_hits, recent_times = _collect_recent_event_hits(
-            runtime.series, latest, bars=recent_window
-        )
-        if not recent_hits:
-            print(
-                f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال آخر {recent_window} شموع"
-            )
-            continue
-
-        recent_alerts = list(runtime.alerts)
-        if recent_window > 0 and runtime.series.length() > 0:
-            cutoff_idx = max(0, runtime.series.length() - recent_window)
-            cutoff_time = runtime.series.get_time(cutoff_idx)
-            recent_alerts = [(ts, title) for ts, title in recent_alerts if ts >= cutoff_time]
-
-        summary = []
-        for key in ["BOS","BOS_PLUS","CHOCH","IDM","IDM_OB","EXT_OB","GOLDEN_ZONE"]:
-            if key in latest:
-                evt = latest[key]
-                disp = evt.get("display", "")
-                status_disp = evt.get("status_display")
-                if status_disp:
-                    disp = f"{disp} [{status_disp}]"
-                direction_hint = _resolve_direction(
-                    evt.get("direction"),
-                    evt.get("direction_display"),
-                    evt.get("status"),
-                    evt.get("text"),
-                    disp,
-                )
-                summary.append(
-                    _colorize_directional_text(
-                        disp,
-                        direction=direction_hint,
-                        fallback=None,
-                    )
-                )
-
-        if recent_alerts or args.verbose:
-            # --- Telegram: send formatted recent alerts (only when present) ---
-            try:
-                if getattr(cfg, "tg_enable", False) and recent_alerts:
-                    lines = [f"📌 {_format_symbol(sym)} ({args.timeframe}) | أحدث الإشارات:"]
-                    # recent_alerts are usually tuples: (timestamp, title)
-                    for item in recent_alerts[:50]:
-                        try:
-                            ts, title = item
-                            lines.append(f"- {title} | {ts} UTC")
-                        except Exception:
-                            lines.append(f"- {item}")
-                    _send_tg(cfg, lines)
-            except Exception as e:
-                try:
-                    print(f"[Telegram] recent_alerts send failed: {e}", file=sys.__stderr__)
-                except Exception:
-                    pass
-            _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
-            if summary:
-                print("  •", " | ".join(summary))
-            for ts, title in recent_alerts[-10:]:
-                ts_s = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(ts/1000))
-                colored_title = _colorize_directional_text(title)
-                print(f"  - {ts_s} :: {colored_title}")
-            alerts_total += len(recent_alerts)
-
-    if args.verbose:
-        print(f"\nDone. Symbols scanned: {len(symbols)}, alerts: {alerts_total}")
-    return 0
-
-
-
-def __router_main__():
-    import sys
-    # Try to use embedded CLI when available
-    try:
-        use_cli = _should_route_android(sys.argv[1:])
-    except Exception:
-        use_cli = False
-    if use_cli and ('_android_cli_entry' in globals()):
-        try:
-            return _android_cli_entry()
-        except Exception as e:
-            try:
-                print(f"[AndroidCLI] crash: {e}", file=sys.__stderr__)
-            except Exception:
-                pass
-            return 1
-    # Fallback to original main() if present
-    try:
-        return main()  # type: ignore
-    except Exception:
-        return 0
-
-
-# ============================================================================
-
-
-
-# === Auto-args when launched from editor (no CLI flags) ====== FUTURES-ONLY ==
-def __editor_autoargs__():
-    import sys
-    if len(sys.argv) == 1:  # no flags -> inject defaults
-        sys.argv += [
-            "-t", "1m", "-l", "600",
-            "--min-change", "5",
-            "--min-volume", "30000000",
-            "--max-scan", "60",
-            "--exclude-patterns", "INU,DOGE,PEPE,FLOKI,BONK,SHIB,BABY,CAT,MOON,MEME",
-            "--exclude-symbols", "OGUSDT,SHIBUSDT,PEPEUSDT,BONKUSDT",
-            "--verbose"
-        ]
-
-# ========================= Arabic Console Renderer & CLI (Futures-only) =========================
-import sys, time
-try:
-    import ccxt  # لبيانات بينانس
-except Exception:
-    ccxt = None
-
-# ---------- Arabic renderer helpers ----------
-def _ar_num(x):
-    try:
-        if isinstance(x, (int,float)):
-            if abs(x) >= 1e6: return f"{x/1e6:.2f}M"
-            if abs(x) >= 1e3: return f"{x/1e3:.2f}K"
-            return f"{x:.6f}" if isinstance(x,float) else str(x)
-        return str(x)
-    except Exception:
-        return str(x)
-
-_AR_KEYS = {
-    "PULLBACK": ["pullback"],
-    "CHOCH"   : ["choch","ch o ch"],
-    "BOS"     : ["bos","b 0 s"],
-    "IDM"     : ["idm"," i d m "],
-    "DEMAND"  : ["demand","طلب"],
-    "SUPPLY"  : ["supply","عرض"],
-    "FVG_UP"  : ["fvg up","fvg صاعدة","fvg↑"],
-    "FVG_DN"  : ["fvg down","fvg هابطة","fvg↓"],
-    "OF_BOX"  : ["order flow","flow box"],
-    "LIQ"     : ["liquidity","سيولة"],
-    "SCOB"    : ["scob"],
-}
-
-# منطق “آخر حدث لكل بند” / أسماء عربية مطلوبة
-_LAST_BUCKETS = {
-    "BOS": ["bos","b 0 s"],
-    "CHOCH": ["choch","ch o ch"],
-    "Golden zone": ["golden zone","gz"],
-    "IDM": ["idm"," i d m "],
-    "EXT OB": ["ext ob","ext_ob"],
-    "IDM OB": ["idm ob","idm_ob"],
-    "Hist IDM OB": ["hist idm ob","hist_idm_ob"],
-    "Hist EXT OB": ["hist ext ob","hist_ext_ob"],
-    "الدوائر الحمراء": ["الدوائر الحمراء","red circle"],
-    "الدوائر الخضراء": ["الدوائر الخضراء","green circle"],
-}
-
-def _last_by_keywords(alerts, mapping):
-    latest = {}
-    for ts, title in alerts:
-        t = (title or "").lower()
-        for name, kws in mapping.items():
-            if any(kw in t for kw in kws):
-                if name not in latest or ts > latest[name][0]:
-                    latest[name] = (ts, title)
-    return [(name, latest.get(name)) for name in mapping.keys()]
-
-# ---------- Bind strongly to runtime internals ----------
-def _ci_get(d, key):
-    if not isinstance(d, dict):
-        return None
-    if key in d: return d[key]
-    lk = str(key).lower()
-    for k,v in d.items():
-        try:
-            if str(k).lower() == lk: return v
-        except Exception:
-            pass
-    return None
-
-def _take_last(value):
-    if value is None: return None
-    if isinstance(value, dict):
-        ts = value.get("ts") or value.get("time") or value.get("timestamp") or 0
-        disp = value.get("display") or value.get("text") or value.get("title") or str(value)
-        return (ts, disp)
-    if isinstance(value, (list,tuple)) and value:
-        return _take_last(value[-1])
-    if isinstance(value, str):
-        return (0, value)
-    return (0, str(value))
-
-_INT_KEYS = [
-    ("latest_events",), ("latest",), ("last",),
-    ("markers",), ("events",), ("signals",),
-]
-
-_METRIC_MAP = {
-    "BOS": ["BOS","bos","b 0 s"],
-    "CHOCH": ["CHOCH","choch","ch o ch"],
-    "Golden zone": ["GOLDEN_ZONE","golden_zone","gz","golden zone"],
-    "IDM": ["IDM","idm"," i d m "],
-    "EXT OB": ["EXT_OB","ext_ob","ext ob"],
-    "IDM OB": ["IDM_OB","idm_ob","idm ob"],
-    "Hist IDM OB": ["HIST_IDM_OB","hist_idm_ob","hist idm ob"],
-    "Hist EXT OB": ["HIST_EXT_OB","hist_ext_ob","hist ext ob"],
-    "الدوائر الحمراء": ["RED_CIRCLE","red_circle","الدوائر الحمراء","red circle"],
-    "الدوائر الخضراء": ["GREEN_CIRCLE","green_circle","الدوائر الخضراء","green circle"],
-}
-
-def _extract_from_metrics_dict(mdict):
-    out = {}
-    if not isinstance(mdict, dict): return out
-    roots = []
-    for path in _INT_KEYS:
-        node = mdict
-        ok = True
-        for p in path:
-            node = _ci_get(node, p)
-            if node is None: ok = False; break
-        if ok and node is not None:
-            roots.append(node)
-    for label, keys in _METRIC_MAP.items():
-        found = None
-        for root in roots:
-            if isinstance(root, dict):
-                for k in keys + [label]:
-                    cand = _ci_get(root, k)
-                    if cand is None: continue
-                    last = _take_last(cand)
-                    if last: found = last; break
-            if found: break
-        if found: out[label] = found
-    return out
-
-def _extract_latest_from_runtime(runtime):
-    # 1) خصائص مباشرة على الـruntime
-    for root_name in ["latest_events","latest","last","markers","events","signals","state","summary"]:
-        node = getattr(runtime, root_name, None)
-        out = _extract_from_metrics_dict(node)
-        if out: return out
-    # 2) gather_console_metrics
-    try:
-        if hasattr(runtime, "gather_console_metrics"):
-            m = runtime.gather_console_metrics() or {}
-            out = _extract_from_metrics_dict(m)
-            if out: return out
-    except Exception:
-        pass
-    # 3) سقوط إلى نصوص التنبيهات فقط
-    alerts = list(getattr(runtime, "alerts", []))
-    latest = {}
-    for name, item in _last_by_keywords(alerts, _LAST_BUCKETS):
-        if item is not None: latest[name] = item
-    return latest
-
-def _fetch_pct_change(exchange, symbol):
-    try:
-        t = exchange.fetch_ticker(symbol)
-        v = t.get("percentage")
-        if v is None and isinstance(t.get("info"), dict):
-            v = t["info"].get("priceChangePercent")
-        return float(v) if v is not None else None
-    except Exception:
-        return None
-
-def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
-    ln, last_close = 0, None
-    try: ln = runtime.series.length()
-    except Exception: pass
-    try: last_close = runtime.series.get("close")
-    except Exception: pass
-    pct = _fetch_pct_change(exchange, symbol)
-    pct_s = f"{pct:+.2f}%" if pct is not None else "—"
-
-    disp_sym = symbol.replace(':USDT','')
-    hdr = f"{_format_symbol(disp_sym)} ({timeframe}) تحليل"
-    print(f"\\n===== {hdr} =====")
-    print(f"عدد الشموع: {ln}  |  السعر الحالي: {_ar_num(last_close) if last_close is not None else '—'}  |  تغيّر 24 ساعة: {pct_s}")
-
-    # عدادات (من نصوص التنبيهات فقط)
-    def _count_by_keywords(alerts):
-        out = {k: 0 for k in _AR_KEYS}
-        for _, title in alerts:
-            t = (title or "").lower()
-            for key, kws in _AR_KEYS.items():
-                if any(kw in t for kw in kws):
-                    out[key] += 1
-        return out
-    counts = _count_by_keywords(recent_alerts)
-    c = lambda k: counts.get(k,0)
-    print("\\nعدد التنبيهات :", len(recent_alerts))
-    print("إشارات Pullback :", c("PULLBACK"))
-    print("علامات CHoCH    :", c("CHOCH"))
-    print("علامات BOS      :", c("BOS"))
-    print("علامات IDM      :", c("IDM"))
-    print("مناطق الطلب     :", c("DEMAND"))
-    print("مناطق العرض     :", c("SUPPLY"))
-    box_tally = getattr(runtime, "console_box_status_tally", {})
-
-    def _box_total(name: str, statuses: Sequence[str]) -> int:
-        if not isinstance(box_tally, dict):
-            return 0
-        counter = box_tally.get(name, {})
-        if not isinstance(counter, dict):
-            return 0
-        total = 0
-        for status in statuses:
-            value = counter.get(status, 0)
-            if isinstance(value, (int, float)):
-                total += int(value)
-        return total
-
-    print("IDM OB تم إنشائها حديثاً:", _box_total("IDM_OB", ("new",)))
-    print("IDM OB تم ملامستها    :", _box_total("IDM_OB", ("touched", "retest")))
-    print("EXT OB تم إنشائها حديثاً:", _box_total("EXT_OB", ("new",)))
-    print("EXT OB تم ملامستها    :", _box_total("EXT_OB", ("touched", "retest")))
-    print("فجوات FVG صاعدة :", c("FVG_UP"))
-    print("فجوات FVG هابطة :", c("FVG_DN"))
-    print("صناديق Order Flow:", c("OF_BOX"))
-    print("مستويات السيولة :", c("LIQ"))
-    print("شموع SCOB       :", c("SCOB"))
-
-    print("\\nأحدث الإشارات مع الأسعار")
-    latest = _extract_latest_from_runtime(runtime)
-    if not latest:
-        print("—")
-    else:
-        for name in _LAST_BUCKETS.keys():
-            item = latest.get(name)
-            if not item: continue
-            ts, title = item
-            try:
-                ts_s = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts/1000)) if ts else "—"
-            except Exception:
-                ts_s = "—"
-            colored_title = _colorize_directional_text(title)
-            print(f"- {name}: {ts_s} UTC  |  {colored_title}")
-
-# ---------- Live exchange helpers (Futures-only) ----------
-def _build_exchange(_market_forced_usdtm:str="usdtm"):
-    return ccxt.binanceusdm({"enableRateLimit": True})
-
-def fetch_ohlcv(ex, symbol, timeframe, limit):
-    ex.load_markets()
-    return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-
-# ---------- Settings & argument parsing ----------
-class Settings:
-    def __init__(self, **kw):
-        self.__dict__.update(kw)
-        self.market = 'usdtm'
-        self.max_scan = kw.get("max_scan", 60)
-        self.drop_last_incomplete = kw.get("drop_last_incomplete", False)
-        self.showHL = kw.get("showHL", False)
-        self.showMn = kw.get("showMn", False)
-        self.showISOB = kw.get("showISOB", True)
-        self.showMajoinMiner = kw.get("showMajoinMiner", False)
-        self.showCircleHL = kw.get("showCircleHL", True)
-        self.showSMC = kw.get("showSMC", True)
-        self.lengSMC = kw.get("lengSMC", 40)
-        self.swing_size = kw.get("swing_size", 10)
-        self.swing_length = kw.get("swing_length", 50)
-        self.show_fvg = kw.get("show_fvg", True)
-        self.show_liquidity = kw.get("show_liquidity", True)
-        self.liquidity_display_limit = kw.get("liquidity_display_limit", 20)
-        self.bos_confirmation = kw.get("bos_confirmation", "Close")
-        self.ob_test_mode = kw.get("ob_test_mode", "CLOSE")
-        self.show_brk_ob = kw.get("show_brk_ob", True)
-        self.extend_box_on_break = kw.get("extend_box_on_break", True)
-        self.show_mark_x = kw.get("show_mark_x", True)
-        self.enable_alert_ob_break = kw.get("enable_alert_ob_break", True)
-        self.enable_alert_mark_x = kw.get("enable_alert_mark_x", True)
-        self.enable_alert_bos_plus = kw.get("enable_alert_bos_plus", True)
-        self.bos_plus_retest_window = kw.get("bos_plus_retest_window", 2)
-        self.show_ote = kw.get("show_ote", True)
-        self.enable_alert_ote_touch = kw.get("enable_alert_ote_touch", True)
-        self.strict_close_for_break = kw.get("strict_close_for_break", False)
-        self.structure_requires_sweep = kw.get("structure_requires_sweep", False)
-        self.structure_requires_wick = kw.get("structure_requires_wick", False)
-        self.mtf_lookahead = kw.get("mtf_lookahead", False)
-        self.zone_type = kw.get("zone_type", "Mother Bar")
-        raw_threshold = kw.get("min_change", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_threshold)
-        try:
-            self.min_change = float(raw_threshold) if raw_threshold is not None else None
-        except (TypeError, ValueError):
-            self.min_change = None
-        raw_window = kw.get(
-            "height_candle_window",
-            DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_candle_window,
-        )
-        try:
-            parsed_window = int(raw_window) if raw_window is not None else None
-        except (TypeError, ValueError):
-            parsed_window = None
-        if parsed_window is not None and parsed_window <= 0:
-            parsed_window = None
-        self.height_candle_window = parsed_window
-        raw_metric = kw.get("height_metric", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_metric)
-        if isinstance(raw_metric, str):
-            metric_value = raw_metric.strip() or DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_metric
-        elif raw_metric is None:
-            metric_value = DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_metric
-        else:
-            metric_value = str(raw_metric)
-        self.height_metric = metric_value
-        scope_value = kw.get("height_scope", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_scope)
-        if isinstance(scope_value, str):
-            stripped_scope = scope_value.strip()
-            self.height_scope = stripped_scope or None
-        else:
-            self.height_scope = None
-        raw_continuous = kw.get("continuous_scan", EDITOR_AUTORUN_DEFAULTS.continuous_scan)
-        if isinstance(raw_continuous, str):
-            normalized = raw_continuous.strip().lower()
-            if normalized in ("", "0", "false", "no", "off"):
-                continuous_value = False
-            elif normalized in ("1", "true", "yes", "on"):
-                continuous_value = True
-            else:
-                continuous_value = EDITOR_AUTORUN_DEFAULTS.continuous_scan
-        else:
-            continuous_value = bool(raw_continuous)
-        self.continuous_scan = continuous_value
-        raw_interval = kw.get("continuous_interval", EDITOR_AUTORUN_DEFAULTS.scan_interval)
-        try:
-            parsed_interval = float(raw_interval)
-        except (TypeError, ValueError):
-            parsed_interval = EDITOR_AUTORUN_DEFAULTS.scan_interval
-        self.continuous_interval = parsed_interval if parsed_interval >= 0 else 0.0
-
-
-# NOTE: Removed duplicate _parse_args_android (kept the extended parser above).
-
-def _pick_symbols(cfg, symbol_override: str | None, max_symbols_hint: int):
-    ex = _build_exchange('usdtm')
-    explicit = (symbol_override or "").strip()
-    limit_hint = max_symbols_hint if max_symbols_hint else cfg.max_scan
-    try:
-        limit_value = int(limit_hint)
-    except (TypeError, ValueError):
-        limit_value = int(cfg.max_scan) if cfg.max_scan else 0
-    if limit_value < 0:
-        limit_value = 0
-
-    selector_threshold = getattr(cfg, "min_change", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_threshold)
-    try:
-        threshold = float(selector_threshold) if selector_threshold is not None else None
-    except (TypeError, ValueError):
-        threshold = None
-    raw_metric = getattr(cfg, "height_metric", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_metric)
-    if isinstance(raw_metric, str):
-        metric = raw_metric.strip() or DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_metric
-    elif raw_metric is None:
-        metric = DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_metric
-    else:
-        metric = str(raw_metric)
-    raw_scope = getattr(cfg, "height_scope", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_scope)
-    if isinstance(raw_scope, str):
-        scope = raw_scope.strip()
-    else:
-        scope = None
-
-    selector = BinanceSymbolSelectorConfig(
-        prioritize_top_gainers=DEFAULT_BINANCE_SYMBOL_SELECTOR.prioritize_top_gainers,
-        top_gainer_metric=metric,
-        top_gainer_threshold=threshold,
-        top_gainer_scope=scope,
-        top_gainer_candle_window=getattr(
-            cfg,
-            "height_candle_window",
-            DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_candle_window,
-        ),
-    )
-
-    selection = _binance_pick_symbols(
-        ex,
-        limit_value,
-        explicit or None,
-        selector,
-    )
-
-    symbols = selection.symbols
-    if explicit:
-        return symbols
-
-    ban = ("INU", "DOGE", "PEPE", "FLOKI", "BONK", "SHIB", "BABY", "CAT", "MOON", "MEME")
-    filtered = [s for s in symbols if not any(b in s for b in ban)]
-    if not filtered:
-        filtered = symbols
-
-    if limit_value and limit_value > 0:
-        filtered = filtered[:limit_value]
-
-    return list(dict.fromkeys(filtered))
-
-# ---------- Android CLI entry ----------
-def _android_cli_entry() -> int:
-    if ccxt is None:
-        print("ccxt not installed. pip install ccxt", file=sys.stderr)
-        return 2
-    cfg, args = _parse_args_android()
-    recent_window = max(1, args.recent)
-
-    ex = _build_exchange(getattr(cfg, "market", 'usdtm'))
-
-    try:
-        SmartMoneyAlgoProE5
-        IndicatorInputs
-        PullbackInputs
-        MarketStructureInputs
-        OrderFlowInputs
-        FVGInputs
-        LiquidityInputs
-        DemandSupplyInputs
-        OrderBlockInputs
-        StructureInputs
-        ICTMarketStructureInputs
-        fetch_ohlcv
-    except NameError as e:
-        print("Missing indicator class or inputs:", e, file=sys.stderr)
-        return 3
-
-    pullback = PullbackInputs(showHL=cfg.showHL, showMn=cfg.showMn)
-    structure = MarketStructureInputs(showSMC=cfg.showSMC, lengSMC=int(cfg.lengSMC), showCircleHL=cfg.showCircleHL)
-    order_flow = OrderFlowInputs(showISOB=cfg.showISOB, showMajoinMiner=cfg.showMajoinMiner)
-    fvg = FVGInputs(show_fvg=cfg.show_fvg)
-    liq = LiquidityInputs(currentTF=cfg.show_liquidity, displayLimit=int(cfg.liquidity_display_limit))
-    ds = DemandSupplyInputs(mittigation_filt=cfg.ob_test_mode)
-    ob = OrderBlockInputs(poi_type=cfg.zone_type)
-    utils = StructureInputs(isOTE=cfg.show_ote, markX=cfg.show_mark_x)
-    ict = ICTMarketStructureInputs(swingSize=int(cfg.swing_size))
-
-    inputs = IndicatorInputs(
-        pullback=pullback, structure=structure, order_flow=order_flow,
-        fvg=fvg, liquidity=liq, demand_supply=ds, order_block=ob,
-        structure_util=utils, ict_structure=ict,
-    )
-    inputs.console.max_age_bars = max(1, recent_window - 1)
-
-    symbol_override = args.symbol or None
-    iteration = 0
-    try:
-        while True:
-            iteration += 1
-            if cfg.continuous_scan and iteration > 1:
-                print(f"\nإعادة تشغيل المسح (الدورة {iteration})", flush=True)
-
-            symbols = _pick_symbols(cfg, symbol_override=symbol_override, max_symbols_hint=args.max_symbols)
-            symbols = list(dict.fromkeys(symbols))
-            if cfg.max_scan:
-                try:
-                    symbols = symbols[: int(cfg.max_scan)]
-                except Exception:
-                    pass
-            alerts_total = 0
-
-            for i, sym in enumerate(symbols, 1):
-                try:
-                    candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
-                    if cfg.drop_last_incomplete and candles:
-                        candles = candles[:-1]
-                    runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
-                    runtime._bos_break_source = cfg.bos_confirmation
-                    runtime._strict_close_for_break = cfg.strict_close_for_break
-                    runtime.process([
-                        {"time": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5] if len(c)>5 else float('nan')}
-                        for c in candles
-                    ])
-                except Exception as e:
-                    print(
-                        f"[{i}/{len(symbols)}] {_format_symbol(sym)}: error {e}",
-                        file=sys.stderr,
-                    )
-                    continue
-
-                metrics = runtime.gather_console_metrics()
-                latest_events = metrics.get("latest_events") or {}
-                recent_hits, _ = _collect_recent_event_hits(
-                    runtime.series, latest_events, bars=recent_window
-                )
-
-                # --- Telegram: send event hits (guaranteed path) ---
-                try:
-                    if getattr(cfg, "tg_enable", False) and recent_hits:
-                        # try to capture last close price (best-effort)
-                        last_close = None
-                        try:
-                            last_close = runtime.series.get("close")
-                        except Exception:
-                            last_close = None
-                        head = f"🔔 {_format_symbol(sym)} ({args.timeframe})"
-                        if last_close is not None:
-                            head += f" | السعر: {_ar_num(last_close)}"
-                        _send_tg(cfg, [head] + [str(x) for x in recent_hits])
-                except Exception as e:
-                    try:
-                        print(f"[Telegram] alert send failed: {e}", file=sys.__stderr__)
-                    except Exception:
-                        pass
-                if not recent_hits:
-                    if recent_window == 1:
-                        span_phrase = "آخر شمعة واحدة"
-                    elif recent_window == 2:
-                        span_phrase = "آخر شمعتين"
-                    else:
-                        span_phrase = f"آخر {recent_window} شموع"
-                    print(
-                        f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال {span_phrase}"
-                    )
-                    continue
-
-                recent_alerts = list(getattr(runtime, "alerts", []))
-                if recent_window > 0 and hasattr(runtime, "series") and runtime.series.length() > 0:
-                    try:
-                        cutoff_idx = max(0, runtime.series.length() - recent_window)
-                        cutoff_time = runtime.series.get_time(cutoff_idx)
-                        if cutoff_time:
-                            recent_alerts = [
-                                (ts, title) for ts, title in recent_alerts if ts >= cutoff_time
-                            ]
-                    except Exception:
-                        pass
-
-                if recent_alerts or args.verbose:
-                    _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
-                    alerts_total += len(recent_alerts)
-
-            if args.verbose:
-                print(f"\nتم. عدد الرموز: {len(symbols)}  |  عدد التنبيهات: {alerts_total}")
-
-            if not cfg.continuous_scan:
-                print(
-                    "اكتمل المسح بعد دورة واحدة لأن خيار التشغيل المستمر غير مُفعّل."
-                    " لتشغيل المسح باستمرار استخدم --continuous=true أو عدّل"
-                    " AUTORUN_CONTINUOUS_SCAN في أعلى الملف.",
-                    flush=True,
-                )
-                break
-            if cfg.continuous_interval > 0:
-                print(
-                    f"انتظار {cfg.continuous_interval:.2f} ثانية قبل تشغيل المسح التالي",
-                    flush=True,
-                )
-                time.sleep(cfg.continuous_interval)
-    except KeyboardInterrupt:
-        print("تم إيقاف المسح من قبل المستخدم.")
-    return 0
-
-# ---------- Router ----------
-def __router_main__():
-    if len(sys.argv) == 1:
-        defaults = EDITOR_AUTORUN_DEFAULTS
-        sys.argv += [
-            "-t", defaults.timeframe,
-            "-l", str(defaults.candle_limit),
-            "--max-symbols", str(defaults.max_symbols),
-            "--recent", str(defaults.recent_bars),
-            "--verbose",
-        ]
-        if defaults.height_threshold is not None:
-            sys.argv += ["--min-change", str(defaults.height_threshold)]
-        if defaults.height_candle_window is not None:
-            sys.argv += ["--height-candles", str(defaults.height_candle_window)]
-        if defaults.height_scope:
-            sys.argv += ["--height-scope", str(defaults.height_scope)]
-        if defaults.height_metric:
-            sys.argv += ["--height-metric", str(defaults.height_metric)]
-        if defaults.continuous_scan:
-            sys.argv.append("--continuous")
-        if defaults.scan_interval > 0:
-            sys.argv += ["--continuous-interval", str(defaults.scan_interval)]
-    return _android_cli_entry()
-
-# ---------- Main ----------
-if __name__ == "__main__":
-    __router_main__()
-
-
-# ============================================================================
-# === ICT Strategies Integration (Text-only Runner) — appended by assistant ===
-# ============================================================================
-"""
-هذا القسم يضيف "محرّك الاستراتيجيات" (Top 10 ICT) وتشغيلًا تلقائيًا من داخل الملف.
-- لا يغيّر أي دوال/فئات موجودة لديك (يعمل كطبقة عليا فقط).
-- يطبع سطرًا نصيًا واحدًا لكل إشارة مكتملة وفق الاستراتيجية المفعّلة.
-- إدارة مخاطر تلقائية: %2 من رصيد 100$ (يمكن ضبطها من السطرات أدناه أو عبر سطر الأوامر).
-- يدعم CSV أو ccxt (إن توفر) للفحص التاريخي 2022-01-01 → 2023-12-31 أو الوضع الحي.
-"""
-
-import argparse, csv, os, sys, math, time
-import datetime as dt
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Literal
-
-# -------- إعدادات إفتراضية للتشغيل التلقائي من المحرّر --------
-DEFAULT_STRATEGY: str = "ICT 2022"   # بدّلها إلى أي اسم من القائمة المسموح بها أدناه
-DEFAULT_EQUITY: float = 100.0        # الرصيد بالدولار
-DEFAULT_RISK: float = 2.0            # نسبة المخاطرة لكل صفقة (%)
-DEFAULT_NY_OFFSET: int = -4          # إزاحة نيويورك عن UTC (تقريبية، بدون DST)
-DEFAULT_SYMBOLS: str = "BTCUSDT"     # رموز مفصولة بفواصل
-DEFAULT_START: str = "2022-01-01"    # بداية الباكتيست
-DEFAULT_END: str   = "2023-12-31"    # نهاية الباكتيست
-DEFAULT_LIVE: bool = False           # الوضع الحي (يتطلب ccxt)
-DEFAULT_CSV: Optional[str] = None    # مثال: "BTCUSDT=./btc_1m.csv"
-
-# محاولـة تحميل ccxt إن توفّر
-try:
-    import ccxt  # type: ignore
-except Exception:
-    ccxt = None  # type: ignore
-
-
-# ---------------------- مساعدات بيانات الشموع ----------------------
-def _read_csv_series(path: str) -> List[Dict[str, float]]:
-    out: List[Dict[str, float]] = []
-    with open(path, newline="", encoding="utf-8") as fh:
-        rd = csv.DictReader(fh)
-        for row in rd:
-            out.append({
-                "time": int(row["time"]),
-                "open": float(row["open"]),
-                "high": float(row["high"]),
-                "low": float(row["low"]),
-                "close": float(row["close"]),
-                "volume": float(row.get("volume", 0.0)),
-            })
-    return out
-
-
-def _fetch_ohlcv_ccxt(exchange: "ccxt.binanceusdm", symbol: str, timeframe: str,
-                      since_ms: int, until_ms: int, limit: int = 1000) -> List[Dict[str, float]]:
-    out: List[Dict[str, float]] = []
-    since = since_ms
-    normalized_symbol = _binance_linear_symbol_from_id(symbol) or symbol
-    while True:
-        try:
-            batch = exchange.fetch_ohlcv(normalized_symbol, timeframe=timeframe, since=since, limit=limit)
-        except Exception as exc:
-            if ccxt is None or not isinstance(exc, getattr(ccxt, "BaseError", Exception)):
-                raise
-            # حاول مجددًا باستخدام معرّف REST "BTCUSDT" إن أمكن
-            fallback = _binance_linear_symbol_id(normalized_symbol)
-            if not fallback:
-                raise
-            normalized_symbol = fallback
-            batch = exchange.fetch_ohlcv(normalized_symbol, timeframe=timeframe, since=since, limit=limit)
-        if not batch:
-            break
-        for t, o, h, l, c, v in batch:
-            if t > until_ms:
-                return out
-            out.append({"time": t, "open": float(o), "high": float(h), "low": float(l), "close": float(c), "volume": float(v)})
-            since = t + 1
-        if len(batch) < limit or out[-1]["time"] >= until_ms:
-            break
-    return out
-
-
-# ---------------------- اكتشاف فئة المؤشّر في هذا الملف ----------------------
-@dataclass
-class _IndicatorAPI:
-    Klass: Any
-    inputs_ctor: Optional[Any]
-
-    @classmethod
-    def discover(cls) -> "_IndicatorAPI":
-        # نحاول تفضيل SmartMoneyAlgoProE5 إن وجد
-        mod = sys.modules.get(__name__)
-        cand = getattr(mod, "SmartMoneyAlgoProE5", None)
-        inputs = getattr(mod, "IndicatorInputs", None)
-        if cand is None:
-            # بديل: أول فئة لديها process([candle])
-            for name in dir(mod):
-                obj = getattr(mod, name)
-                if isinstance(obj, type) and hasattr(obj, "process"):
-                    cand = obj
-                    break
-        if cand is None:
-            raise RuntimeError("لا يمكن العثور على فئة مؤشر تحتوي على process([...]) داخل هذا الملف.")
-        return cls(Klass=cand, inputs_ctor=inputs)
-
-    def new_runtime(self):
-        if self.inputs_ctor is not None:
-            try:
-                return self.Klass(self.inputs_ctor())
-            except Exception:
-                pass
-        return self.Klass()
-
-
-# ---------------------- محرّك الاستراتيجيات (Top 10 ICT) ----------------------
-@dataclass
-class _Signal:
-    symbol: str
-    side: Literal["BUY", "SELL"]
-    entry: float
-    stop: float
-    strategy: str
-    t: int
-    reason: str = ""
-
-
-def _fmt(v: float) -> str:
-    s = f"{v:.6f}"
-    return s.rstrip("0").rstrip(".")
-
-
-def _pos_size(equity_usd: float, risk_pct: float, entry: float, stop: float) -> float:
-    risk_amt = max(equity_usd * (risk_pct / 100.0), 1e-9)
-    dist = abs(entry - stop)
-    if dist <= 0:
-        return 0.0
-    return risk_amt / dist
-
-
-def _utc_to_ny_minutes(ts_ms: int, ny_offset_hours: int) -> int:
-    tm = dt.datetime.utcfromtimestamp(ts_ms / 1000)
-    tm = tm + dt.timedelta(hours=ny_offset_hours)
-    return tm.hour * 60 + tm.minute
-
-
-def _extract_events(rt: Any) -> Dict[str, Any]:
-    for name in ("gather_console_metrics", "_collect_latest_console_events"):
-        if hasattr(rt, name):
-            try:
-                m = getattr(rt, name)()
-                if isinstance(m, dict):
-                    if "latest_events" in m and isinstance(m["latest_events"], dict):
-                        return m["latest_events"]
-                    return m
-            except Exception:
-                pass
-    for attr in ("console_event_log", "last_events", "events"):
-        v = getattr(rt, attr, None)
-        if isinstance(v, dict):
-            return v
-    return {}
-
-
-def _series_get(rt: Any, key: str, idx: int = 0) -> float:
-    try:
-        if hasattr(rt, "series"):
-            return float(rt.series.get(key, idx))
-    except Exception:
-        pass
-    return float("nan")
-
-
-def _last_time(rt: Any) -> int:
-    try:
-        if hasattr(rt, "series"):
-            return int(rt.series.get_time())
-    except Exception:
-        pass
-    return 0
-
-
-def _pdh_pdl(rt: Any) -> Tuple[Optional[float], Optional[float]]:
-    def _num(x):
-        try:
-            return float(x) if x == x else None
-        except Exception:
-            return None
-    return _num(getattr(rt, "pdh", None)), _num(getattr(rt, "pdl", None))
-
-
-def _has_fvg(rt: Any, bullish: bool) -> bool:
-    try:
-        holder = getattr(rt, "bullish_gap_holder" if bullish else "bearish_gap_holder", None)
-        if holder is None:
-            return False
-        size = holder.size() if hasattr(holder, "size") else (len(holder) if hasattr(holder, "__len__") else 0)
-        return size > 0
-    except Exception:
-        return False
-
-
-def _last_ob_zone(rt: Any, bullish: bool) -> Optional[Tuple[float, float]]:
-    arr = getattr(rt, "demandZone" if bullish else "supplyZone", None)
-    try:
-        if arr and arr.size() > 0:
-            box = arr.get(arr.size() - 1)
-            top = getattr(box, "top", None)
-            bottom = getattr(box, "bottom", None)
-            if top is not None and bottom is not None:
-                lo, hi = (float(bottom), float(top))
-                return (lo, hi)
-    except Exception:
-        pass
-    return None
-
-
-def _dir_from(events: Dict[str, Any], key: str) -> Optional[str]:
-    v = events.get(key, {})
-    d = v.get("direction")
-    if isinstance(d, str):
-        return d.lower()
-    return None
-
-
-def _swept_against_pdh_pdl(rt: Any) -> Optional[str]:
-    pdh, pdl = _pdh_pdl(rt)
-    lc = _series_get(rt, "close", 0)
-    pc = _series_get(rt, "close", 1)
-    if pdh is not None and pc <= pdh and lc > pdh:
-        return "up"
-    if pdl is not None and pc >= pdl and lc < pdl:
-        return "down"
-    return None
-
-
-class _StrategyEngine:
-    def __init__(self, rt: Any, symbol: str, *, equity: float, risk_pct: float, ny_offset: int) -> None:
-        self.rt = rt
-        self.symbol = symbol
-        self.equity = equity
-        self.risk_pct = risk_pct
-        self.ny_offset = ny_offset
-
-    def _print(self, sig: _Signal) -> None:
-        size = _pos_size(self.equity, self.risk_pct, sig.entry, sig.stop)
-        when = dt.datetime.utcfromtimestamp(sig.t/1000).strftime("%Y-%m-%d %H:%M:%S UTC")
-        print(f"[🔔] {self.symbol} — {('شراء' if sig.side=='BUY' else 'بيع')} @ {_fmt(sig.entry)} — "
-              f"SL {_fmt(sig.stop)} — الاستراتيجية: {sig.strategy} — الحجم ≈ {_fmt(size)} — {when} — {sig.reason}")
-
-    def evaluate_and_print(self, name: str) -> None:
-        sig = self._evaluate(name)
-        if sig:
-            self._print(sig)
-
-    # ----------------- استراتيجيات (نسخة خفيفة) -----------------
-    def _evaluate(self, name: str) -> Optional[_Signal]:
-        name = (name or "").strip()
-        if name in ("", "ICT 2022"):
-            return self._ict_2022()
-        if name == "Silver Bullet":
-            return self._silver_bullet()
-        if name == "Judas Swing":
-            return self._judas()
-        if name == "Turtle Soup":
-            return self._turtle_soup()
-        if name == "OTE":
-            return self._ote()
-        if name == "PO3":
-            return self._po3()
-        if name == "Liquidity Sweep + OB":
-            return self._sweep_ob()
-        if name == "Breaker Block":
-            return self._breaker()
-        if name == "FVG Continuation":
-            return self._fvg_cont()
-        if name == "OSOK":
-            sig = self._ict_2022(require_killzone=True)
-            if sig:
-                sig.strategy = "OSOK"
-            return sig
-        return None
-
-    def _ict_2022(self, require_killzone: bool = False) -> Optional[_Signal]:
-        ev = _extract_events(self.rt)
-        t = _last_time(self.rt)
-        price = _series_get(self.rt, "close", 0)
-        if require_killzone:
-            minutes = _utc_to_ny_minutes(t, self.ny_offset)
-            if not (10*60 <= minutes < 11*60):
-                return None
-        swept = _swept_against_pdh_pdl(self.rt)
-        bull_bos = _dir_from(ev, "BOS") == "bullish" or _dir_from(ev, "CHOCH") == "bullish"
-        bear_bos = _dir_from(ev, "BOS") == "bearish" or _dir_from(ev, "CHOCH") == "bearish"
-        if swept == "down" and bull_bos and (_has_fvg(self.rt, True) or _last_ob_zone(self.rt, True)):
-            ob = _last_ob_zone(self.rt, True)
-            sl = ob[0] if ob else (price - 0.001*price)
-            return _Signal(self.symbol, "BUY", price, sl, "ICT 2022", t, "sweep↓ + BOS↑ + FVG/OB")
-        if swept == "up" and bear_bos and (_has_fvg(self.rt, False) or _last_ob_zone(self.rt, False)):
-            ob = _last_ob_zone(self.rt, False)
-            sl = ob[1] if ob else (price + 0.001*price)
-            return _Signal(self.symbol, "SELL", price, sl, "ICT 2022", t, "sweep↑ + BOS↓ + FVG/OB")
-        return None
-
-    def _silver_bullet(self) -> Optional[_Signal]:
-        ev = _extract_events(self.rt)
-        t = _last_time(self.rt)
-        minutes = _utc_to_ny_minutes(t, self.ny_offset)
-        in_win = (3*60 <= minutes < 4*60) or (10*60 <= minutes < 11*60) or (14*60 <= minutes < 15*60)
-        if not in_win:
-            return None
-        price = _series_get(self.rt, "close", 0)
-        bull = _dir_from(ev, "MSS") == "bullish" or _dir_from(ev, "CHOCH") == "bullish"
-        bear = _dir_from(ev, "MSS") == "bearish" or _dir_from(ev, "CHOCH") == "bearish"
-        if bull and _has_fvg(self.rt, True):
-            ob = _last_ob_zone(self.rt, True)
-            sl = ob[0] if ob else (price - 0.001*price)
-            return _Signal(self.symbol, "BUY", price, sl, "Silver Bullet", t, "NY window + MSS↑ + FVG")
-        if bear and _has_fvg(self.rt, False):
-            ob = _last_ob_zone(self.rt, False)
-            sl = ob[1] if ob else (price + 0.001*price)
-            return _Signal(self.symbol, "SELL", price, sl, "Silver Bullet", t, "NY window + MSS↓ + FVG")
-        return None
-
-    def _judas(self) -> Optional[_Signal]:
-        ev = _extract_events(self.rt)
-        t = _last_time(self.rt)
-        minutes = _utc_to_ny_minutes(t, self.ny_offset)
-        if not (3*60 <= minutes < 5*60):
-            return None
-        price = _series_get(self.rt, "close", 0)
-        swept = _swept_against_pdh_pdl(self.rt)
-        if swept == "up" and (_dir_from(ev, "MSS") == "bearish" or _dir_from(ev, "BOS") == "bearish"):
-            ob = _last_ob_zone(self.rt, False); sl = ob[1] if ob else (price + 0.001*price)
-            return _Signal(self.symbol, "SELL", price, sl, "Judas Swing", t, "London sweep↑ + shift↓")
-        if swept == "down" and (_dir_from(ev, "MSS") == "bullish" or _dir_from(ev, "BOS") == "bullish"):
-            ob = _last_ob_zone(self.rt, True); sl = ob[0] if ob else (price - 0.001*price)
-            return _Signal(self.symbol, "BUY", price, sl, "Judas Swing", t, "London sweep↓ + shift↑")
-        return None
-
-    def _turtle_soup(self) -> Optional[_Signal]:
-        ev = _extract_events(self.rt)
-        t = _last_time(self.rt)
-        price = _series_get(self.rt, "close", 0)
-        pdh, pdl = _pdh_pdl(self.rt)
-        pc = _series_get(self.rt, "close", 1)
-        if pdh is not None and pc > pdh and price < pdh and (_dir_from(ev, "BOS") == "bearish" or _dir_from(ev, "CHOCH") == "bearish"):
-            sl = pdh + abs(price - pc)
-            return _Signal(self.symbol, "SELL", price, sl, "Turtle Soup", t, "fake breakout above PDH")
-        if pdl is not None and pc < pdl and price > pdl and (_dir_from(ev, "BOS") == "bullish" or _dir_from(ev, "CHOCH") == "bullish"):
-            sl = pdl - abs(price - pc)
-            return _Signal(self.symbol, "BUY", price, sl, "Turtle Soup", t, "fake breakdown below PDL")
-        return None
-
-    def _ote(self) -> Optional[_Signal]:
-        ev = _extract_events(self.rt)
-        t = _last_time(self.rt)
-        price = _series_get(self.rt, "close", 0)
-        gz = ev.get("GOLDEN_ZONE", {})
-        bounds = gz.get("price")
-        if isinstance(bounds, (list, tuple)) and len(bounds) == 2:
-            lo, hi = float(bounds[0]), float(bounds[1])
-            if lo <= price <= hi and (_dir_from(ev, "BOS") in ("bullish","bearish") or _dir_from(ev, "MSS") in ("bullish","bearish")):
-                if _dir_from(ev, "BOS") == "bullish" or _dir_from(ev, "MSS") == "bullish":
-                    return _Signal(self.symbol, "BUY", price, lo, "OTE", t, "inside OTE + bullish shift")
-                if _dir_from(ev, "BOS") == "bearish" or _dir_from(ev, "MSS") == "bearish":
-                    return _Signal(self.symbol, "SELL", price, hi, "OTE", t, "inside OTE + bearish shift")
-        return None
-
-    def _po3(self) -> Optional[_Signal]:
-        ev = _extract_events(self.rt)
-        t = _last_time(self.rt)
-        price = _series_get(self.rt, "close", 0)
-        minutes = _utc_to_ny_minutes(t, self.ny_offset)
-        swept = _swept_against_pdh_pdl(self.rt)
-        if (3*60 <= minutes < 8*60) and swept == "down" and (_dir_from(ev, "BOS") == "bullish" or _dir_from(ev, "MSS") == "bullish"):
-            return _Signal(self.symbol, "BUY", price, price - 0.001*price, "PO3", t, "AM sweep↓ -> distribution↑")
-        if (3*60 <= minutes < 8*60) and swept == "up" and (_dir_from(ev, "BOS") == "bearish" or _dir_from(ev, "MSS") == "bearish"):
-            return _Signal(self.symbol, "SELL", price, price + 0.001*price, "PO3", t, "AM sweep↑ -> distribution↓")
-        return None
-
-    def _sweep_ob(self) -> Optional[_Signal]:
-        ev = _extract_events(self.rt)
-        t = _last_time(self.rt)
-        price = _series_get(self.rt, "close", 0)
-        swept = _swept_against_pdh_pdl(self.rt)
-        if swept == "up" and _dir_from(ev, "BOS") == "bearish":
-            ob = _last_ob_zone(self.rt, False)
-            if ob:
-                return _Signal(self.symbol, "SELL", price, ob[1], "Liquidity Sweep + OB", t, "sweep↑ + bearish BOS + OB")
-        if swept == "down" and _dir_from(ev, "BOS") == "bullish":
-            ob = _last_ob_zone(self.rt, True)
-            if ob:
-                return _Signal(self.symbol, "BUY", price, ob[0], "Liquidity Sweep + OB", t, "sweep↓ + bullish BOS + OB")
-        return None
-
-    def _breaker(self) -> Optional[_Signal]:
-        ev = _extract_events(self.rt)
-        t = _last_time(self.rt)
-        price = _series_get(self.rt, "close", 0)
-        has_idm = "IDM_OB" in ev and isinstance(ev["IDM_OB"].get("price"), (list, tuple))
-        has_ext = "EXT_OB" in ev and isinstance(ev["EXT_OB"].get("price"), (list, tuple))
-        if has_idm and _dir_from(ev, "BOS") == "bearish":
-            lo, hi = map(float, ev["IDM_OB"]["price"])
-            return _Signal(self.symbol, "SELL", price, hi, "Breaker Block", t, "IDM OB broken -> retest")
-        if has_ext and _dir_from(ev, "BOS") == "bullish":
-            lo, hi = map(float, ev["EXT_OB"]["price"])
-            return _Signal(self.symbol, "BUY", price, lo, "Breaker Block", t, "EXT OB broken -> retest")
-        return None
-
-    def _fvg_cont(self) -> Optional[_Signal]:
-        ev = _extract_events(self.rt)
-        t = _last_time(self.rt)
-        price = _series_get(self.rt, "close", 0)
-        bull = _has_fvg(self.rt, True) and (_dir_from(ev, "BOS") == "bullish" or _dir_from(ev, "MSS") == "bullish")
-        bear = _has_fvg(self.rt, False) and (_dir_from(ev, "BOS") == "bearish" or _dir_from(ev, "MSS") == "bearish")
-        if bull:
-            return _Signal(self.symbol, "BUY", price, price - 0.001*price, "FVG Continuation", t, "trend↑ + bullish FVG")
-        if bear:
-            return _Signal(self.symbol, "SELL", price, price + 0.001*price, "FVG Continuation", t, "trend↓ + bearish FVG")
-        return None
-
-
-# ---------------------- محرّك التشغيل (باكتيست/حي) ----------------------
-@dataclass
-class _Config:
-    strategy: str
-    symbols: List[str]
-    start: dt.datetime
-    end: dt.datetime
-    equity: float = 100.0
-    risk_pct: float = 2.0
-    ny_offset: int = -4
-    live: bool = False
-    csv_map: Dict[str, str] | None = None
-
-
-class _Engine:
-    def __init__(self, cfg: _Config) -> None:
-        self.cfg = cfg
-        self.api = _IndicatorAPI.discover()
-        self.exchange = None
-        if ccxt is not None and (self.cfg.live or not self.cfg.csv_map):
-            try:
-                self.exchange = ccxt.binanceusdm({"enableRateLimit": True})
-            except Exception:
-                self.exchange = None
-
-    def _candles_for_symbol(self, sym: str) -> List[Dict[str, float]]:
-        if self.cfg.csv_map and sym in self.cfg.csv_map:
-            return _read_csv_series(self.cfg.csv_map[sym])
-        if self.exchange is None:
-            raise RuntimeError("الوضع المختار يتطلب ccxt أو CSV. وفّر CSV عبر --csv SYMBOL=path.csv")
-        return _fetch_ohlcv_ccxt(self.exchange, sym, "1m",
-                                 since_ms=int(self.cfg.start.timestamp()*1000),
-                                 until_ms=int(self.cfg.end.timestamp()*1000))
-
-    def _run_series(self, sym: str, candles: List[Dict[str, float]]) -> None:
-        rt = self.api.new_runtime()
-        try:
-            rt.process([])  # تهيئة إن لزم
-        except Exception:
-            pass
-        eng = _StrategyEngine(rt, sym, equity=self.cfg.equity, risk_pct=self.cfg.risk_pct, ny_offset=self.cfg.ny_offset)
-        for c in candles:
-            try:
-                rt.process([c])
-            except Exception:
-                continue
-            eng.evaluate_and_print(self.cfg.strategy)
-
-    def run_backtest(self) -> None:
-        for sym in self.cfg.symbols:
-            candles = self._candles_for_symbol(sym)
-            if not candles:
-                print(f"[!] لا توجد شموع لرمز {sym}")
-                continue
-            self._run_series(sym, candles)
-
-    def run_live(self) -> None:
-        if self.exchange is None:
-            raise RuntimeError("الوضع الحي يتطلب ccxt واتصالاً بالمصدر")
-        while True:
-            now = dt.datetime.utcnow()
-            start = now - dt.timedelta(hours=24)
-            for sym in self.cfg.symbols:
-                candles = _fetch_ohlcv_ccxt(self.exchange, sym, "1m",
-                                            since_ms=int(start.timestamp()*1000),
-                                            until_ms=int(now.timestamp()*1000))
-                self._run_series(sym, candles[-600:])  # آخر ~10 ساعات
-            time.sleep(10)
-
-
-# ---------------------- CLI وتشغيل تلقائي ----------------------
-def _parse_csv_map(arg: Optional[str]) -> Dict[str, str]:
-    mapping: Dict[str, str] = {}
-    if not arg:
-        return mapping
-    for part in arg.split(","):
-        if "=" in part:
-            k, v = part.split("=", 1)
-            mapping[k.strip()] = v.strip()
-    return mapping
-
-
-def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="ICT Strategy Runner (Integrated, text-only)")
-    p.add_argument("--strategy", default=DEFAULT_STRATEGY,
-                   choices=["ICT 2022","Silver Bullet","Judas Swing","Turtle Soup","OTE","PO3",
-                            "Liquidity Sweep + OB","Breaker Block","FVG Continuation","OSOK"],
-                   help="الاستراتيجية المفعلة")
-    p.add_argument("--symbols", default=DEFAULT_SYMBOLS, help="قائمة رموز مفصولة بفواصل (USDT-M)")
-    p.add_argument("--start", default=DEFAULT_START, help="YYYY-MM-DD")
-    p.add_argument("--end", default=DEFAULT_END, help="YYYY-MM-DD")
-    p.add_argument("--equity", type=float, default=DEFAULT_EQUITY, help="الرصيد بالدولار")
-    p.add_argument("--risk", type=float, default=DEFAULT_RISK, help="نسبة المخاطرة لكل صفقة (%)")
-    p.add_argument("--ny-offset", type=int, default=DEFAULT_NY_OFFSET, help="إزاحة نيويورك عن UTC (تقريبية)")
-    p.add_argument("--live", action="store_true", default=DEFAULT_LIVE, help="مسح حي (يتطلب ccxt)")
-    p.add_argument("--csv", default=DEFAULT_CSV, help="خرائط CSV: SYMBOL=path.csv[,SYMBOL2=path2.csv]")
-    args, _ = p.parse_known_args(argv)
-    return args
-
-
-def _main(argv: Optional[List[str]] = None) -> None:
-    args = _parse_args(argv)
-    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
-    start = dt.datetime.strptime(args.start, "%Y-%m-%d")
-    end = dt.datetime.strptime(args.end, "%Y-%m-%d") + dt.timedelta(days=1) - dt.timedelta(milliseconds=1)
-    cfg = _Config(
-        strategy=args.strategy,
-        symbols=symbols,
-        start=start,
-        end=end,
-        equity=float(args.equity),
-        risk_pct=float(args.risk),
-        ny_offset=int(args.ny_offset),
-        live=bool(args.live),
-        csv_map=_parse_csv_map(args.csv),
-    )
-    eng = _Engine(cfg)
-    if cfg.live:
-        eng.run_live()
-    else:
-        eng.run_backtest()
-
-
-if __name__ == "__main__":
-    # تشغيل تلقائي من المحرر بالقيم الإفتراضية أعلاه.
-    _main()
-# ============================ End of Integration ============================
+if __name__ == '__main__':
+    raise SystemExit(main())
