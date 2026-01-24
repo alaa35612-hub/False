@@ -1342,12 +1342,16 @@ class SmartMoneyAlgoProE5:
         self,
         inputs: Optional[IndicatorInputs] = None,
         base_timeframe: Optional[str] = None,
+        symbol: Optional[str] = None,
+        tg_config: Optional[Any] = None,
         tracer: Optional[ExecutionTracer] = None,
     ) -> None:
         self.inputs = inputs or IndicatorInputs()
         self.series = SeriesAccessor()
         self.base_tf_seconds: Optional[int] = _parse_timeframe_to_seconds(base_timeframe, None)
         self.base_timeframe = base_timeframe or ""
+        self.symbol = symbol
+        self.tg_config = tg_config
         self.security_series: Dict[str, SecuritySeries] = {}
         self.ob_volume_history: Dict[str, PineArray] = {}
         self.ob_valid_history: Dict[str, bool] = {}
@@ -1636,16 +1640,179 @@ class SmartMoneyAlgoProE5:
     ) -> None:
         direction_text = "صاعد" if bullish else "هابط"
         display = f"{key} @ {format_price(price)} ({direction_text})"
-        self.console_event_log[key] = {
-            "text": key,
-            "price": price,
-            "time": timestamp,
+            self.console_event_log[key] = {
+                "text": key,
+                "price": price,
+                "time": timestamp,
             "time_display": format_timestamp(timestamp),
             "display": display,
             "direction": "bullish" if bullish else "bearish",
             "direction_display": direction_text,
             "source": "confirmed",
-        }
+            }
+
+    def _series_index_from_time(self, timestamp: Optional[int]) -> Optional[int]:
+        if timestamp is None or self.series.length() == 0:
+            return None
+        try:
+            ts = int(timestamp)
+        except (TypeError, ValueError):
+            return None
+        if ts <= 0:
+            return None
+        times = self.series.time
+        idx = bisect.bisect_left(times, ts)
+        if idx < len(times) and times[idx] == ts:
+            return idx
+        if idx > 0:
+            return idx - 1
+        return None
+
+    def _series_value_at(self, series: str, index: int) -> float:
+        values = getattr(self.series, series)
+        if 0 <= index < len(values):
+            return values[index]
+        return NA
+
+    def _fvg_exists_at_time(self, target_time: Optional[int], bullish: bool) -> bool:
+        if target_time is None:
+            return False
+        holder = self.bullish_gap_holder if bullish else self.bearish_gap_holder
+        for i in range(holder.size()):
+            box = holder.get(i)
+            if isinstance(box, Box) and box.left == target_time:
+                return True
+        return False
+
+    def _evaluate_shift_for_ob(self, ob_index: int, bullish: bool, max_shift: int = 3) -> Tuple[bool, str]:
+        for shift in range(1, max_shift + 1):
+            idx = ob_index + shift
+            if idx >= self.series.length():
+                break
+            target_time = self.series.time[idx]
+            if self._fvg_exists_at_time(target_time, bullish):
+                return True, f"Shifted +{shift} bars"
+        return False, f"No FVG within +{max_shift} bars"
+
+    def evaluate_order_block_conditions(
+        self,
+        box: Box,
+    ) -> Tuple[bool, Dict[str, Dict[str, Any]], Optional[str]]:
+        details: Dict[str, Dict[str, Any]] = {}
+        reason_parts: List[str] = []
+        ob_index = self._series_index_from_time(box.left)
+        is_bullish: Optional[bool] = None
+        if hasattr(self, "demandZone") and box in getattr(self.demandZone, "values", []):
+            is_bullish = True
+        elif hasattr(self, "supplyZone") and box in getattr(self.supplyZone, "values", []):
+            is_bullish = False
+        else:
+            is_bullish = True
+
+        # Condition 1: Liquidity sweep of previous candle.
+        sweep_pass = False
+        sweep_detail = "Insufficient history"
+        if ob_index is not None and ob_index - 1 >= 0:
+            prev_index = ob_index - 1
+            if is_bullish:
+                sweep_pass = self._series_value_at("low", ob_index) < self._series_value_at("low", prev_index)
+            else:
+                sweep_pass = self._series_value_at("high", ob_index) > self._series_value_at("high", prev_index)
+            sweep_detail = "Sweep confirmed" if sweep_pass else "No sweep vs previous candle"
+        details["C1 Sweep"] = {"pass": sweep_pass, "detail": sweep_detail}
+        if not sweep_pass:
+            reason_parts.append("C1 Sweep failed")
+
+        # Condition 2: Immediate FVG after sweep candle.
+        fvg_pass = False
+        fvg_detail = "Insufficient history"
+        next_time: Optional[int] = None
+        if ob_index is not None and ob_index + 1 < self.series.length():
+            next_time = self.series.time[ob_index + 1]
+            fvg_pass = self._fvg_exists_at_time(next_time, bool(is_bullish))
+            fvg_detail = "FVG on next bar" if fvg_pass else "No FVG on next bar"
+        details["C2 FVG"] = {"pass": fvg_pass, "detail": fvg_detail}
+
+        # Condition 3: Shift logic if no immediate FVG.
+        if fvg_pass:
+            shift_pass = True
+            shift_detail = "Direct FVG; no shift needed"
+        else:
+            if ob_index is not None:
+                shift_pass, shift_detail = self._evaluate_shift_for_ob(ob_index, bool(is_bullish))
+            else:
+                shift_pass, shift_detail = False, "Insufficient history"
+        details["C3 Shift"] = {"pass": shift_pass, "detail": shift_detail}
+        if not (fvg_pass or shift_pass):
+            reason_parts.append("C2/C3 FVG/Shift failed")
+
+        # Condition 4: Inside bar filter.
+        inside_bar = False
+        inside_detail = "Insufficient history"
+        if ob_index is not None and ob_index < len(self.isb_history):
+            inside_bar = bool(self.isb_history[ob_index])
+            inside_detail = "Inside bar detected" if inside_bar else "Not inside bar"
+        inside_pass = not inside_bar
+        details["C4 InsideBar"] = {"pass": inside_pass, "detail": inside_detail}
+        if not inside_pass:
+            reason_parts.append("C4 InsideBar failed")
+
+        # Condition 5: Not mitigated / not touched.
+        touched_detail = "Insufficient history"
+        touched = False
+        if ob_index is not None:
+            touched_detail = "Not touched"
+            for idx in range(ob_index + 1, self.series.length()):
+                low = self._series_value_at("low", idx)
+                high = self._series_value_at("high", idx)
+                if low <= box.top and high >= box.bottom:
+                    touched = True
+                    touched_detail = f"Touched at +{idx - ob_index} bars"
+                    break
+        not_mitigated_pass = not touched
+        details["C5 NotMitigated"] = {"pass": not_mitigated_pass, "detail": touched_detail}
+        if not not_mitigated_pass:
+            reason_parts.append("C5 NotMitigated failed")
+
+        overall_pass = bool(sweep_pass and (fvg_pass or shift_pass) and inside_pass and not_mitigated_pass)
+        reason = " | ".join(reason_parts) if reason_parts else None
+        return overall_pass, details, reason
+
+    def _emit_order_block_evaluation(self, box: Box) -> None:
+        ob_type = box.text.strip()
+        symbol = self.symbol or "UNKNOWN"
+        timeframe = self.base_timeframe or "N/A"
+        overall_pass, details, reason = self.evaluate_order_block_conditions(box)
+        price_range = f"{format_price(box.bottom)} → {format_price(box.top)}"
+        time_display = format_timestamp(box.left)
+        line1 = f"{symbol} {timeframe} | {ob_type} Detected | PASS={overall_pass} | Price {price_range} | {time_display}"
+
+        def _flag(value: bool) -> str:
+            return "✅" if value else "❌"
+
+        def _detail_line(label: str) -> str:
+            entry = details.get(label, {})
+            detail_text = entry.get("detail")
+            suffix = f" ({detail_text})" if detail_text else ""
+            return f"{label}={_flag(bool(entry.get('pass')))}{suffix}"
+
+        line2 = " ".join(
+            [
+                _detail_line("C1 Sweep"),
+                _detail_line("C2 FVG"),
+                _detail_line("C3 Shift"),
+                _detail_line("C4 InsideBar"),
+                _detail_line("C5 NotMitigated"),
+            ]
+        )
+        line3 = f"Reason: {reason or '—'}"
+        lines = [line1, line2, line3]
+        print("\n".join(lines), flush=True)
+        if self.tg_config is not None:
+            try:
+                _send_tg(self.tg_config, lines)
+            except Exception:
+                pass
 
     def _register_box_event(self, box: Box, *, status: str = "active", event_time: Optional[int] = None) -> None:
         text = box.text.strip()
@@ -1696,6 +1863,8 @@ class SmartMoneyAlgoProE5:
                     price_range = f"{format_price(box.bottom)} → {format_price(box.top)}"
                     message = f"{{ticker}} {box.text} Created, Range: {price_range}"
                     self.alertcondition(True, alert_title, message)
+                if key in ("IDM_OB", "EXT_OB"):
+                    self._emit_order_block_evaluation(box)
 
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
         events: Dict[str, Dict[str, Any]] = {}
@@ -9013,7 +9182,12 @@ def scan_binance(
                     )
                 return idx, None, None
             candles = fetch_ohlcv(_get_exchange(), symbol, timeframe, limit, fast_scan=fast_scan)
-            runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
+            runtime = SmartMoneyAlgoProE5(
+                inputs=inputs,
+                base_timeframe=timeframe,
+                symbol=symbol,
+                tracer=tracer,
+            )
             runtime.process(candles)
             metrics = runtime.gather_console_metrics()
             latest_events = metrics.get("latest_events") or {}
@@ -9849,7 +10023,12 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
             candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
             if cfg.drop_last_incomplete and candles:
                 candles = candles[:-1]
-            runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
+            runtime = SmartMoneyAlgoProE5(
+                inputs=inputs,
+                base_timeframe=args.timeframe,
+                symbol=sym,
+                tg_config=cfg,
+            )
             runtime._bos_break_source = cfg.bos_confirmation
             runtime._strict_close_for_break = cfg.strict_close_for_break
             runtime.process(candles)
@@ -10744,7 +10923,12 @@ def _android_cli_entry() -> int:
                         candles = candles[:-1]
                     runtime = runtime_cache.get(sym)
                     if runtime is None:
-                        runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
+                        runtime = SmartMoneyAlgoProE5(
+                            inputs=inputs,
+                            base_timeframe=args.timeframe,
+                            symbol=sym,
+                            tg_config=cfg,
+                        )
                         runtime._bos_break_source = cfg.bos_confirmation
                         runtime._strict_close_for_break = cfg.strict_close_for_break
                         runtime_cache[sym] = runtime
