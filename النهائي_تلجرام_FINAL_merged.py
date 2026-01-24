@@ -13,10 +13,9 @@ packages in the Pine file are intentionally omitted, per the latest user
 instruction.
 
 The script can be invoked directly or through ``main()`` which handles command
-line arguments and report generation inside
-``FINAL_REPORT_SMART_MONEY_ANALYSIS.md``.  The code is organised to expose the
-intermediate state so tests can validate structural parity against the Pine
-logic.
+line arguments and optional Binance scanning output to the console. The code is
+organised to expose the intermediate state so tests can validate structural
+parity against the Pine logic.
 """
 
 from __future__ import annotations
@@ -26,14 +25,13 @@ import concurrent.futures
 import bisect
 import dataclasses
 import datetime
-import inspect
 import json
 import math
 import os
 import re
 import sys
-import textwrap
 import time
+import threading
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -166,6 +164,90 @@ TELEGRAM_DISABLE_WEB_PREVIEW = True
 TELEGRAM_MIRROR_FLUSH_SECONDS = 2.0
 TELEGRAM_MIRROR_MAX_LINES = 25
 TELEGRAM_MAX_MESSAGE_CHARS = 3800  # أقل من 4096 لتجنب رفض تيليجرام
+
+# -----------------------------------------------------------------------------
+# Scanner & Event Settings (عدّل هذه القيم من أعلى الملف)
+# -----------------------------------------------------------------------------
+SCANNER_TIMEFRAME = "1h"
+SCANNER_LOOKBACK = 0
+SCANNER_CONCURRENCY = 1
+SCANNER_FAST_SCAN = True
+SCANNER_CONTINUOUS = False
+SCANNER_INTERVAL = 2.0
+SCANNER_MIN_DAILY_CHANGE = 0.0
+
+# فلتر عمر الأحداث (بعدد الشموع)
+EVENT_PRINT_ENABLED = True
+EVENT_PRINT_MAX_AGE_BARS = 2
+
+EVENT_PRINT_KEYS = {
+    "BOS",
+    "BOS_PLUS",
+    "FUTURE_BOS",
+    "CHOCH",
+    "FUTURE_CHOCH",
+    "MSS",
+    "MSS_PLUS",
+    "IDM_OB",
+    "HIST_IDM_OB",
+    "EXT_OB",
+    "HIST_EXT_OB",
+    "FVG",
+    "LIQUIDITY_LEVELS",
+    "GOLDEN_ZONE",
+    "PDH",
+    "PDL",
+    "EQUILIBRIUM",
+    "SWING_SWEEP",
+    "X",
+    "KEY_LEVEL_4H",
+    "KEY_LEVEL_DAILY",
+    "KEY_LEVEL_WEEKLY",
+    "GREEN_CIRCLE",
+    "RED_CIRCLE",
+}
+
+EVENT_PRINT_LABELS = {
+    "BOS": "BOS",
+    "BOS_PLUS": "BOS+",
+    "FUTURE_BOS": "BOS (ملامسة ليبل مستقبلي)",
+    "CHOCH": "CHoCH",
+    "FUTURE_CHOCH": "CHoCH (ملامسة ليبل مستقبلي)",
+    "MSS": "MSS",
+    "MSS_PLUS": "MSS+",
+    "IDM_OB": "IDM OB",
+    "HIST_IDM_OB": "Hist IDM OB",
+    "EXT_OB": "EXT OB",
+    "HIST_EXT_OB": "Hist EXT OB",
+    "FVG": "FVG",
+    "LIQUIDITY_LEVELS": "Liquidity Levels",
+    "GOLDEN_ZONE": "Golden zone",
+    "PDH": "PDH",
+    "PDL": "PDL",
+    "EQUILIBRIUM": "Equilibrium (0.5)",
+    "SWING_SWEEP": "Swing Sweep",
+    "X": 'Mark "X',
+    "KEY_LEVEL_4H": "Key Levels 4H",
+    "KEY_LEVEL_DAILY": "Key Levels Daily",
+    "KEY_LEVEL_WEEKLY": "Key Levels Weekly",
+    "GREEN_CIRCLE": "الدوائر الخضراء",
+    "RED_CIRCLE": "الدوائر الحمراء",
+}
+
+
+@dataclass(frozen=True)
+class _EditorAutorunDefaults:
+    timeframe: str = SCANNER_TIMEFRAME
+    candle_limit: int = 500
+    max_symbols: int = 600
+    recent_bars: int = 2
+    concurrency: int = SCANNER_CONCURRENCY
+    fast_scan: bool = SCANNER_FAST_SCAN
+    continuous_scan: bool = SCANNER_CONTINUOUS
+    scan_interval: float = SCANNER_INTERVAL
+
+
+EDITOR_AUTORUN_DEFAULTS = _EditorAutorunDefaults()
 
 # (اختياري) تصدير الإعدادات كمتغيرات بيئة حتى تعمل دون سطر أوامر
 # ملاحظة: لا نطبع التوكن أو الـ chat_id حفاظًا على الخصوصية.
@@ -1154,25 +1236,6 @@ class IndicatorInputs:
     support_resistance: SupportResistanceInputs = field(default_factory=SupportResistanceInputs)
 
 
-@dataclass
-class PullbackInventory:
-    general_info: List[str] = field(default_factory=list)
-    inputs: List[Dict[str, str]] = field(default_factory=list)
-    constants: List[Dict[str, str]] = field(default_factory=list)
-    vars: List[Dict[str, str]] = field(default_factory=list)
-    arrays: List[Dict[str, str]] = field(default_factory=list)
-    functions: List[Dict[str, Any]] = field(default_factory=list)
-    definitions: Dict[str, List[str]] = field(default_factory=dict)
-    direction_logic: List[str] = field(default_factory=list)
-    timeline: List[str] = field(default_factory=list)
-    outputs: List[Dict[str, str]] = field(default_factory=list)
-    dependencies: List[str] = field(default_factory=list)
-    edge_cases: List[str] = field(default_factory=list)
-    tests: List[str] = field(default_factory=list)
-    coverage: Dict[str, int] = field(default_factory=dict)
-    missing: List[str] = field(default_factory=list)
-
-
 # ----------------------------------------------------------------------------
 # Utility accessors for historical series
 # ----------------------------------------------------------------------------
@@ -1382,6 +1445,8 @@ class SmartMoneyAlgoProE5:
         self.boxes: List[Box] = []
         self.bar_colors: List[Tuple[int, str]] = []
         self.console_event_log: Dict[str, Dict[str, Any]] = {}
+        self.console_printed_events: Dict[str, int] = {}
+        self.console_printed_tokens: Dict[str, str] = {}
         self.console_box_status_tally: Dict[str, Counter[str]] = defaultdict(Counter)
         console_inputs = getattr(self.inputs, "console", None)
         if console_inputs is None:
@@ -1522,6 +1587,76 @@ class SmartMoneyAlgoProE5:
             return True
         return bars_ago <= self.console_max_age_bars
 
+    def _event_print_within_age(self, timestamp: Any) -> bool:
+        if EVENT_PRINT_MAX_AGE_BARS <= 0:
+            return True
+        bars_ago = self._bars_ago_from_time(timestamp)
+        if bars_ago is None:
+            return True
+        return bars_ago <= EVENT_PRINT_MAX_AGE_BARS
+
+    def _should_print_event(self, key: str, payload: Dict[str, Any]) -> bool:
+        if not EVENT_PRINT_ENABLED:
+            return False
+        if EVENT_PRINT_KEYS and key not in EVENT_PRINT_KEYS:
+            return False
+        timestamp = payload.get("time") if isinstance(payload, dict) else None
+        if not self._event_print_within_age(timestamp):
+            return False
+        if isinstance(timestamp, (int, float)):
+            last_time = self.console_printed_events.get(key)
+            if last_time is not None and int(timestamp) == last_time:
+                return False
+        token = payload.get("fingerprint")
+        if token:
+            last_token = self.console_printed_tokens.get(key)
+            if last_token == token:
+                return False
+        return True
+
+    def _emit_console_event(self, key: str, payload: Dict[str, Any]) -> None:
+        if not isinstance(payload, dict):
+            return
+        if not self._should_print_event(key, payload):
+            return
+        timestamp = payload.get("time")
+        if isinstance(timestamp, (int, float)):
+            self.console_printed_events[key] = int(timestamp)
+        token = payload.get("fingerprint")
+        if token:
+            self.console_printed_tokens[key] = str(token)
+        label = EVENT_PRINT_LABELS.get(key, key)
+        display = payload.get("display")
+        if display is None:
+            price = payload.get("price")
+            if isinstance(price, tuple):
+                display = " → ".join(format_price(p) for p in price)
+            else:
+                display = format_price(price if isinstance(price, (int, float)) else None)
+        status_display = payload.get("status_display")
+        if status_display:
+            display = f"{display} [{status_display}]"
+        time_display = payload.get("time_display") or format_timestamp(timestamp)
+        if time_display and time_display != "—":
+            display = f"{display} | {time_display}"
+        direction_hint = _resolve_direction(
+            payload.get("direction"),
+            payload.get("direction_display"),
+            payload.get("status"),
+            payload.get("text"),
+            display,
+        )
+        colored_display = _colorize_directional_text(
+            display,
+            direction=direction_hint,
+            fallback=ANSI_VALUE_POS,
+        )
+        print(f"{ANSI_BOLD}{label}{ANSI_RESET}: {colored_display}", flush=True)
+
+    def _record_console_event(self, key: str, payload: Dict[str, Any]) -> None:
+        self.console_event_log[key] = payload
+        self._emit_console_event(key, payload)
+
     def gather_console_metrics(self) -> Dict[str, Any]:
         """Aggregate runtime metrics for console presentation."""
 
@@ -1589,6 +1724,11 @@ class SmartMoneyAlgoProE5:
         metrics["ext_ob_new"] = _status_total(ext_counter, "new")
         metrics["ext_ob_touched"] = _status_total(ext_counter, "touched", "retest")
         metrics["current_price"] = self.series.get("close")
+        metrics["latest_events"] = {
+            key: payload
+            for key, payload in self.console_event_log.items()
+            if self._console_event_within_age(payload.get("time"))
+        }
         return metrics
 
     def _register_label_event(self, label: Label) -> None:
@@ -1618,18 +1758,35 @@ class SmartMoneyAlgoProE5:
                 key = "RED_CIRCLE"
             elif label.color == self.inputs.structure.bull:
                 key = "GREEN_CIRCLE"
+        if key is None:
+            if text.startswith(self.PDH_TEXT):
+                key = "PDH"
+            elif text.startswith(self.PDL_TEXT):
+                key = "PDL"
+            elif text.startswith(self.MID_TEXT):
+                key = "EQUILIBRIUM"
+        if key is None:
+            normalized = text.lower()
+            if "4h" in normalized:
+                key = "KEY_LEVEL_4H"
+            elif any(token in normalized for token in ("daily", "do", "pdh", "pdl")):
+                key = "KEY_LEVEL_DAILY"
+            elif any(token in normalized for token in ("weekly", "wo", "pwh", "pwl")):
+                key = "KEY_LEVEL_WEEKLY"
         if key:
             if key in ("BOS", "CHOCH"):
                 existing = self.console_event_log.get(key)
                 if existing and existing.get("source") == "confirmed":
                     return
-            self.console_event_log[key] = {
+            payload = {
                 "text": label.text,
                 "price": label.y,
                 "time": label.x,
                 "time_display": format_timestamp(label.x),
                 "display": f"{label.text} @ {format_price(label.y)}",
+                "fingerprint": f"{key}:{_fmt_price_key(label.y)}",
             }
+            self._record_console_event(key, payload)
             self._trace("label", "register", timestamp=label.x, key=key, text=label.text, price=label.y)
 
     def _register_structure_break_event(
@@ -1642,7 +1799,7 @@ class SmartMoneyAlgoProE5:
     ) -> None:
         direction_text = "صاعد" if bullish else "هابط"
         display = f"{key} @ {format_price(price)} ({direction_text})"
-        self.console_event_log[key] = {
+        payload = {
             "text": key,
             "price": price,
             "time": timestamp,
@@ -1651,7 +1808,9 @@ class SmartMoneyAlgoProE5:
             "direction": "bullish" if bullish else "bearish",
             "direction_display": direction_text,
             "source": "confirmed",
+            "fingerprint": f"{key}:{_fmt_price_key(price)}",
         }
+        self._record_console_event(key, payload)
 
     def _register_box_event(self, box: Box, *, status: str = "active", event_time: Optional[int] = None) -> None:
         text = box.text.strip()
@@ -1689,7 +1848,7 @@ class SmartMoneyAlgoProE5:
                         _save_json_set(_OB_RETEST_CACHE_PATH, _OB_RETEST_SEEN)
 
             tally[status_key] += 1
-            self.console_event_log[key] = {
+            payload = {
                 "text": box.text,
                 "price": (box.bottom, box.top),
                 "time": ts,
@@ -1697,7 +1856,9 @@ class SmartMoneyAlgoProE5:
                 "display": f"{box.text} {format_price(box.bottom)} → {format_price(box.top)}",
                 "status": status,
                 "status_display": status_label,
+                "fingerprint": f"{key}:{_fmt_price_key(box.bottom)}:{_fmt_price_key(box.top)}:{status}",
             }
+            self._record_console_event(key, payload)
             self._trace(
                 "box",
                 "register",
@@ -4685,6 +4846,17 @@ class SmartMoneyAlgoProE5:
             fvg.i_textColor,
         )
         labelholder.unshift(label)
+        self._record_console_event(
+            "FVG",
+            {
+                "text": "FVG",
+                "price": (lower, upper),
+                "time": bar_time,
+                "time_display": format_timestamp(bar_time),
+                "display": f"FVG {format_price(lower)} → {format_price(upper)}",
+                "fingerprint": f"FVG:{_fmt_price_key(lower)}:{_fmt_price_key(upper)}",
+            },
+        )
 
     def _fvg_delete(
         self,
@@ -4990,6 +5162,18 @@ class SmartMoneyAlgoProE5:
                     self.highBoxArrayHTF.push(box_obj)
                 self.last_liq_high_time = time_ref
                 created_high = True
+                self._record_console_event(
+                    "LIQUIDITY_LEVELS",
+                    {
+                        "text": "Liquidity High",
+                        "price": price,
+                        "time": time_ref,
+                        "time_display": format_timestamp(time_ref),
+                        "display": f"Liquidity High @ {format_price(price)}",
+                        "direction": "bearish",
+                        "fingerprint": f"LIQ_HIGH:{_fmt_price_key(price)}",
+                    },
+                )
 
         if pivot_low is not None:
             time_ref, price = pivot_low
@@ -5026,6 +5210,18 @@ class SmartMoneyAlgoProE5:
                     self.lowBoxArrayHTF.push(box_obj)
                 self.last_liq_low_time = time_ref
                 created_low = True
+                self._record_console_event(
+                    "LIQUIDITY_LEVELS",
+                    {
+                        "text": "Liquidity Low",
+                        "price": price,
+                        "time": time_ref,
+                        "time_display": format_timestamp(time_ref),
+                        "display": f"Liquidity Low @ {format_price(price)}",
+                        "direction": "bullish",
+                        "fingerprint": f"LIQ_LOW:{_fmt_price_key(price)}",
+                    },
+                )
 
         high_line_alert = self._liquidity_remove_mitigated_lines(self.highLineArrayHTF, True, liq)
         low_line_alert = self._liquidity_remove_mitigated_lines(self.lowLineArrayHTF, False, liq)
@@ -5822,6 +6018,17 @@ class SmartMoneyAlgoProE5:
                 self.inputs.structure_util.colorSweep,
             )
         self.arrBCLine.push(ln)
+        self._record_console_event(
+            "SWING_SWEEP",
+            {
+                "text": "Swing Sweep",
+                "price": y,
+                "time": self.series.get_time(),
+                "time_display": format_timestamp(self.series.get_time()),
+                "display": f"Swing Sweep @ {format_price(y)}",
+                "fingerprint": f"SWING_SWEEP:{_fmt_price_key(y)}",
+            },
+        )
 
     def TP(self, H: float, L: float) -> None:
         target = (self.series.get("high") + abs(H - L)) if self.isCocUp else (self.series.get("low") - abs(H - L))
@@ -5991,6 +6198,22 @@ class SmartMoneyAlgoProE5:
                         "size.small",
                         color,
                     )
+                if txt == self.MID_TEXT:
+                    high = self.series.get("high")
+                    low = self.series.get("low")
+                    if not math.isnan(high) and not math.isnan(low) and low <= y <= high:
+                        touch_time = self.series.get_time()
+                        self._record_console_event(
+                            "EQUILIBRIUM",
+                            {
+                                "text": "0.5",
+                                "price": y,
+                                "time": touch_time,
+                                "time_display": format_timestamp(touch_time),
+                                "display": f"0.5 @ {format_price(y)}",
+                                "fingerprint": f"EQUILIBRIUM:{_fmt_price_key(y)}:{touch_time}",
+                            },
+                        )
                 setattr(self, line_attr, new_line)
                 setattr(self, label_attr, new_label)
         return val, valiIdx, idDirUP
@@ -7558,7 +7781,111 @@ def fetch_binance_usdtm_symbols(
     return symbols
 
 
-def fetch_ohlcv(exchange: Any, symbol: str, timeframe: str, limit: int) -> List[Dict[str, float]]:
+def _ensure_markets_loaded(exchange: Any) -> bool:
+    """Load exchange markets once per client for faster repeated OHLCV calls."""
+
+    markets = getattr(exchange, "markets", None)
+    if markets:
+        return True
+    try:
+        _call_with_retries(exchange.load_markets, retries=3)
+    except Exception as exc:
+        if _is_rate_limit_error(exc):
+            print(f"تحذير: تعذر تحميل أسواق Binance بسبب معدل الطلبات: {exc}", flush=True)
+        else:
+            print(f"تحذير: تعذر تحميل أسواق Binance: {exc}", flush=True)
+        return False
+    return True
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    status = getattr(exc, "status", None) or getattr(exc, "status_code", None)
+    if isinstance(status, int) and status in (418, 429):
+        return True
+    return any(
+        token in message
+        for token in (
+            "too many requests",
+            "rate limit",
+            "rate-limit",
+            "banned",
+            "418",
+            "429",
+            "ip banned",
+        )
+    )
+
+
+def _rate_limit_backoff(attempt: int) -> float:
+    return min(10.0, 1.5 ** attempt)
+
+
+def _extract_ban_until_ms(message: str) -> Optional[int]:
+    match = re.search(r"banned until (\d+)", message, re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _sleep_until(timestamp_ms: int) -> None:
+    now_ms = int(time.time() * 1000)
+    if timestamp_ms <= now_ms:
+        return
+    wait_seconds = max(0.0, (timestamp_ms - now_ms) / 1000.0) + 1.0
+    time.sleep(wait_seconds)
+
+
+class _GlobalRateLimiter:
+    def __init__(self, min_interval: float = 0.2) -> None:
+        self._min_interval = max(0.0, float(min_interval))
+        self._lock = threading.Lock()
+        self._next_allowed = 0.0
+
+    def wait(self) -> None:
+        if self._min_interval <= 0:
+            return
+        with self._lock:
+            now = time.time()
+            if now < self._next_allowed:
+                time.sleep(self._next_allowed - now)
+            self._next_allowed = time.time() + self._min_interval
+
+
+GLOBAL_RATE_LIMITER = _GlobalRateLimiter()
+
+
+def _call_with_retries(action: Callable[[], Any], *, retries: int = 3) -> Any:
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            GLOBAL_RATE_LIMITER.wait()
+            return action()
+        except Exception as exc:  # pragma: no cover - defensive
+            last_exc = exc
+            if not _is_rate_limit_error(exc):
+                raise
+            ban_until = _extract_ban_until_ms(str(exc))
+            if ban_until:
+                _sleep_until(ban_until)
+            else:
+                time.sleep(_rate_limit_backoff(attempt + 1))
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("request failed without exception")
+
+
+def fetch_ohlcv(
+    exchange: Any,
+    symbol: str,
+    timeframe: str,
+    limit: int,
+    *,
+    fast_scan: bool = False,
+) -> List[Dict[str, float]]:
     """Fetch OHLCV data while preserving full history for structural parity.
 
     Binance USDT-M returns at most 1500 candles per request.  TradingView keeps
@@ -7577,16 +7904,36 @@ def fetch_ohlcv(exchange: Any, symbol: str, timeframe: str, limit: int) -> List[
     candles: List[Dict[str, float]] = []
     target = limit if limit > 0 else None
 
+    if fast_scan:
+        request_limit = target or max_batch
+        raw = _call_with_retries(
+            lambda: exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=request_limit),
+            retries=3,
+        )
+        return [
+            {
+                "time": entry[0],
+                "open": entry[1],
+                "high": entry[2],
+                "low": entry[3],
+                "close": entry[4],
+                "volume": entry[5],
+            }
+            for entry in raw
+        ]
+
     while True:
         request_limit = max_batch
         if target is not None and target < max_batch and not candles:
             # first batch can be trimmed if the caller only needs a small window
             request_limit = target
         raw: List[List[float]]
-        if since <= 0:
-            raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=request_limit, since=since)
-        else:
-            raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=request_limit, since=since)
+        raw = _call_with_retries(
+            lambda: exchange.fetch_ohlcv(
+                symbol, timeframe=timeframe, limit=request_limit, since=since
+            ),
+            retries=3,
+        )
         if not raw:
             break
         for entry in raw:
@@ -7612,777 +7959,358 @@ def fetch_ohlcv(exchange: Any, symbol: str, timeframe: str, limit: int) -> List[
     return candles
 
 
-def _split_arguments(argument_string: str) -> List[str]:
-    parts: List[str] = []
-    current: List[str] = []
-    depth = 0
-    for char in argument_string:
-        if char == "(":
-            depth += 1
-        elif char == ")":
-            depth -= 1
-        if char == "," and depth == 0:
-            parts.append("".join(current).strip())
-            current = []
-        else:
-            current.append(char)
-    if current:
-        parts.append("".join(current).strip())
-    return parts
+METRIC_LABELS = [
+    ("alerts", "عدد التنبيهات"),
+    ("pullback_arrows", "إشارات Pullback"),
+    ("choch_labels", "علامات CHoCH"),
+    ("bos_labels", "علامات BOS"),
+    ("idm_labels", "علامات IDM"),
+    ("demand_zones", "مناطق الطلب"),
+    ("supply_zones", "مناطق العرض"),
+    ("idm_ob_new", "IDM OB تم إنشائها حديثاً"),
+    ("idm_ob_touched", "IDM OB تم ملامستها"),
+    ("ext_ob_new", "EXT OB تم إنشائها حديثاً"),
+    ("ext_ob_touched", "EXT OB تم ملامستها"),
+    ("bullish_fvg", "فجوات FVG صاعدة"),
+    ("bearish_fvg", "فجوات FVG هابطة"),
+    ("order_flow_boxes", "صناديق Order Flow"),
+    ("liquidity_objects", "مستويات السيولة"),
+    ("scob_colored_bars", "شموع SCOB"),
+]
 
 
-def _extract_pine_input(lines: List[str], name: str) -> Optional[Dict[str, str]]:
-    pattern = re.compile(rf"^\s*{name}\s*=\s*input\.(\w+)\((.*)\)")
-    for idx, line in enumerate(lines, 1):
-        match = pattern.match(line.strip())
-        if not match:
-            continue
-        kind = match.group(1)
-        args = match.group(2)
-        pieces = _split_arguments(args)
-        default = pieces[0] if pieces else ""
-        group = "غير محدد"
-        purpose = "غير مذكور"
-        for piece in pieces[1:]:
-            if "group" in piece:
-                group = piece.split("=", 1)[1].strip()
-            literal = re.search(r'(\"[^\"]*\"|\'[^\']*\')', piece)
-            if literal and purpose == "غير مذكور":
-                purpose = literal.group(1)
-        if purpose == "غير مذكور":
-            literal = re.search(r'(\"[^\"]*\"|\'[^\']*\')', pieces[0]) if pieces else None
-            if literal:
-                purpose = literal.group(1)
-        return {
-            "name": name,
-            "type": f"input.{kind}",
-            "group": group,
-            "default": default,
-            "purpose": purpose,
-            "quote": f"«⟪{line.strip()}⟫» (سطر {idx})",
-        }
-    return None
+EVENT_DISPLAY_ORDER = [
+    ("BOS", "BOS"),
+    ("BOS_PLUS", "BOS+"),
+    ("CHOCH", "CHOCH"),
+    ("MSS_PLUS", "MSS+"),
+    ("MSS", "MSS"),
+    ("IDM", "IDM"),
+    ("IDM_OB", "IDM OB"),
+    ("EXT_OB", "EXT OB"),
+    ("HIST_IDM_OB", "Hist IDM OB"),
+    ("HIST_EXT_OB", "Hist EXT OB"),
+    ("GOLDEN_ZONE", "Golden zone"),
+    ("X", "X"),
+    ("RED_CIRCLE", "الدوائر الحمراء"),
+    ("GREEN_CIRCLE", "الدوائر الخضراء"),
+    ("FUTURE_BOS", "ليبل BOS المستقبلي"),
+    ("FUTURE_CHOCH", "ليبل CHOCH المستقبلي"),
+]
 
 
-def _extract_pine_var(lines: List[str], name: str) -> Optional[Dict[str, str]]:
-    pattern = re.compile(rf"^\s*var\s+(?:\w+\s+)?{name}\s*=\s*(.*)")
-    for idx, line in enumerate(lines, 1):
-        match = pattern.match(line.strip())
-        if match:
-            return {
-                "name": name,
-                "initial": match.group(1),
-                "quote": f"«⟪{line.strip()}⟫» (سطر {idx})",
-            }
-    return None
-
-
-def _extract_pine_array(lines: List[str], name: str) -> Optional[Dict[str, str]]:
-    pattern = re.compile(rf"^\s*var\s+{name}\s*=\s*(array\.[^\(]+\(.*\))")
-    for idx, line in enumerate(lines, 1):
-        match = pattern.match(line.strip())
-        if match:
-            return {
-                "name": name,
-                "constructor": match.group(1),
-                "quote": f"«⟪{line.strip()}⟫» (سطر {idx})",
-            }
-    return None
-
-
-def _capture_pine_function(lines: List[str], start_index: int) -> str:
-    block: List[str] = []
-    block.append(lines[start_index - 1])
-    for line in lines[start_index:]:
-        if line and not line.startswith("    "):
-            break
-        block.append(line)
-    return "\n".join(block).rstrip()
-
-
-def _extract_pine_function(lines: List[str], name: str) -> Optional[Dict[str, Any]]:
-    pattern = re.compile(rf"^\s*{name}\(([^)]*)\)\s*=>")
-    for idx, line in enumerate(lines, 1):
-        match = pattern.match(line)
-        if not match:
-            continue
-        block = _capture_pine_function(lines, idx)
-        return {
-            "name": name,
-            "signature": f"{name}({match.group(1)}) =>",
-            "block": block,
-            "quote": f"«⟪{line.strip()}⟫» (سطر {idx})",
-            "start": idx,
-        }
-    return None
-
-
-def _collect_lines_with(lines: List[str], token: str) -> List[str]:
-    results: List[str] = []
-    for idx, line in enumerate(lines, 1):
-        if token in line:
-            results.append(f"- سطر {idx}: «⟪{line.strip()}⟫»")
-    return results
-
-
-def parse_pine_pullback(pine_text: str) -> PullbackInventory:
-    lines = pine_text.splitlines()
-    inventory = PullbackInventory()
-
-    for idx, line in enumerate(lines, 1):
-        stripped = line.strip()
-        if stripped.startswith("indicator("):
-            inventory.general_info.append(f"- «⟪{stripped}⟫» (سطر {idx})")
-            break
-
-    input_names = [
-        "showHL",
-        "colorHL",
-        "showMn",
-        "showMajoinMiner",
-        "showMajoinMinerMax",
-        "showISOB",
-        "showISOBMax",
-        "ClrMajorOFBull",
-        "ClrMajorOFBear",
-        "ClrMinorOFBull",
-        "ClrMinorOFBear",
+def print_symbol_summary(index: int, symbol: str, timeframe: str, candle_count: int, metrics: dict) -> None:
+    header_color = ANSI_HEADER_COLORS[index % len(ANSI_HEADER_COLORS)]
+    symbol_display = _format_symbol(symbol)
+    header_lines = [
+        f"{header_color}{ANSI_BOLD}════ تحليل {symbol_display}{header_color}{ANSI_BOLD} ({timeframe}) ════{ANSI_RESET}",
+        f"{ANSI_DIM}عدد الشموع: {candle_count}{ANSI_RESET}",
     ]
-    for name in input_names:
-        entry = _extract_pine_input(lines, name)
-        if entry:
-            inventory.inputs.append(entry)
-        else:
-            inventory.missing.append(f"Input {name}")
-
-    var_names = [
-        "puHigh",
-        "puLow",
-        "puHigh_",
-        "puLow_",
-        "puHBar",
-        "puLBar",
-        "lstHlPrs",
-        "lstHlPrsIdm",
-    ]
-    for name in var_names:
-        entry = _extract_pine_var(lines, name)
-        if entry:
-            inventory.vars.append(entry)
-        else:
-            inventory.missing.append(f"Var {name}")
-
-    array_names = [
-        "arrHLLabel",
-        "arrHLCircle",
-        "arrPrevPrs",
-        "arrPrevIdx",
-        "arrPrevPrsMin",
-        "arrPrevIdxMin",
-        "arrlstHigh",
-        "arrlstLow",
-        "arrOBBullm",
-        "arrOBBearm",
-        "arrOBBulls",
-        "arrOBBears",
-        "arrOBBullisVm",
-        "arrOBBearisVm",
-        "arrOBBullisVs",
-        "arrOBBearisVs",
-    ]
-    for name in array_names:
-        entry = _extract_pine_array(lines, name)
-        if entry:
-            inventory.arrays.append(entry)
-        else:
-            inventory.missing.append(f"Array {name}")
-
-    for func_name in ("labelMn", "labelHL"):
-        entry = _extract_pine_function(lines, func_name)
-        if entry:
-            inventory.functions.append(entry)
-        else:
-            inventory.missing.append(f"Function {func_name}")
-
-    # Direction and drawing details
-    for function in inventory.functions:
-        block_lines = function["block"].splitlines()
-        for raw in block_lines:
-            stripped = raw.strip()
-            if any(keyword in stripped for keyword in ("getDirection", "getTextLabel", "getYloc")):
-                inventory.direction_logic.append(f"- {function['name']}: «⟪{stripped}⟫»")
-            if any(keyword in stripped for keyword in ("label.new", "box.new")):
-                draw_type = "label.new" if "label.new" in stripped else "box.new"
-                inventory.outputs.append(
-                    {
-                        "type": draw_type,
-                        "context": function["name"],
-                        "quote": f"«⟪{stripped}⟫»",
-                    }
-                )
-
-    # Definitions
-    inventory.definitions["general"] = [
-        entry["quote"] for entry in inventory.functions
-    ]
-    pine_labelhl = next((f for f in inventory.functions if f["name"] == "labelHL"), None)
-    pine_labelmn = next((f for f in inventory.functions if f["name"] == "labelMn"), None)
-    major_details: List[str] = []
-    minor_details: List[str] = []
-    if pine_labelhl:
-        for line in pine_labelhl["block"].splitlines():
-            stripped = line.strip()
-            if "showMajoinMiner" in stripped or "arrOBBullm" in stripped or "arrHLLabel" in stripped:
-                major_details.append(f"- «⟪{stripped}⟫»")
-    if pine_labelmn:
-        for line in pine_labelmn["block"].splitlines():
-            stripped = line.strip()
-            if "showMn" in stripped or "arrOBBulls" in stripped:
-                minor_details.append(f"- «⟪{stripped}⟫»")
-    inventory.definitions["major"] = major_details
-    inventory.definitions["minor"] = minor_details
-
-    # Timeline from higher level calls
-    timeline_tokens = ["labelMn(", "labelHL("]
-    for token in timeline_tokens:
-        inventory.timeline.extend(_collect_lines_with(lines, token))
-
-    # Dependencies and edge cases
-    if pine_labelhl:
-        inventory.dependencies.append(
-            "- يعتمد على مدخلات Order Flow مثل «⟪showMajoinMiner⟫» و«⟪ClrMajorOFBull⟫» داخل labelHL"
-        )
-        inventory.edge_cases.append(
-            "- إعادة تعيين «⟪arrPrevPrs.set(0,0)⟫» تمنع إعادة استخدام قيم قديمة عند غياب HL/LH"
-        )
-    if pine_labelmn:
-        inventory.dependencies.append(
-            "- الوظيفة labelMn تستخدم «⟪showISOB⟫» لإنشاء صناديق Minor" )
-        inventory.edge_cases.append(
-            "- تصفير «⟪arrPrevPrsMin.set(0,0)⟫» بعد إنشاء الصندوق يمنع تراكم مناطق خاطئة"
-        )
-
-    inventory.tests.extend(
-        [
-            "- حالة صعود: تمرير سلسلة تصنع HH ثم HL يجب أن تفعّل «⟪labelHL(true)⟫» وتضيف صندوق Major Bull.",
-            "- حالة هبوط قصيرة: قمّة/قاع سريعين يجب أن تولّد «⟪labelMn(false)⟫» مع سهم Minor وتحديث arrPrevIdxMin.",
-        ]
-    )
-
-    inventory.coverage = {
-        "Inputs": len(inventory.inputs),
-        "Vars": len(inventory.vars),
-        "Arrays": len(inventory.arrays),
-        "Funcs": len(inventory.functions),
-        "Alerts": 0,
-        "Draws": len(inventory.outputs),
-    }
-
-    return inventory
-
-
-def _extract_python_inputs(python_lines: List[str]) -> List[Dict[str, str]]:
-    inputs: List[Dict[str, str]] = []
-    start_index: Optional[int] = None
-    for idx, line in enumerate(python_lines):
-        if line.strip().startswith("class PullbackInputs"):
-            start_index = idx + 1
-            break
-    if start_index is None:
-        return inputs
-    for idx in range(start_index, len(python_lines)):
-        line = python_lines[idx]
-        if not line.startswith("    ") or line.strip().startswith("@"):
-            break
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if ":" in stripped and "=" in stripped:
-            left, right = stripped.split("=", 1)
-            name_part, type_part = left.split(":", 1)
-            inputs.append(
-                {
-                    "name": name_part.strip(),
-                    "type": type_part.strip(),
-                    "default": right.strip(),
-                    "group": "IndicatorInputs.pullback",
-                    "purpose": "dataclass field",
-                    "quote": f"«⟪{stripped}⟫» (سطر {idx + 1})",
-                }
+    price_value = metrics.get("current_price")
+    if isinstance(price_value, (int, float)):
+        price_value = float(price_value)
+        if not math.isnan(price_value):
+            header_lines.append(f"{ANSI_DIM}السعر الحالي: {format_price(price_value)}{ANSI_RESET}")
+    elif isinstance(price_value, str):
+        header_lines.append(f"{ANSI_DIM}السعر الحالي: {price_value}{ANSI_RESET}")
+    change_value = metrics.get("daily_change_percent")
+    if isinstance(change_value, (int, float)):
+        header_lines.append(f"{ANSI_DIM}تغير 24 ساعة: {change_value:+.2f}%{ANSI_RESET}")
+    header = "\n".join(header_lines)
+    print(header, flush=True)
+    for key, label in METRIC_LABELS:
+        value = metrics.get(key, 0)
+        value_color = ANSI_VALUE_POS if value > 0 else ANSI_VALUE_ZERO
+        print(f"  {ANSI_LABEL}{label:<26}{ANSI_RESET}: {value_color}{value}{ANSI_RESET}", flush=True)
+    latest_events = metrics.get("latest_events") or {}
+    print(f"{ANSI_BOLD}أحدث الإشارات مع الأسعار{ANSI_RESET}", flush=True)
+    for key, label in EVENT_DISPLAY_ORDER:
+        event = latest_events.get(key)
+        if event:
+            display_text = event.get("display")
+            if display_text is None:
+                price = event.get("price")
+                if isinstance(price, tuple):
+                    display_text = " → ".join(format_price(p) for p in price)
+                else:
+                    display_text = format_price(price if isinstance(price, (int, float)) else None)
+            status_display = event.get("status_display")
+            if status_display:
+                display_text = f"{display_text} [{status_display}]"
+            time_display = event.get("time_display") or format_timestamp(event.get("time"))
+            if time_display and time_display != "—":
+                display_text = f"{display_text} | {time_display}"
+            direction_hint = _resolve_direction(
+                event.get("direction"),
+                event.get("direction_display"),
+                event.get("status"),
+                event.get("text"),
+                display_text,
             )
-    return inputs
-
-
-def _extract_python_attr(python_lines: List[str], name: str) -> Optional[Dict[str, str]]:
-    pattern = re.compile(rf"self\.{name}\s*=\s*(.*)")
-    for idx, line in enumerate(python_lines, 1):
-        match = pattern.search(line)
-        if match:
-            return {
-                "name": name,
-                "value": match.group(1).strip(),
-                "quote": f"«⟪{line.strip()}⟫» (سطر {idx})",
-            }
-    return None
-
-
-def gather_python_pullback(python_text: str, runtime: SmartMoneyAlgoProE5) -> PullbackInventory:
-    python_lines = python_text.splitlines()
-    inventory = PullbackInventory()
-
-    class_line = _collect_lines_with(python_lines, "class SmartMoneyAlgoProE5:")
-    if class_line:
-        inventory.general_info.extend(class_line)
-
-    input_rows = _extract_python_inputs(python_lines)
-    for row in input_rows:
-        if row["name"] in {"showHL", "colorHL", "showMn"}:
-            inventory.inputs.append(row)
-
-    var_names = [
-        "lstHlPrs",
-        "lstHlPrsIdm",
-        "puHigh",
-        "puLow",
-        "puHBar",
-        "puLBar",
-    ]
-    for name in var_names:
-        entry = _extract_python_attr(python_lines, name)
-        if entry:
-            inventory.vars.append(entry)
-        else:
-            inventory.missing.append(f"Python attr {name}")
-
-    array_names = [
-        "arrHLLabel",
-        "arrHLCircle",
-        "arrPrevPrs",
-        "arrPrevIdx",
-        "arrPrevPrsMin",
-        "arrPrevIdxMin",
-        "arrOBBullm",
-        "arrOBBearm",
-        "arrOBBulls",
-        "arrOBBears",
-        "arrOBBullisVm",
-        "arrOBBearisVm",
-        "arrOBBullisVs",
-        "arrOBBearisVs",
-    ]
-    for name in array_names:
-        entry = _extract_python_attr(python_lines, name)
-        if entry:
-            inventory.arrays.append(entry)
-
-    python_functions: List[Dict[str, Any]] = []
-    for func_name in ("labelMn", "labelHL"):
-        func = getattr(SmartMoneyAlgoProE5, func_name)
-        source_lines, start_line = inspect.getsourcelines(func)
-        block = "".join(source_lines).rstrip()
-        python_functions.append(
-            {
-                "name": func_name,
-                "signature": source_lines[0].strip(),
-                "block": block,
-                "quote": f"«⟪{source_lines[0].strip()}⟫» (سطر {start_line})",
-                "start": start_line,
-            }
-        )
-    inventory.functions.extend(python_functions)
-
-    for function in python_functions:
-        for raw in function["block"].splitlines():
-            stripped = raw.strip()
-            if any(keyword in stripped for keyword in ("self.getDirection", "self.getTextLabel", "self.getYloc")):
-                inventory.direction_logic.append(f"- {function['name']}: «⟪{stripped}⟫»")
-            if any(keyword in stripped for keyword in ("self.label_new", "self.box_new")):
-                draw_type = "self.label_new" if "self.label_new" in stripped else "self.box_new"
-                inventory.outputs.append(
-                    {
-                        "type": draw_type,
-                        "context": function["name"],
-                        "quote": f"«⟪{stripped}⟫»",
-                    }
-                )
-            if "self.arrPrevPrs.set(0, 0)" in stripped or "self.arrPrevPrsMin.set(0, 0)" in stripped:
-                inventory.edge_cases.append(f"- {function['name']}: «⟪{stripped}⟫»")
-
-    inventory.definitions["general"] = [entry["quote"] for entry in python_functions]
-    py_labelhl = next((f for f in python_functions if f["name"] == "labelHL"), None)
-    py_labelmn = next((f for f in python_functions if f["name"] == "labelMn"), None)
-    if py_labelhl:
-        inventory.definitions["major"] = [
-            f"- «⟪{line.strip()}⟫" for line in py_labelhl["block"].splitlines() if "showMajoinMiner" in line or "arrOBBullm" in line
-        ]
-    if py_labelmn:
-        inventory.definitions["minor"] = [
-            f"- «⟪{line.strip()}⟫" for line in py_labelmn["block"].splitlines() if "showMn" in line or "arrOBBulls" in line
-        ]
-
-    timeline_tokens = ["self.labelMn(", "self.labelHL("]
-    for token in timeline_tokens:
-        inventory.timeline.extend(_collect_lines_with(python_lines, token))
-
-    if py_labelhl:
-        inventory.dependencies.append(
-            "- labelHL يستخدم «⟪self.inputs.order_flow.showMajoinMiner⟫» و«⟪self.inputs.order_flow.ClrMajorOFBull⟫» لتوليد مناطق Major"
-        )
-    if py_labelmn:
-        inventory.dependencies.append(
-            "- labelMn يعتمد على «⟪self.inputs.order_flow.showISOB⟫» لبناء صناديق Minor"
-        )
-
-    inventory.tests.extend(
-        [
-            "- استدعاء runtime.labelHL(True) بعد تهيئة بيانات تصاعدية يجب أن يضيف نص HH بنفس ترتيب Pine.",
-            "- معالجة شمعة انعكاس سريعة ثم runtime.labelMn(False) يجب أن يدفع صندوق Minor Bear مطابق للسكربت." ,
-        ]
-    )
-
-    inventory.coverage = {
-        "Inputs": len(inventory.inputs),
-        "Vars": len(inventory.vars),
-        "Arrays": len(inventory.arrays),
-        "Funcs": len(inventory.functions),
-        "Alerts": 0,
-        "Draws": len(inventory.outputs),
-    }
-
-    return inventory
-
-
-def format_pullback_section(source: str, inventory: PullbackInventory) -> str:
-    lines: List[str] = []
-    lines.append(f"## {source}")
-    lines.append("B) قالب الإخراج النهائي — Pullback")
-    lines.append("0. بيانات عامة مقتصرة على صلة Pullback")
-    lines.extend(inventory.general_info or ["- غير موجود"])
-
-    lines.append("1. جدول Inputs المؤثرة في Pullback — تطابق 1:1")
-    if inventory.inputs:
-        lines.append("| الاسم | النوع | المجموعة/العرض | القيمة الافتراضية | الغرض | المصدر |")
-        lines.append("|------|-------|-----------------|-------------------|--------|---------|")
-        for item in inventory.inputs:
-            lines.append(
-                f"| {item['name']} | {item['type']} | {item.get('group', '')} | {item.get('default', '')} | {item.get('purpose', '')} | {item['quote']} |"
+            colored_display = _colorize_directional_text(
+                display_text,
+                direction=direction_hint,
+                fallback=ANSI_VALUE_POS,
             )
-    else:
-        lines.append("- لا توجد مدخلات")
-
-    lines.append("2. Constants — تطابق 1:1")
-    lines.append("- غير موجود")
-
-    lines.append("3. Vars و Arrays الخاصة بالPullback — الاسم/التهيئة/متى تتغيّر/الدور")
-    if inventory.vars or inventory.arrays:
-        for item in inventory.vars:
-            lines.append(f"- متغير {item['name']}: {item['quote']}")
-        for item in inventory.arrays:
-            lines.append(f"- مصفوفة {item['name']}: {item['quote']}")
-    else:
-        lines.append("- لا توجد متغيرات/مصفوفات")
-
-    lines.append("4. الدوال (Functions) — التوقيع + منطق داخلي خطوة-بخطوة")
-    if inventory.functions:
-        for function in inventory.functions:
-            lines.append(f"- {function['signature']} — {function['quote']}")
-    else:
-        lines.append("- لا توجد دوال")
-
-    lines.append("5. تعريفات التشغيل:")
-    lines.append("5.1) تعريف Pullback العام")
-    lines.extend(inventory.definitions.get("general", ["- غير موجود"]))
-    lines.append("5.2) Major Pullback — الشروط/العتبات/الفلاتر/الفروقات")
-    lines.extend(inventory.definitions.get("major", ["- غير موجود"]))
-    lines.append("5.3) Minor Pullback — الشروط/العتبات/الفلاتر/الفروقات")
-    lines.extend(inventory.definitions.get("minor", ["- غير موجود"]))
-
-    lines.append("6. منطق الاتجاه/الهيكل المُستخدم كأساس (HH/HL/LH/LL/ChoCh/BOS…) وتأثيره")
-    lines.extend(inventory.direction_logic or ["- غير موثق"])
-
-    lines.append("7. التسلسل الزمني (Top→Down) مع «⟪…⟫»")
-    lines.extend(inventory.timeline or ["- غير متاح"])
-
-    lines.append("8. المخرجات البصرية المتعلقة بـPullback")
-    if inventory.outputs:
-        for output in inventory.outputs:
-            lines.append(f"- {output['context']}::{output['type']} {output['quote']}")
-    else:
-        lines.append("- لا توجد مخرجات")
-
-    lines.append("9. Dependences Graph (نصي مختصر)")
-    lines.extend(inventory.dependencies or ["- غير محدد"])
-
-    lines.append("10. الحالات الحدّية/القيود")
-    lines.extend(inventory.edge_cases or ["- غير مصرح"])
-
-    lines.append("11. اختبارات تحقق سريعة")
-    lines.extend(inventory.tests or ["- غير متوفر"])
-
-    lines.append("12. قائمة التحقق (Coverage 99.99%)")
-    coverage_parts = [f"{key}: {value}" for key, value in inventory.coverage.items()]
-    lines.append("- " + " | ".join(coverage_parts))
-    if inventory.missing:
-        for missing in inventory.missing:
-            lines.append(f"- عنصر غير مواءم: {missing}")
-    else:
-        lines.append("- لا توجد عناصر ناقصة")
-
-    return "\n".join(lines)
+        else:
+            colored_display = _colorize_directional_text("—", direction=None, fallback=ANSI_VALUE_ZERO)
+        print(f"  {ANSI_LABEL}{label:<26}{ANSI_RESET}: {colored_display}", flush=True)
+    print(f"{ANSI_DIM}{'-'*48}{ANSI_RESET}", flush=True)
 
 
-def build_pullback_comparison(pine: PullbackInventory, python: PullbackInventory) -> str:
-    lines: List[str] = []
-    lines.append("A) قالب عام للمقارنة (Pine ↔ Python)")
-    lines.append("1. نطاق التحليل: Pullback")
-    lines.append("2. ملخص التطابق العام 1:1: قيد التحقق اليدوي (تم تجهيز الجرد الكامل)")
-    lines.append("3. مصفوفة المواءمة 1:1:")
-    lines.append("الاسم (Pine) | الاسم (Python) | النوع | المعادلة/الشرط | نقاط التحديث | استدعاءات الرسم/التنبيه | الملاحظة")
-
-    def _line_from(block: Optional[Dict[str, Any]], token: str) -> str:
-        if not block:
-            return "غير متاح"
-        for raw in block["block"].splitlines():
-            stripped = raw.strip()
-            if token in stripped:
-                return f"«⟪{stripped}⟫»"
-        return "غير متاح"
-
-    pine_labelhl = next((f for f in pine.functions if f["name"] == "labelHL"), None)
-    pine_labelmn = next((f for f in pine.functions if f["name"] == "labelMn"), None)
-    python_labelhl = next((f for f in python.functions if f["name"] == "labelHL"), None)
-    python_labelmn = next((f for f in python.functions if f["name"] == "labelMn"), None)
-
-    lines.append(
-        "labelHL | labelHL | دالة | "
-        + _line_from(pine_labelhl, "showHL")
-        + " ↔ "
-        + _line_from(python_labelhl, "self.inputs.pullback.showHL")
-        + " | "
-        + _line_from(pine_labelhl, "arrOBBullm.unshift")
-        + " ↔ "
-        + _line_from(python_labelhl, "self.arrOBBullm.unshift")
-        + " | "
-        + _line_from(pine_labelhl, "label.new")
-        + " ↔ "
-        + _line_from(python_labelhl, "self.label_new")
-        + " | مطابق مشروط بالمدخلات"
+def print_trace_comparison(result: 'TraceComparisonResult') -> None:
+    status = "مطابق" if result.matches else "اختلاف"
+    print(
+        f"Trace comparison: {status} (المرجع={result.reference_events}, الحالي={result.current_events})",
+        flush=True,
     )
-    lines.append(
-        "labelMn | labelMn | دالة | "
-        + _line_from(pine_labelmn, "showMn")
-        + " ↔ "
-        + _line_from(python_labelmn, "self.inputs.pullback.showMn")
-        + " | "
-        + _line_from(pine_labelmn, "arrOBBulls.unshift")
-        + " ↔ "
-        + _line_from(python_labelmn, "self.arrOBBulls.unshift")
-        + " | "
-        + _line_from(pine_labelmn, "label.new")
-        + " ↔ "
-        + _line_from(python_labelmn, "self.label_new")
-        + " | مطابق مع مراقبة شروط Minor"
+    if result.mismatches:
+        preview = result.mismatches[:5]
+        for mismatch in preview:
+            print(
+                "  - الحدث #{idx}: المرجع={ref} | الحالي={cur}".format(
+                    idx=mismatch.get("index"),
+                    ref=json.dumps(mismatch.get("reference", {}), ensure_ascii=False),
+                    cur=json.dumps(mismatch.get("current", {}), ensure_ascii=False),
+                ),
+                flush=True,
+            )
+        extra = len(result.mismatches) - len(preview)
+        if extra > 0:
+            print(f"  - ... {extra} اختلافات إضافية", flush=True)
+
+
+def _extract_daily_change_percent(ticker: dict) -> float | None:
+    value = ticker.get("percentage") if isinstance(ticker, dict) else None
+    if value is None:
+        open_price = ticker.get("open") if isinstance(ticker, dict) else None
+        last_price = ticker.get("last") if isinstance(ticker, dict) else None
+        if open_price and last_price and open_price != 0:
+            value = ((float(last_price) - float(open_price)) / float(open_price)) * 100.0
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _collect_recent_event_hits(series: object, latest_events: object, *, bars: int = 2) -> tuple[list[str], list[int]]:
+    if bars <= 0:
+        return [], []
+
+    recent_times: list[int] = []
+    if hasattr(series, "get_time"):
+        for offset in range(bars):
+            try:
+                ts = series.get_time(offset)
+            except Exception:
+                ts = None
+            if isinstance(ts, (int, float)) and ts > 0:
+                recent_times.append(int(ts))
+
+    if not recent_times or not isinstance(latest_events, dict):
+        return [], recent_times
+
+    hits: list[str] = []
+    for key, payload in latest_events.items():
+        timestamp = None
+        if isinstance(payload, dict):
+            timestamp = payload.get("time") or payload.get("ts") or payload.get("timestamp")
+        if isinstance(timestamp, (int, float)) and int(timestamp) in recent_times:
+            hits.append(str(key))
+    return hits, recent_times
+
+
+def scan_binance(
+    timeframe: str,
+    limit: int,
+    symbols: list[str] | None,
+    concurrency: int,
+    tracer: 'ExecutionTracer' | None = None,
+    *,
+    min_daily_change: float = 0.0,
+    inputs: 'IndicatorInputs' | None = None,
+    recent_window_bars: int | None = None,
+    max_symbols: int | None = None,
+    symbol_selector: 'BinanceSymbolSelectorConfig' | None = None,
+    fast_scan: bool = True,
+) -> tuple['SmartMoneyAlgoProE5', list[dict]]:
+    if ccxt is None:
+        raise RuntimeError("ccxt is not available")
+    exchange = ccxt.binanceusdm({"enableRateLimit": True})
+    _ensure_markets_loaded(exchange)
+    all_symbols = symbols or fetch_binance_usdtm_symbols(
+        exchange,
+        limit=max_symbols,
+        selector=symbol_selector,
     )
+    if max_symbols and max_symbols > 0:
+        all_symbols = all_symbols[: int(max_symbols)]
+    summaries: list[dict] = []
+    primary_runtime = None
+    window = recent_window_bars
+    if window is None:
+        console_inputs = getattr(inputs, "console", None) if inputs else None
+        if console_inputs is not None and getattr(console_inputs, "max_age_bars", None) is not None:
+            try:
+                window = int(console_inputs.max_age_bars) + 1
+            except Exception:
+                window = 2
+        else:
+            window = 2
+    window = max(1, int(window))
 
-    lines.append("4. الفروقات الموثقة:")
-    lines.append("- لا توجد فروقات موثقة ضمن النطاق بعد؛ يلزم تشغيل الحالات الاختبارية للتأكيد")
+    tickers: dict = {}
+    ticker_error = None
+    try:
+        if all_symbols:
+            tickers = _call_with_retries(
+                lambda: exchange.fetch_tickers(all_symbols),
+                retries=3,
+            )
+        else:
+            tickers = _call_with_retries(exchange.fetch_tickers, retries=3)
+    except Exception as exc:
+        try:
+            tickers = _call_with_retries(exchange.fetch_tickers, retries=3)
+        except Exception as fallback_exc:
+            ticker_error = fallback_exc
+            print(f"تعذر جلب بيانات التيكر بشكلٍ مجمّع: {fallback_exc}", flush=True)
+        else:
+            ticker_error = exc
 
-    lines.append("5. حالات اختبار نصّية:")
-    lines.extend(pine.tests)
+    exchange_local = threading.local()
 
-    lines.append("6. تقرير التغطية:")
-    pine_cov = " | ".join(f"Pine {k}: {v}" for k, v in pine.coverage.items())
-    python_cov = " | ".join(f"Python {k}: {v}" for k, v in python.coverage.items())
-    lines.append(f"- {pine_cov}")
-    lines.append(f"- {python_cov}")
-    if pine.missing or python.missing:
-        for missing in pine.missing:
-            lines.append(f"- Pine ناقص: {missing}")
-        for missing in python.missing:
-            lines.append(f"- Python ناقص: {missing}")
-    else:
-        lines.append("- لا توجد عناصر غير مواءمة معلنة")
+    def _get_exchange() -> object:
+        local_exchange = getattr(exchange_local, "client", None)
+        if local_exchange is None:
+            local_exchange = ccxt.binanceusdm({"enableRateLimit": True})
+            if not _ensure_markets_loaded(local_exchange):
+                raise RuntimeError("تعذر تحميل الأسواق بسبب معدل الطلبات")
+            exchange_local.client = local_exchange
+        return local_exchange
 
-    return "\n".join(lines)
-
-
-def generate_pullback_report(
-    pine_text: str, python_text: str, runtime: SmartMoneyAlgoProE5
-) -> str:
-    pine_inventory = parse_pine_pullback(pine_text)
-    python_inventory = gather_python_pullback(python_text, runtime)
-    sections = [
-        build_pullback_comparison(pine_inventory, python_inventory),
-        format_pullback_section("Pine Script v5", pine_inventory),
-        format_pullback_section("Python Runtime", python_inventory),
-    ]
-    return "\n\n".join(sections)
-
-
-def render_report(
-    runtime: SmartMoneyAlgoProE5,
-    outfile: Path,
-) -> None:
-    now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
-    pullback_section = textwrap.dedent(
-        f"""
-        ### الإعدادات
-        - showHL: {runtime.inputs.pullback.showHL}
-        - showMn: {runtime.inputs.pullback.showMn}
-
-        ### الأحداث المكتشفة
-        - عدد ملصقات Pullback: {sum(1 for lbl in runtime.labels if lbl.text in ("HH", "HL", "LH", "LL"))}
-        """
-    ).strip()
-
-    market_section = textwrap.dedent(
-        f"""
-        ### الإعدادات
-        - showSMC: {runtime.inputs.structure.showSMC}
-        - lengSMC: {runtime.inputs.structure.lengSMC}
-        - structure_type: {runtime.inputs.structure.structure_type}
-
-        ### الكيانات
-        - خطوط الهيكل: {sum(1 for line in runtime.lines if line.style in ("line.style_dashed", "line.style_dotted"))}
-        """
-    ).strip()
-
-    order_block_section = textwrap.dedent(
-        f"""
-        ### الإعدادات
-        - extndBox: {runtime.inputs.order_block.extndBox}
-        - showExob: {runtime.inputs.order_block.showExob}
-        - showIdmob: {runtime.inputs.order_block.showIdmob}
-        - showSCOB: {runtime.inputs.order_block.showSCOB}
-
-        ### المناطق الفعالة
-        - إجمالي الصناديق: {len(runtime.boxes)}
-        """
-    ).strip()
-
-    scob_section = textwrap.dedent(
-        f"""
-        ### الإعدادات
-        - Show SCOB: {runtime.inputs.order_block.showSCOB}
-        - Bullish SCOB اللون: {runtime.inputs.order_block.scobUp}
-        - Bearish SCOB اللون: {runtime.inputs.order_block.scobDn}
-
-        ### إشارات الشموع
-        - ألوان الأعمدة المسجلة: {len(runtime.bar_colors)}
-        """
-    ).strip()
-
-    comparison = getattr(runtime.tracer, "comparison", None)
-    trace_section = ""
-    if comparison:
-        lines = [
-            f"- حالة المطابقة: {'مطابق' if comparison.matches else 'اختلاف'}",
-            f"- أحداث المرجع: {comparison.reference_events}",
-            f"- الأحداث الحالية: {comparison.current_events}",
-        ]
-        if comparison.mismatches:
-            preview = comparison.mismatches[:5]
-            for mismatch in preview:
-                ref_dump = json.dumps(mismatch.get("reference", {}), ensure_ascii=False)
-                cur_dump = json.dumps(mismatch.get("current", {}), ensure_ascii=False)
-                lines.append(
-                    f"- الحدث #{mismatch.get('index')}: المرجع={ref_dump} | الحالي={cur_dump}"
+    def scan_symbol(idx: int, symbol: str):
+        try:
+            ticker = tickers.get(symbol)
+            if ticker is None and (min_daily_change > 0.0 or ticker_error is not None):
+                try:
+                    ticker = _get_exchange().fetch_ticker(symbol)
+                except Exception as exc:
+                    print(
+                        f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ticker: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    return idx, None, None
+            daily_change = _extract_daily_change_percent(ticker)
+            if min_daily_change > 0.0 and daily_change is not None and daily_change <= min_daily_change:
+                print(
+                    f"تخطي {_format_symbol(symbol)} (تغير 24 ساعة {daily_change:.2f}% ≤ الحد الأدنى {min_daily_change:.2f}%)",
+                    flush=True,
                 )
-            if len(comparison.mismatches) > len(preview):
-                remaining = len(comparison.mismatches) - len(preview)
-                lines.append(f"- ... {remaining} اختلافات إضافية")
-        trace_section = "## مقارنة التتبع\n" + "\n".join(lines)
+                if tracer and tracer.enabled:
+                    tracer.log(
+                        "scan",
+                        "symbol_skipped_daily_change",
+                        timestamp=None,
+                        symbol=symbol,
+                        change=daily_change,
+                        threshold=min_daily_change,
+                    )
+                return idx, None, None
+            candles = fetch_ohlcv(_get_exchange(), symbol, timeframe, limit, fast_scan=fast_scan)
+            runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
+            runtime.process(candles)
+            metrics = runtime.gather_console_metrics()
+            latest_events = metrics.get("latest_events") or {}
+            recent_hits, recent_times = _collect_recent_event_hits(runtime.series, latest_events, bars=window)
+            if not recent_hits:
+                print(
+                    f"تخطي {_format_symbol(symbol)} لعدم وجود أحداث خلال آخر {window} شموع",
+                    flush=True,
+                )
+                if tracer and tracer.enabled:
+                    tracer.log(
+                        "scan",
+                        "symbol_skipped_stale_events",
+                        timestamp=runtime.series.get_time(0) or None,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        reference_times=recent_times,
+                        window=window,
+                    )
+                return idx, None, None
 
-    coverage_table = textwrap.dedent(
-        """
-        | الحزمة | المدخلات | المتغيرات | المصفوفات | الدوال | العناصر المرسومة |
-        |--------|----------|-----------|-----------|--------|--------------------|
-        | Pullback | 3 | 6 | 4 | 3 | {pullback_draws} |
-        | Market Structure | 6 | 18 | 12 | 10 | {ms_draws} |
-        | Order Block | 18 | 22 | 16 | 12 | {len_boxes} |
-        | SCOB | 3 | 5 | 4 | 4 | {bar_colors} |
-        """
-    ).format(
-        pullback_draws=sum(1 for lbl in runtime.labels if lbl.text in ("HH", "HL", "LH", "LL")),
-        ms_draws=sum(1 for line in runtime.lines if line.style in ("line.style_dashed", "line.style_dotted")),
-        len_boxes=len(runtime.boxes),
-        bar_colors=len(runtime.bar_colors),
-    )
+            metrics["daily_change_percent"] = daily_change
+            summary = {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "candles": len(candles),
+                "alerts": metrics.get("alerts", len(runtime.alerts)),
+                "boxes": metrics.get("boxes", len(runtime.boxes)),
+                "metrics": metrics,
+            }
+            print_symbol_summary(idx, symbol, timeframe, len(candles), metrics)
+            if tracer and tracer.enabled:
+                tracer.log(
+                    "scan",
+                    "symbol_complete",
+                    timestamp=runtime.series.get_time(0),
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    candles=len(candles),
+                )
+            return idx, runtime, summary
+        except Exception as exc:
+            print(f"فشل مسح {_format_symbol(symbol)}: {exc}", flush=True)
+            return idx, None, None
 
-    trace_block = f"{trace_section}\n\n" if trace_section else ""
+    if concurrency > 1:
+        print("تم فرض التوازي = 1 لتجنّب حظر REST من Binance.", flush=True)
+    results = [scan_symbol(idx, symbol) for idx, symbol in enumerate(all_symbols)]
 
-    full_settings_lines: List[str] = [f"- عدد الشموع المحللة: {runtime.series.length()}"]
+    results.sort(key=lambda item: item[0])
+    for idx, runtime, summary in results:
+        if runtime is None or summary is None:
+            continue
+        summaries.append(summary)
+        if primary_runtime is None:
+            primary_runtime = runtime
+    if primary_runtime is None:
+        primary_runtime = SmartMoneyAlgoProE5(inputs=inputs, tracer=tracer)
+        primary_runtime.process([])
+    return primary_runtime, summaries
 
-    def collect_inputs(prefix: str, value: Any) -> None:
-        if dataclasses.is_dataclass(value):
-            collect_inputs(prefix, dataclasses.asdict(value))
+
+def _parse_bool_token(token: str) -> bool:
+    normalized = token.strip().lower()
+    if normalized in {"1", "true", "yes", "on", "y", "enable", "enabled"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "n", "disable", "disabled"}:
+        return False
+    raise ValueError(f"قيمة منطقية غير صالحة: {token!r}")
+
+
+class _OptionalBoolAction(argparse.Action):
+    """argparse action allowing ``--flag`` or ``--flag=false`` patterns."""
+
+    def __init__(self, option_strings, dest, **kwargs):
+        if "nargs" in kwargs:
+            raise ValueError("_OptionalBoolAction لا يدعم تحديد nargs")
+        kwargs.setdefault("default", False)
+        super().__init__(option_strings, dest, nargs="?", **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        if values is None:
+            setattr(namespace, self.dest, True)
             return
-        if isinstance(value, dict):
-            for key in sorted(value.keys()):
-                child_prefix = f"{prefix}.{key}" if prefix else key
-                collect_inputs(child_prefix, value[key])
-            return
-        if isinstance(value, list):
-            for idx, item in enumerate(value):
-                collect_inputs(f"{prefix}[{idx}]", item)
-            return
-        full_settings_lines.append(f"- {prefix}: {_serialize_scalar(value)}")
-
-    inputs_dict = dataclasses.asdict(runtime.inputs)
-    for key in sorted(inputs_dict.keys()):
-        collect_inputs(key, inputs_dict[key])
-
-    full_settings_section = "## الإعدادات الكاملة\n" + "\n".join(full_settings_lines)
-
-    content = textwrap.dedent(
-        f"""
-# FINAL_REPORT_SMART_MONEY_ANALYSIS
-
-**المؤشر**: Smart Money Algo Pro E5 - CHADBULL
-**التاريخ**: {now}
-
-    ## فهرس المحتويات
-1. [Pullback](#pullback)
-2. [Market Structure](#market-structure)
-3. [Order Block](#order-block)
-4. [SCOB / Zone Type](#scob--zone-type)
-5. [قائمة التحقق (Coverage 99.99%)](#قائمة-التحقق-coverage-9999)
-6. [الإعدادات الكاملة](#الإعدادات-الكاملة)
-
-## Pullback
-{pullback_section}
-
-## Market Structure
-{market_section}
-
-## Order Block
-{order_block_section}
-
-## SCOB / Zone Type
-{scob_section}
-
-{trace_block}## قائمة التحقق (Coverage 99.99%)
-{coverage_table}
-
-{full_settings_section}
-        """
-    ).strip()
-    outfile.write_text(content + "\n")
-
-
-def run_runtime_from_file(
-    source: Path,
-    outfile: Path,
-    timeframe: str = "",
-    bars: int = 0,
-    inputs: Optional[IndicatorInputs] = None,
-) -> None:
-    candles = json.loads(source.read_text())
-    if bars > 0:
-        candles = candles[-bars:]
-    runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe if timeframe else None)
-    runtime.process(candles)
-    render_report(runtime, outfile)
+        try:
+            parsed = _parse_bool_token(str(values))
+        except ValueError as exc:
+            parser.error(str(exc))
+        setattr(namespace, self.dest, parsed)
 
 
 def print_trace_comparison(result: TraceComparisonResult) -> None:
@@ -8407,35 +8335,76 @@ def print_trace_comparison(result: TraceComparisonResult) -> None:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Smart Money Algo Pro E5 Python port")
     parser.add_argument("--data", type=Path, help="JSON file with OHLCV candles", required=False)
-    parser.add_argument("--outfile", type=Path, default=Path("FINAL_REPORT_SMART_MONEY_ANALYSIS.md"))
     parser.add_argument("--analysis-timeframe", type=str, default="", help="Override base timeframe when using --data")
+    parser.add_argument("--timeframe", type=str, default=SCANNER_TIMEFRAME, help="Timeframe used when scanning Binance")
+    parser.add_argument(
+        "--lookback",
+        type=int,
+        default=SCANNER_LOOKBACK,
+        help="Number of candles to request per symbol when scanning (0 = full history)",
+    )
     parser.add_argument("--bars", type=int, default=0, help="Limit number of candles to analyse from --data source")
+    parser.add_argument("--symbols", type=str, default="")
+    parser.add_argument("--concurrency", type=int, default=EDITOR_AUTORUN_DEFAULTS.concurrency)
     parser.add_argument(
-        "--pullback-report",
-        action="store_true",
-        help="توليد تقرير جرد Pullback (Pine ↔ Python) وفق قالب OS-PB/1",
+        "--min-daily-change",
+        type=float,
+        default=SCANNER_MIN_DAILY_CHANGE,
+        help="الحد الأدنى لتغير 24 ساعة (٪) لاختيار الرمز عند مسح Binance، 0 لتعطيل الفلتر",
     )
-    parser.add_argument(
-        "--pine-source",
-        type=Path,
-        default=Path("Smart Money Algo Pro E5 - CHADBULL.txt"),
-        help="مسار ملف Pine الأصلي لاستخراج منطق Pullback",
-    )
+    parser.add_argument("--no-scan", action="store_true")
     parser.add_argument("--trace", action="store_true", help="Enable execution tracing")
     parser.add_argument("--trace-file", type=Path, help="Write execution trace to JSON file")
     parser.add_argument("--compare-trace", type=Path, help="قارن التتبع الحالي بملف JSON مرجعي")
     parser.add_argument(
         "--max-age-bars",
         type=int,
-        default=1,
+        default=EVENT_PRINT_MAX_AGE_BARS,
         help="Ignore console events older than this many completed bars (minimum 1)",
     )
+    parser.add_argument(
+        "--continuous",
+        "--continuous-scan",
+        dest="continuous_scan",
+        action=_OptionalBoolAction,
+        default=SCANNER_CONTINUOUS,
+        help="تشغيل ماسح Binance في حلقة متواصلة بدون توقف (يدعم true/false)",
+    )
+    parser.add_argument(
+        "--no-continuous",
+        "--no-continuous-scan",
+        dest="continuous_scan",
+        action="store_false",
+        help="تعطيل حلقة المسح المستمرة",
+    )
+    parser.add_argument(
+        "--scan-interval",
+        type=float,
+        default=EDITOR_AUTORUN_DEFAULTS.scan_interval,
+        help="عدد الثواني للانتظار قبل إعادة تشغيل المسح عند تفعيل --continuous-scan",
+    )
+    parser.add_argument(
+        "--fast-scan",
+        dest="fast_scan",
+        action=_OptionalBoolAction,
+        default=EDITOR_AUTORUN_DEFAULTS.fast_scan,
+        help="تسريع المسح بجلب آخر الشموع فقط بدون تحميل التاريخ الكامل (أسرع بكثير)",
+    )
+    parser.add_argument(
+        "--no-fast-scan",
+        dest="fast_scan",
+        action="store_false",
+        help="تعطيل وضع المسح السريع (الحصول على التاريخ الكامل)",
+    )
     args = parser.parse_args(argv)
+    if args.min_daily_change < 0.0:
+        parser.error("--min-daily-change يجب أن يكون رقمًا غير سالب")
     if args.max_age_bars <= 0:
         parser.error("--max-age-bars يجب أن يكون رقمًا موجبًا")
-
-    def log(stage: str) -> None:
-        print(stage, flush=True)
+    if args.scan_interval < 0.0:
+        parser.error("--scan-interval يجب أن يكون رقمًا غير سالب")
+    if args.continuous_scan and args.scan_interval <= 0.0:
+        args.scan_interval = max(EDITOR_AUTORUN_DEFAULTS.scan_interval, 2.0)
 
     tracer = ExecutionTracer(enabled=args.trace, outfile=args.trace_file)
 
@@ -8447,60 +8416,74 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     indicator_inputs = IndicatorInputs()
     indicator_inputs.console.max_age_bars = args.max_age_bars
 
-    if args.pullback_report:
-        log("Foundation")
-        pine_text = args.pine_source.read_text(encoding="utf-8")
-        python_text = Path(__file__).read_text(encoding="utf-8")
-        log("Inventory")
-        runtime = SmartMoneyAlgoProE5(
-            inputs=indicator_inputs,
-            base_timeframe=args.analysis_timeframe or None,
-            tracer=tracer,
-        )
-        log("Timeline")
-        runtime.process([])
-        log("Rendering")
-        report_text = generate_pullback_report(pine_text, python_text, runtime)
-        args.outfile.write_text(report_text, encoding="utf-8")
-        print(f"Pullback report written to {args.outfile}")
-        log("Coverage")
-        tracer.emit()
-        return 0
-
     if args.data:
-        log("Foundation")
         candles = json.loads(args.data.read_text())
         if args.bars > 0:
             candles = candles[-args.bars :]
-        log("Inventory")
         runtime = SmartMoneyAlgoProE5(
             inputs=indicator_inputs,
             base_timeframe=args.analysis_timeframe or None,
             tracer=tracer,
         )
-        log("Timeline")
         runtime.process(candles)
         perform_comparison()
-        log("Rendering")
-        render_report(runtime, args.outfile)
-        log("Coverage")
+        metrics = runtime.gather_console_metrics()
+        metrics["daily_change_percent"] = None
+        print_symbol_summary(0, "DATA", args.analysis_timeframe or args.timeframe, len(candles), metrics)
         tracer.emit()
         return 0
 
-    log("Foundation")
-    log("Inventory")
-    runtime = SmartMoneyAlgoProE5(
-        inputs=indicator_inputs,
-        base_timeframe=args.analysis_timeframe or None,
-        tracer=tracer,
-    )
-    log("Timeline")
-    runtime.process([])
-    perform_comparison()
-    log("Rendering")
-    render_report(runtime, args.outfile)
-    log("Coverage")
-    tracer.emit()
+    if args.no_scan:
+        runtime = SmartMoneyAlgoProE5(
+            inputs=indicator_inputs,
+            base_timeframe=args.analysis_timeframe or None,
+            tracer=tracer,
+        )
+        runtime.process([])
+        perform_comparison()
+        metrics = runtime.gather_console_metrics()
+        metrics["daily_change_percent"] = None
+        print_symbol_summary(0, "EMPTY", args.analysis_timeframe or args.timeframe, 0, metrics)
+        tracer.emit()
+        return 0
+
+    manual_symbols = [s.strip() for s in args.symbols.split(",") if s.strip()] or None
+
+    iteration = 0
+    try:
+        while True:
+            iteration += 1
+            tracer.clear()
+            if args.continuous_scan and iteration > 1:
+                print(f"\nإعادة تشغيل المسح (الدورة {iteration})", flush=True)
+            scan_binance(
+                args.timeframe,
+                args.lookback,
+                manual_symbols,
+                args.concurrency,
+                tracer,
+                min_daily_change=args.min_daily_change,
+                inputs=indicator_inputs,
+                fast_scan=args.fast_scan,
+            )
+            perform_comparison()
+            tracer.emit()
+            if not args.continuous_scan:
+                print(
+                    "اكتمل المسح بعد دورة واحدة لأن خيار التشغيل المستمر غير مُفعّل."
+                    " لتفعيل الحلقة استخدم --continuous-scan=true أو فعّل المتغير"
+                    " AUTORUN_CONTINUOUS_SCAN في أعلى الملف.",
+                    flush=True,
+                )
+                break
+            if args.scan_interval > 0.0:
+                print(
+                    f"انتظار {args.scan_interval:.2f} ثانية قبل تشغيل المسح التالي",
+                    flush=True,
+                )
+                time.sleep(args.scan_interval)
+    except KeyboardInterrupt:
+        print("تم إيقاف المسح من قبل المستخدم.", flush=True)
     return 0
 
 if __name__ == '__main__':
