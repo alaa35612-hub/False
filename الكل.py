@@ -269,6 +269,15 @@ GOLDEN_ZONE_TOUCH_ONCE = True
 STRATEGY_REQUIRE_LIQUIDITY_SWEEP = True
 STRATEGY_REQUIRE_STRUCTURE = True
 STRATEGY_REQUIRE_RETRACE = True
+STRATEGY_MODE = "ICT_V1"  # "ICT_V1" أو "ICT_V2"
+
+# إعدادات ICT_V2 (Bias 4H + Entry 15m)
+ICT_V2_REQUIRE_HTF_BIAS = True
+ICT_V2_REQUIRE_DISPLACEMENT = True
+ICT_V2_REQUIRE_CONFIRMATION = True
+ICT_V2_CONFIRMATION_MODE = ["mss", "bos", "rejection"]
+ICT_V2_BIAS_TIMEFRAME = "4h"
+ICT_V2_ENTRY_TIMEFRAME = "15m"
 
 # -----------------------------------------------------------------------------
 # Feature Toggles (تشغيل/إيقاف منطق الكشف)
@@ -8940,6 +8949,51 @@ def _price_in_range(price: float, payload: Dict[str, Any]) -> bool:
         return low <= price <= high
     return False
 
+def is_recent(timestamp: Optional[int], recent_times: Sequence[int]) -> bool:
+    if timestamp is None:
+        return False
+    return int(timestamp) in {int(t) for t in recent_times}
+
+def normalize_range(a: float, b: float) -> Tuple[float, float]:
+    return (a, b) if a <= b else (b, a)
+
+def _payload_range(payload: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    value = payload.get("price")
+    if isinstance(value, tuple) and len(value) == 2:
+        low, high = normalize_range(float(value[0]), float(value[1]))
+        return low, high
+    low = payload.get("low")
+    high = payload.get("high")
+    if isinstance(low, (int, float)) and isinstance(high, (int, float)):
+        return normalize_range(float(low), float(high))
+    value = payload.get("range")
+    if isinstance(value, tuple) and len(value) == 2:
+        low, high = normalize_range(float(value[0]), float(value[1]))
+        return low, high
+    return None
+
+def zone_touch(direction: str, candle: Dict[str, float], zone_low: float, zone_high: float) -> bool:
+    low, high = normalize_range(zone_low, zone_high)
+    if direction == "bullish":
+        candle_low = candle.get("low", math.nan)
+        return not math.isnan(candle_low) and low <= candle_low <= high
+    if direction == "bearish":
+        candle_high = candle.get("high", math.nan)
+        return not math.isnan(candle_high) and low <= candle_high <= high
+    return False
+
+def ensure_sequence(
+    liquidity_time: Optional[int],
+    structure_time: Optional[int],
+    displacement_time: Optional[int],
+    retest_time: Optional[int],
+    confirm_time: Optional[int],
+) -> bool:
+    times = [liquidity_time, structure_time, displacement_time, retest_time, confirm_time]
+    if any(t is None for t in times):
+        return False
+    return liquidity_time < structure_time < displacement_time < retest_time < confirm_time
+
 def _signal_direction(payload: Dict[str, Any]) -> Optional[str]:
     direction = payload.get("direction")
     if direction in ("bullish", "bearish"):
@@ -9026,6 +9080,25 @@ def scan_binance(
             exchange_local.client = local_exchange
         return local_exchange
 
+    def _get_bias_4h(symbol: str) -> Tuple[Optional[str], Optional[int], Dict[str, Any]]:
+        htf_timeframe = ICT_V2_BIAS_TIMEFRAME
+        htf_candles = fetch_ohlcv(_get_exchange(), symbol, htf_timeframe, limit, fast_scan=fast_scan)
+        htf_runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=htf_timeframe, tracer=tracer)
+        htf_runtime.process(htf_candles)
+        htf_metrics = htf_runtime.gather_console_metrics()
+        htf_latest_events = htf_metrics.get("latest_events") or {}
+        _, htf_payload, htf_time = _latest_event_payload(
+            htf_latest_events,
+            ("MSS", "MSS_PLUS", "BOS", "BOS_PLUS", "CHOCH"),
+        )
+        htf_bias = _signal_direction(htf_payload or {})
+        _, htf_recent_times = _collect_recent_event_hits(htf_runtime.series, htf_latest_events, bars=window)
+        if ICT_V2_REQUIRE_HTF_BIAS and (
+            htf_bias is None or htf_time is None or not is_recent(htf_time, htf_recent_times)
+        ):
+            return None, htf_time, htf_metrics
+        return htf_bias, htf_time, htf_metrics
+
     def scan_symbol(idx: int, symbol: str):
         try:
             ticker = tickers.get(symbol)
@@ -9055,8 +9128,11 @@ def scan_binance(
                         threshold=min_daily_change,
                     )
                 return idx, None, None
-            candles = fetch_ohlcv(_get_exchange(), symbol, timeframe, limit, fast_scan=fast_scan)
-            runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
+            entry_timeframe = timeframe
+            if STRATEGY_MODE == "ICT_V2":
+                entry_timeframe = ICT_V2_ENTRY_TIMEFRAME
+            candles = fetch_ohlcv(_get_exchange(), symbol, entry_timeframe, limit, fast_scan=fast_scan)
+            runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=entry_timeframe, tracer=tracer)
             runtime.process(candles)
             metrics = runtime.gather_console_metrics()
             latest_events = metrics.get("latest_events") or {}
@@ -9073,7 +9149,7 @@ def scan_binance(
                         "symbol_skipped_stale_events",
                         timestamp=runtime.series.get_time(0) or None,
                         symbol=symbol,
-                        timeframe=timeframe,
+                        timeframe=entry_timeframe,
                         reference_times=recent_times,
                         window=window,
                     )
@@ -9093,6 +9169,206 @@ def scan_binance(
             )
             signal_direction = _signal_direction(signal_payload or {})
             sweep_direction = _liquidity_sweep_direction(liquidity_payload or {})
+
+            if STRATEGY_MODE == "ICT_V2":
+                def _reject(reason: str, **extra: Any) -> Tuple[int, None, None]:
+                    if tracer and tracer.enabled:
+                        tracer.log(
+                            "scan",
+                            "symbol_skipped_ict_v2",
+                            timestamp=runtime.series.get_time(0) or None,
+                            symbol=symbol,
+                            timeframe=entry_timeframe,
+                            rejected_reason=reason,
+                            **extra,
+                        )
+                    return idx, None, None
+
+                htf_bias, htf_time, _ = _get_bias_4h(symbol)
+                if htf_bias is None:
+                    return _reject("no_htf_bias", htf_time=htf_time)
+
+                if not is_recent(liquidity_time, recent_times):
+                    return _reject("stale_event", event="liquidity", liquidity_time=liquidity_time)
+                if not is_recent(structure_time, recent_times):
+                    return _reject("stale_event", event="structure", structure_time=structure_time)
+                if not is_recent(signal_time, recent_times):
+                    return _reject("stale_event", event="signal", signal_time=signal_time)
+
+                structure_direction = _signal_direction(structure_payload or {})
+                if any(direction is None for direction in (htf_bias, signal_direction, sweep_direction, structure_direction)):
+                    return _reject(
+                        "missing_direction",
+                        htf_bias=htf_bias,
+                        signal_direction=signal_direction,
+                        sweep_direction=sweep_direction,
+                        structure_direction=structure_direction,
+                    )
+
+                if structure_time is None or liquidity_time is None or structure_time <= liquidity_time:
+                    return _reject("sequence_violation", step="sweep_to_shift")
+                if structure_direction != sweep_direction:
+                    return _reject(
+                        "direction_conflict",
+                        htf_bias=htf_bias,
+                        signal_direction=signal_direction,
+                        sweep_direction=sweep_direction,
+                        structure_direction=structure_direction,
+                    )
+
+                displacement_key, displacement_payload, displacement_time = _latest_event_payload(
+                    latest_events,
+                    ("FVG",),
+                )
+                if displacement_time is None or displacement_time <= structure_time:
+                    if ICT_V2_REQUIRE_DISPLACEMENT:
+                        return _reject("no_displacement", displacement_key=displacement_key)
+                if ICT_V2_REQUIRE_DISPLACEMENT and not is_recent(displacement_time, recent_times):
+                    return _reject("stale_event", event="displacement", displacement_time=displacement_time)
+
+                poi_type = None
+                poi_range = None
+                poi_time = None
+                for key in ("FVG", "ORDER_BLOCK", "MITIGATION_BLOCK", "BREAKER_BLOCK", "IDM_OB", "EXT_OB"):
+                    payload = latest_events.get(key)
+                    if not isinstance(payload, dict):
+                        continue
+                    ts = _event_timestamp(payload)
+                    if ts is None or (displacement_time is not None and ts <= displacement_time):
+                        continue
+                    range_value = _payload_range(payload)
+                    if range_value is None:
+                        continue
+                    poi_type = key
+                    poi_range = range_value
+                    poi_time = ts
+                    break
+
+                if poi_type is None or poi_range is None:
+                    return _reject("no_retest", poi_type=poi_type)
+                if not is_recent(poi_time, recent_times):
+                    return _reject("stale_event", event="poi", poi_time=poi_time)
+
+                candle = {
+                    "high": runtime.series.get("high"),
+                    "low": runtime.series.get("low"),
+                    "close": runtime.series.get("close"),
+                }
+                retest_time = runtime.series.get_time(0)
+                if not isinstance(retest_time, (int, float)) or retest_time <= (displacement_time or 0):
+                    return _reject("no_retest", poi_type=poi_type, retest_time=retest_time)
+                if not zone_touch(signal_direction, candle, poi_range[0], poi_range[1]):
+                    return _reject("no_retest", poi_type=poi_type, poi_range=poi_range)
+                if not is_recent(int(retest_time), recent_times):
+                    return _reject("stale_event", event="retest", retest_time=retest_time)
+
+                confirm_time = None
+                confirm_type = None
+                if "mss" in ICT_V2_CONFIRMATION_MODE:
+                    _, confirm_payload, confirm_ts = _latest_event_payload(
+                        latest_events,
+                        ("MSS", "MSS_PLUS", "CHOCH"),
+                    )
+                    confirm_dir = _signal_direction(confirm_payload or {})
+                    if confirm_ts and confirm_ts > int(retest_time) and confirm_dir == signal_direction:
+                        confirm_time = confirm_ts
+                        confirm_type = "mss"
+                if confirm_time is None and "bos" in ICT_V2_CONFIRMATION_MODE:
+                    _, confirm_payload, confirm_ts = _latest_event_payload(
+                        latest_events,
+                        ("BOS", "BOS_PLUS"),
+                    )
+                    confirm_dir = _signal_direction(confirm_payload or {})
+                    if confirm_ts and confirm_ts > int(retest_time) and confirm_dir == signal_direction:
+                        confirm_time = confirm_ts
+                        confirm_type = "bos"
+                if confirm_time is None and "rejection" in ICT_V2_CONFIRMATION_MODE:
+                    close_price = candle.get("close", math.nan)
+                    if signal_direction == "bullish" and not math.isnan(close_price) and close_price > poi_range[1]:
+                        confirm_time = int(retest_time)
+                        confirm_type = "rejection"
+                    if signal_direction == "bearish" and not math.isnan(close_price) and close_price < poi_range[0]:
+                        confirm_time = int(retest_time)
+                        confirm_type = "rejection"
+
+                if ICT_V2_REQUIRE_CONFIRMATION and confirm_time is None:
+                    return _reject("no_confirmation", confirm_modes=ICT_V2_CONFIRMATION_MODE)
+                if confirm_time is not None and not is_recent(confirm_time, recent_times):
+                    return _reject("stale_event", event="confirm", confirm_time=confirm_time)
+
+                if not ensure_sequence(
+                    liquidity_time,
+                    structure_time,
+                    displacement_time,
+                    int(retest_time),
+                    confirm_time or int(retest_time),
+                ):
+                    return _reject("sequence_violation", step="ict_sequence")
+
+                if htf_bias != signal_direction or htf_bias != sweep_direction or htf_bias != structure_direction:
+                    return _reject(
+                        "direction_conflict",
+                        htf_bias=htf_bias,
+                        signal_direction=signal_direction,
+                        sweep_direction=sweep_direction,
+                        structure_direction=structure_direction,
+                    )
+
+                metrics.update(
+                    {
+                        "strategy_mode": "ICT_V2",
+                        "htf_bias": htf_bias,
+                        "sweep_direction": sweep_direction,
+                        "structure_direction": structure_direction,
+                        "poi_type": poi_type,
+                        "poi_range": poi_range,
+                        "liquidity_time": liquidity_time,
+                        "structure_time": structure_time,
+                        "displacement_time": displacement_time,
+                        "retest_time": int(retest_time),
+                        "confirm_time": confirm_time,
+                        "accepted_reason": "ict_v2_sequence",
+                        "confirm_type": confirm_type,
+                    }
+                )
+
+                if tracer and tracer.enabled:
+                    tracer.log(
+                        "scan",
+                        "symbol_accepted_ict_v2",
+                        timestamp=runtime.series.get_time(0) or None,
+                        symbol=symbol,
+                        timeframe=entry_timeframe,
+                        htf_bias=htf_bias,
+                        sweep_direction=sweep_direction,
+                        structure_direction=structure_direction,
+                        poi_type=poi_type,
+                        poi_range=poi_range,
+                        confirm_type=confirm_type,
+                    )
+
+                try:
+                    trigger_lines = _emit_recent_events(symbol, entry_timeframe, latest_events, recent_hits)
+                except Exception:
+                    trigger_lines = []
+                if trigger_lines:
+                    print(f"\n{_format_symbol(symbol)} ({entry_timeframe})", flush=True)
+                    for _ln in trigger_lines:
+                        print(_ln, flush=True)
+                    _save_event_seen_cache()
+
+                metrics["daily_change_percent"] = daily_change
+                summary = {
+                    "symbol": symbol,
+                    "timeframe": entry_timeframe,
+                    "candles": len(candles),
+                    "alerts": metrics.get("alerts", len(getattr(runtime, "alerts", []))),
+                    "boxes": metrics.get("boxes", len(runtime.boxes)),
+                    "metrics": metrics,
+                }
+                if not EVENT_PRINT_ONLY:
+                    print_symbol_summary(idx, symbol, entry_timeframe, len(candles), metrics)
+                return idx, runtime, summary
 
             liquidity_structure_match = True
             if STRATEGY_REQUIRE_LIQUIDITY_SWEEP:
@@ -9143,7 +9419,7 @@ def scan_binance(
                         "symbol_skipped_conditions",
                         timestamp=runtime.series.get_time(0) or None,
                         symbol=symbol,
-                        timeframe=timeframe,
+                        timeframe=entry_timeframe,
                         liquidity_key=liquidity_key,
                         structure_key=structure_key,
                         signal_key=signal_key,
@@ -9154,11 +9430,11 @@ def scan_binance(
 
             # اطبع أحدث الأحداث فقط (آخر شموع ضمن النافذة) مثل سكربت FINAL_liqui
             try:
-                trigger_lines = _emit_recent_events(symbol, timeframe, latest_events, recent_hits)
+                trigger_lines = _emit_recent_events(symbol, entry_timeframe, latest_events, recent_hits)
             except Exception:
                 trigger_lines = []
             if trigger_lines:
-                print(f"\n{_format_symbol(symbol)} ({timeframe})", flush=True)
+                print(f"\n{_format_symbol(symbol)} ({entry_timeframe})", flush=True)
                 for _ln in trigger_lines:
                     print(_ln, flush=True)
                 _save_event_seen_cache()
@@ -9166,21 +9442,21 @@ def scan_binance(
             metrics["daily_change_percent"] = daily_change
             summary = {
                 "symbol": symbol,
-                "timeframe": timeframe,
+                "timeframe": entry_timeframe,
                 "candles": len(candles),
                 "alerts": metrics.get("alerts", len(getattr(runtime, "alerts", []))),
                 "boxes": metrics.get("boxes", len(runtime.boxes)),
                 "metrics": metrics,
             }
             if not EVENT_PRINT_ONLY:
-                print_symbol_summary(idx, symbol, timeframe, len(candles), metrics)
+                print_symbol_summary(idx, symbol, entry_timeframe, len(candles), metrics)
             if tracer and tracer.enabled:
                 tracer.log(
                     "scan",
                     "symbol_complete",
                     timestamp=runtime.series.get_time(0),
                     symbol=symbol,
-                    timeframe=timeframe,
+                    timeframe=entry_timeframe,
                     candles=len(candles),
                 )
             return idx, runtime, summary
