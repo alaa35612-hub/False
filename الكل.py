@@ -269,6 +269,14 @@ GOLDEN_ZONE_TOUCH_ONCE = True
 STRATEGY_REQUIRE_LIQUIDITY_SWEEP = True
 STRATEGY_REQUIRE_STRUCTURE = True
 STRATEGY_REQUIRE_RETRACE = True
+STRATEGY_MODE = "ICT_V1"  # "ICT_V1" أو "ICT_MTF"
+
+# إعدادات استراتيجية ICT متعددة الفريمات (4H Bias + 15M Trigger)
+ICT_MTF_HTF_TIMEFRAME = "4h"
+ICT_MTF_LTF_TIMEFRAME = "15m"
+ICT_MTF_REQUIRE_SWEEP = True
+ICT_MTF_REQUIRE_MSS = True
+ICT_MTF_POI_TYPES = ("FVG", "ORDER_BLOCK", "MITIGATION_BLOCK", "BREAKER_BLOCK", "IDM_OB", "EXT_OB")
 
 # -----------------------------------------------------------------------------
 # Feature Toggles (تشغيل/إيقاف منطق الكشف)
@@ -8940,6 +8948,45 @@ def _price_in_range(price: float, payload: Dict[str, Any]) -> bool:
         return low <= price <= high
     return False
 
+def is_recent(timestamp: Optional[int], recent_times: Sequence[int]) -> bool:
+    if timestamp is None:
+        return False
+    return int(timestamp) in {int(t) for t in recent_times}
+
+def normalize_range(a: float, b: float) -> Tuple[float, float]:
+    return (a, b) if a <= b else (b, a)
+
+def _payload_range(payload: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    value = payload.get("price")
+    if isinstance(value, tuple) and len(value) == 2:
+        low, high = normalize_range(float(value[0]), float(value[1]))
+        return low, high
+    low = payload.get("low")
+    high = payload.get("high")
+    if isinstance(low, (int, float)) and isinstance(high, (int, float)):
+        return normalize_range(float(low), float(high))
+    value = payload.get("range")
+    if isinstance(value, tuple) and len(value) == 2:
+        low, high = normalize_range(float(value[0]), float(value[1]))
+        return low, high
+    return None
+
+def zone_touch(direction: str, candle: Dict[str, float], zone_low: float, zone_high: float) -> bool:
+    low, high = normalize_range(zone_low, zone_high)
+    if direction == "bullish":
+        candle_low = candle.get("low", math.nan)
+        return not math.isnan(candle_low) and low <= candle_low <= high
+    if direction == "bearish":
+        candle_high = candle.get("high", math.nan)
+        return not math.isnan(candle_high) and low <= candle_high <= high
+    return False
+
+def ensure_sequence(times: Sequence[Optional[int]]) -> bool:
+    if any(t is None for t in times):
+        return False
+    int_times = [int(t) for t in times if t is not None]
+    return all(earlier < later for earlier, later in zip(int_times, int_times[1:]))
+
 def _signal_direction(payload: Dict[str, Any]) -> Optional[str]:
     direction = payload.get("direction")
     if direction in ("bullish", "bearish"):
@@ -9026,6 +9073,186 @@ def scan_binance(
             exchange_local.client = local_exchange
         return local_exchange
 
+    def _swing_levels(runtime: "SmartMoneyAlgoProE5") -> Tuple[Optional[float], Optional[float]]:
+        swing_high = getattr(runtime, "swingHighVal", NA)
+        swing_low = getattr(runtime, "swingLowVal", NA)
+        swing_high_val = None if math.isnan(swing_high) else float(swing_high)
+        swing_low_val = None if math.isnan(swing_low) else float(swing_low)
+        return swing_high_val, swing_low_val
+
+    def _compute_htf_bias(symbol: str) -> Dict[str, Any]:
+        htf_timeframe = ICT_MTF_HTF_TIMEFRAME
+        htf_candles = fetch_ohlcv(_get_exchange(), symbol, htf_timeframe, limit, fast_scan=fast_scan)
+        htf_runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=htf_timeframe, tracer=tracer)
+        htf_runtime.process(htf_candles)
+        htf_metrics = htf_runtime.gather_console_metrics()
+        htf_latest_events = htf_metrics.get("latest_events") or {}
+        _, htf_recent_times = _collect_recent_event_hits(htf_runtime.series, htf_latest_events, bars=window)
+
+        sweep_key, sweep_payload, sweep_time = _latest_event_payload(
+            htf_latest_events,
+            ("LIQUIDITY_TOUCH", "SWING_SWEEP"),
+        )
+        structure_key, structure_payload, structure_time = _latest_event_payload(
+            htf_latest_events,
+            ("MSS", "MSS_PLUS", "BOS", "BOS_PLUS", "CHOCH"),
+        )
+        structure_direction = _signal_direction(structure_payload or {})
+        sweep_direction = _liquidity_sweep_direction(sweep_payload or {})
+        swing_high, swing_low = _swing_levels(htf_runtime)
+        dealing_range = None
+        if swing_high is not None and swing_low is not None:
+            dealing_range = normalize_range(swing_low, swing_high)
+
+        bias = None
+        bias_time = None
+        if ICT_MTF_REQUIRE_SWEEP and not is_recent(sweep_time, htf_recent_times):
+            bias = None
+        elif ICT_MTF_REQUIRE_MSS and not is_recent(structure_time, htf_recent_times):
+            bias = None
+        elif sweep_time is not None and structure_time is not None and structure_time > sweep_time:
+            if structure_direction in ("bullish", "bearish"):
+                bias = structure_direction
+                bias_time = structure_time
+
+        return {
+            "bias": bias,
+            "bias_time": bias_time,
+            "sweep_key": sweep_key,
+            "sweep_time": sweep_time,
+            "sweep_direction": sweep_direction,
+            "structure_key": structure_key,
+            "structure_time": structure_time,
+            "structure_direction": structure_direction,
+            "swing_high": swing_high,
+            "swing_low": swing_low,
+            "dealing_range": dealing_range,
+            "recent_times": htf_recent_times,
+            "metrics": htf_metrics,
+        }
+
+    def _evaluate_ltf_entry(symbol: str, htf_bias: Dict[str, Any]) -> Tuple[Optional["SmartMoneyAlgoProE5"], Optional[Dict[str, Any]]]:
+        ltf_timeframe = ICT_MTF_LTF_TIMEFRAME
+        ltf_candles = fetch_ohlcv(_get_exchange(), symbol, ltf_timeframe, limit, fast_scan=fast_scan)
+        ltf_runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=ltf_timeframe, tracer=tracer)
+        ltf_runtime.process(ltf_candles)
+        ltf_metrics = ltf_runtime.gather_console_metrics()
+        latest_events = ltf_metrics.get("latest_events") or {}
+        recent_hits, recent_times = _collect_recent_event_hits(ltf_runtime.series, latest_events, bars=window)
+        if not recent_hits:
+            return ltf_runtime, {
+                "rejected_reason": "no_recent_events",
+                "recent_times": recent_times,
+                "candles": len(ltf_candles),
+            }
+
+        sweep_key, sweep_payload, sweep_time = _latest_event_payload(
+            latest_events,
+            ("LIQUIDITY_TOUCH", "SWING_SWEEP"),
+        )
+        structure_key, structure_payload, structure_time = _latest_event_payload(
+            latest_events,
+            ("MSS", "MSS_PLUS", "BOS", "BOS_PLUS", "CHOCH"),
+        )
+        structure_direction = _signal_direction(structure_payload or {})
+        sweep_direction = _liquidity_sweep_direction(sweep_payload or {})
+
+        if ICT_MTF_REQUIRE_SWEEP and not is_recent(sweep_time, recent_times):
+            return ltf_runtime, {"rejected_reason": "stale_sweep", "sweep_time": sweep_time, "candles": len(ltf_candles)}
+        if ICT_MTF_REQUIRE_MSS and not is_recent(structure_time, recent_times):
+            return ltf_runtime, {
+                "rejected_reason": "stale_structure",
+                "structure_time": structure_time,
+                "candles": len(ltf_candles),
+            }
+        if sweep_time is None or structure_time is None or structure_time <= sweep_time:
+            return ltf_runtime, {
+                "rejected_reason": "sequence_violation",
+                "step": "sweep_to_mss",
+                "candles": len(ltf_candles),
+            }
+
+        bias_direction = htf_bias.get("bias")
+        if bias_direction is None:
+            return ltf_runtime, {"rejected_reason": "no_htf_bias", "candles": len(ltf_candles)}
+        if structure_direction is None or sweep_direction is None:
+            return ltf_runtime, {"rejected_reason": "missing_direction", "candles": len(ltf_candles)}
+        if not (structure_direction == sweep_direction == bias_direction):
+            return ltf_runtime, {"rejected_reason": "direction_conflict", "candles": len(ltf_candles)}
+
+        poi_type = None
+        poi_range = None
+        poi_time = None
+        for key in ICT_MTF_POI_TYPES:
+            payload = latest_events.get(key)
+            if not isinstance(payload, dict):
+                continue
+            ts = _event_timestamp(payload)
+            if ts is None or ts <= structure_time:
+                continue
+            range_value = _payload_range(payload)
+            if range_value is None:
+                continue
+            poi_type = key
+            poi_range = range_value
+            poi_time = ts
+            break
+
+        if poi_type is None or poi_range is None or poi_time is None:
+            return ltf_runtime, {"rejected_reason": "no_poi", "candles": len(ltf_candles)}
+        if not is_recent(poi_time, recent_times):
+            return ltf_runtime, {"rejected_reason": "stale_poi", "poi_time": poi_time, "candles": len(ltf_candles)}
+
+        candle = {
+            "high": ltf_runtime.series.get("high"),
+            "low": ltf_runtime.series.get("low"),
+            "close": ltf_runtime.series.get("close"),
+        }
+        retest_time = ltf_runtime.series.get_time(0)
+        if not isinstance(retest_time, (int, float)) or retest_time <= poi_time:
+            return ltf_runtime, {"rejected_reason": "no_retest", "retest_time": retest_time, "candles": len(ltf_candles)}
+        if not zone_touch(bias_direction, candle, poi_range[0], poi_range[1]):
+            return ltf_runtime, {"rejected_reason": "no_retest", "poi_range": poi_range, "candles": len(ltf_candles)}
+        if not is_recent(int(retest_time), recent_times):
+            return ltf_runtime, {"rejected_reason": "stale_retest", "retest_time": retest_time, "candles": len(ltf_candles)}
+
+        if not ensure_sequence((sweep_time, structure_time, poi_time, int(retest_time))):
+            return ltf_runtime, {
+                "rejected_reason": "sequence_violation",
+                "step": "ltf_sequence",
+                "candles": len(ltf_candles),
+            }
+
+        swing_high, swing_low = _swing_levels(ltf_runtime)
+        entry_type = "Buy" if bias_direction == "bullish" else "Sell"
+        stop_loss = swing_low if bias_direction == "bullish" else swing_high
+        target = swing_high if bias_direction == "bullish" else swing_low
+        if stop_loss is None or target is None:
+            return ltf_runtime, {
+                "rejected_reason": "missing_swing_levels",
+                "swing_high": swing_high,
+                "swing_low": swing_low,
+                "candles": len(ltf_candles),
+            }
+
+        return ltf_runtime, {
+            "accepted_reason": "htf_sweep_mss + ltf_sweep_mss + poi_retest",
+            "entry_type": entry_type,
+            "stop_loss": stop_loss,
+            "target_liquidity": target,
+            "sweep_key": sweep_key,
+            "sweep_time": sweep_time,
+            "structure_key": structure_key,
+            "structure_time": structure_time,
+            "structure_direction": structure_direction,
+            "poi_type": poi_type,
+            "poi_range": poi_range,
+            "poi_time": poi_time,
+            "retest_time": int(retest_time),
+            "recent_times": recent_times,
+            "candles": len(ltf_candles),
+        }
+
     def scan_symbol(idx: int, symbol: str):
         try:
             ticker = tickers.get(symbol)
@@ -9055,6 +9282,91 @@ def scan_binance(
                         threshold=min_daily_change,
                     )
                 return idx, None, None
+            if STRATEGY_MODE == "ICT_MTF":
+                htf_bias = _compute_htf_bias(symbol)
+                if htf_bias.get("bias") is None:
+                    if tracer and tracer.enabled:
+                        tracer.log(
+                            "scan",
+                            "symbol_skipped_ict_mtf",
+                            timestamp=None,
+                            symbol=symbol,
+                            timeframe=ICT_MTF_HTF_TIMEFRAME,
+                            rejected_reason="no_htf_bias",
+                            htf_bias=htf_bias,
+                        )
+                    return idx, None, None
+
+                runtime, entry_result = _evaluate_ltf_entry(symbol, htf_bias)
+                if not entry_result or entry_result.get("accepted_reason") is None:
+                    if tracer and tracer.enabled:
+                        tracer.log(
+                            "scan",
+                            "symbol_skipped_ict_mtf",
+                            timestamp=runtime.series.get_time(0) if runtime else None,
+                            symbol=symbol,
+                            timeframe=ICT_MTF_LTF_TIMEFRAME,
+                            rejected_reason=entry_result.get("rejected_reason") if entry_result else "no_entry",
+                            details=entry_result,
+                        )
+                    return idx, None, None
+
+                metrics = runtime.gather_console_metrics()
+                latest_events = metrics.get("latest_events") or {}
+                recent_hits, _ = _collect_recent_event_hits(runtime.series, latest_events, bars=window)
+                if recent_hits:
+                    try:
+                        trigger_lines = _emit_recent_events(symbol, ICT_MTF_LTF_TIMEFRAME, latest_events, recent_hits)
+                    except Exception:
+                        trigger_lines = []
+                    if trigger_lines:
+                        print(f"\n{_format_symbol(symbol)} ({ICT_MTF_LTF_TIMEFRAME})", flush=True)
+                        for _ln in trigger_lines:
+                            print(_ln, flush=True)
+                        _save_event_seen_cache()
+
+                metrics.update(
+                    {
+                        "strategy_mode": "ICT_MTF",
+                        "htf_bias": htf_bias.get("bias"),
+                        "htf_bias_time": htf_bias.get("bias_time"),
+                        "htf_sweep_time": htf_bias.get("sweep_time"),
+                        "htf_structure_time": htf_bias.get("structure_time"),
+                        "htf_structure_direction": htf_bias.get("structure_direction"),
+                        "htf_dealing_range": htf_bias.get("dealing_range"),
+                        "htf_swing_high": htf_bias.get("swing_high"),
+                        "htf_swing_low": htf_bias.get("swing_low"),
+                        "ltf_entry_type": entry_result.get("entry_type"),
+                        "ltf_entry_reason": entry_result.get("accepted_reason"),
+                        "ltf_stop_loss": entry_result.get("stop_loss"),
+                        "ltf_target_liquidity": entry_result.get("target_liquidity"),
+                        "ltf_poi_type": entry_result.get("poi_type"),
+                        "ltf_poi_range": entry_result.get("poi_range"),
+                        "ltf_retest_time": entry_result.get("retest_time"),
+                    }
+                )
+                metrics["daily_change_percent"] = daily_change
+                summary = {
+                    "symbol": symbol,
+                    "timeframe": ICT_MTF_LTF_TIMEFRAME,
+                    "candles": entry_result.get("candles", len(metrics)),
+                    "alerts": metrics.get("alerts", len(getattr(runtime, "alerts", []))),
+                    "boxes": metrics.get("boxes", len(runtime.boxes)),
+                    "metrics": metrics,
+                }
+                if tracer and tracer.enabled:
+                    tracer.log(
+                        "scan",
+                        "symbol_accepted_ict_mtf",
+                        timestamp=runtime.series.get_time(0) or None,
+                        symbol=symbol,
+                        timeframe=ICT_MTF_LTF_TIMEFRAME,
+                        htf_bias=htf_bias.get("bias"),
+                        entry_type=entry_result.get("entry_type"),
+                        poi_type=entry_result.get("poi_type"),
+                    )
+                return idx, runtime, summary
+
             candles = fetch_ohlcv(_get_exchange(), symbol, timeframe, limit, fast_scan=fast_scan)
             runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
             runtime.process(candles)
