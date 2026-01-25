@@ -1640,16 +1640,54 @@ class SmartMoneyAlgoProE5:
     ) -> None:
         direction_text = "صاعد" if bullish else "هابط"
         display = f"{key} @ {format_price(price)} ({direction_text})"
-            self.console_event_log[key] = {
-                "text": key,
-                "price": price,
-                "time": timestamp,
+        self.console_event_log[key] = {
+            "text": key,
+            "price": price,
+            "time": timestamp,
             "time_display": format_timestamp(timestamp),
             "display": display,
             "direction": "bullish" if bullish else "bearish",
             "direction_display": direction_text,
             "source": "confirmed",
-            }
+        }
+
+    def _register_simple_event(
+        self,
+        key: str,
+        text: str,
+        price: Optional[Union[float, Tuple[float, float]]],
+        timestamp: int,
+        *,
+        display: Optional[str] = None,
+        direction: Optional[str] = None,
+        status: Optional[str] = None,
+        status_display: Optional[str] = None,
+    ) -> None:
+        if display is None:
+            if isinstance(price, tuple):
+                display = f"{text} {format_price(price[0])} → {format_price(price[1])}"
+            elif isinstance(price, (int, float)):
+                display = f"{text} @ {format_price(price)}"
+            else:
+                display = text
+        if status_display is None and status:
+            status_display = self.BOX_STATUS_LABELS.get(status, status)
+        direction_display = None
+        if direction == "bullish":
+            direction_display = "صاعد"
+        elif direction == "bearish":
+            direction_display = "هابط"
+        self.console_event_log[key] = {
+            "text": text,
+            "price": price,
+            "time": timestamp,
+            "time_display": format_timestamp(timestamp),
+            "display": display,
+            "direction": direction,
+            "direction_display": direction_display,
+            "status": status,
+            "status_display": status_display,
+        }
 
     def _series_index_from_time(self, timestamp: Optional[int]) -> Optional[int]:
         if timestamp is None or self.series.length() == 0:
@@ -4641,6 +4679,21 @@ class SmartMoneyAlgoProE5:
             vol_arr.unshift(volume_)
             buy_arr.unshift(b_volume)
             sell_arr.unshift(s_volume)
+            if self.inputs.demand_supply.show_order_blocks or self.inputs.demand_supply.show_order_blocks_mtf:
+                direction = None
+                if "Bullish" in _type:
+                    direction = "bullish"
+                elif "Bearish" in _type:
+                    direction = "bearish"
+                label = f"Order Block ({_type})" if _type else "Order Block"
+                self._register_simple_event(
+                    "ORDER_BLOCK",
+                    label,
+                    (bottom_val, top_val),
+                    int(left_val),
+                    direction=direction,
+                    status="new",
+                )
         if top_arr.size() > max_obs:
             top_arr.pop()
             btm_arr.pop()
@@ -4905,6 +4958,14 @@ class SmartMoneyAlgoProE5:
         self.bearish_OB_Break = bear_base or bear_mtf
         self.alertcondition(self.bullish_OB_Break, "Bullish OB Break", "Bullish OB Broken Ez-SMC")
         self.alertcondition(self.bearish_OB_Break, "Bearish OB Break", "Bearish OB Broken Ez-SMC")
+        if self.bullish_OB_Break or self.bearish_OB_Break:
+            self._register_simple_event(
+                "ORDER_BLOCK_BREAK",
+                "Order Block Break",
+                self.series.get("close"),
+                int(self.series.get_time()),
+                direction="bullish" if self.bullish_OB_Break else "bearish",
+            )
 
     @staticmethod
     def _canonical_mitigation(value: str) -> str:
@@ -6171,6 +6232,13 @@ class SmartMoneyAlgoProE5:
                 "size.small",
                 self.inputs.structure_util.colorSweep,
             )
+        self._register_simple_event(
+            "SWING_SWEEP",
+            "Swing Sweep",
+            y,
+            int(self.series.get_time()),
+            direction="bullish" if trend else "bearish",
+        )
         self.arrBCLine.push(ln)
 
     def TP(self, H: float, L: float) -> None:
@@ -6561,6 +6629,13 @@ class SmartMoneyAlgoProE5:
                     )
                     self.arrOBBulls.unshift(bx)
                     self.arrOBBullisVs.unshift(False)
+                    self._register_simple_event(
+                        "MINOR_OF",
+                        "Minor OF",
+                        (bx.bottom, bx.top),
+                        int(bx.left),
+                        direction="bullish",
+                    )
                     if self.arrOBBulls.size() > self.inputs.order_flow.showISOBMax:
                         old = self.arrOBBulls.pop()
                         if old in self.boxes:
@@ -6576,6 +6651,13 @@ class SmartMoneyAlgoProE5:
                     )
                     self.arrOBBears.unshift(bx)
                     self.arrOBBearisVs.unshift(False)
+                    self._register_simple_event(
+                        "MINOR_OF",
+                        "Minor OF",
+                        (bx.bottom, bx.top),
+                        int(bx.left),
+                        direction="bearish",
+                    )
                     if self.arrOBBears.size() > self.inputs.order_flow.showISOBMax:
                         old = self.arrOBBears.pop()
                         if old in self.boxes:
@@ -6611,6 +6693,13 @@ class SmartMoneyAlgoProE5:
                     )
                     self.arrOBBullm.unshift(bx)
                     self.arrOBBullisVm.unshift(False)
+                    self._register_simple_event(
+                        "MAJOR_OF",
+                        "Major OF",
+                        (bx.bottom, bx.top),
+                        int(bx.left),
+                        direction="bullish",
+                    )
                     if self.arrOBBullm.size() > self.inputs.order_flow.showMajoinMinerMax:
                         old = self.arrOBBullm.pop()
                         if old in self.boxes:
@@ -6626,6 +6715,13 @@ class SmartMoneyAlgoProE5:
                     )
                     self.arrOBBearm.unshift(bx)
                     self.arrOBBearisVm.unshift(False)
+                    self._register_simple_event(
+                        "MAJOR_OF",
+                        "Major OF",
+                        (bx.bottom, bx.top),
+                        int(bx.left),
+                        direction="bearish",
+                    )
                     if self.arrOBBearm.size() > self.inputs.order_flow.showMajoinMinerMax:
                         old = self.arrOBBearm.pop()
                         if old in self.boxes:
@@ -6770,6 +6866,21 @@ class SmartMoneyAlgoProE5:
             )
             zoneArray.push(box_obj)
             zoneArrayisMit.push(0)
+            if (
+                self.inputs.order_block.showIdmob
+                or self.inputs.order_block.showExob
+                or self.inputs.order_block.showBrkob
+                or self.inputs.order_block.showPOI
+            ):
+                key = "DEMAND_ZONE" if isBull else "SUPPLY_ZONE"
+                label = "Demand Zone" if isBull else "Supply Zone"
+                self._register_simple_event(
+                    key,
+                    label,
+                    (box_obj.bottom, box_obj.top),
+                    int(box_obj.left),
+                    status="new",
+                )
 
     # ------------------------------------------------------------------
     def processZones(self, zones: PineArray, isSupply: bool, zonesmit: PineArray) -> bool:
@@ -6783,27 +6894,51 @@ class SmartMoneyAlgoProE5:
                 zone.set_right(self.series.get_time())
             topZone, botZone, leftZone = zone.top, zone.bottom, zone.left
             if isSupply and self.series.get("low") < botZone and self.series.get("close") > topZone:
-                self.demandZone.push(
-                    self.createBox(
-                        leftZone,
-                        self.series.get_time(),
-                        topZone,
-                        botZone,
-                        self.inputs.order_block.colorDemand,
-                    )
+                new_zone = self.createBox(
+                    leftZone,
+                    self.series.get_time(),
+                    topZone,
+                    botZone,
+                    self.inputs.order_block.colorDemand,
                 )
+                self.demandZone.push(new_zone)
                 self.demandZoneIsMit.push(0)
-            elif (not isSupply) and self.series.get("high") > topZone and self.series.get("close") < botZone:
-                self.supplyZone.push(
-                    self.createBox(
-                        leftZone,
-                        self.series.get_time(),
-                        topZone,
-                        botZone,
-                        self.inputs.order_block.colorSupply,
+                if (
+                    self.inputs.order_block.showIdmob
+                    or self.inputs.order_block.showExob
+                    or self.inputs.order_block.showBrkob
+                    or self.inputs.order_block.showPOI
+                ):
+                    self._register_simple_event(
+                        "DEMAND_ZONE",
+                        "Demand Zone",
+                        (new_zone.bottom, new_zone.top),
+                        int(new_zone.left),
+                        status="new",
                     )
+            elif (not isSupply) and self.series.get("high") > topZone and self.series.get("close") < botZone:
+                new_zone = self.createBox(
+                    leftZone,
+                    self.series.get_time(),
+                    topZone,
+                    botZone,
+                    self.inputs.order_block.colorSupply,
                 )
+                self.supplyZone.push(new_zone)
                 self.supplyZoneIsMit.push(0)
+                if (
+                    self.inputs.order_block.showIdmob
+                    or self.inputs.order_block.showExob
+                    or self.inputs.order_block.showBrkob
+                    or self.inputs.order_block.showPOI
+                ):
+                    self._register_simple_event(
+                        "SUPPLY_ZONE",
+                        "Supply Zone",
+                        (new_zone.bottom, new_zone.top),
+                        int(new_zone.left),
+                        status="new",
+                    )
             elif (
                 (isSupply and self.series.get("high") >= botZone and self.series.get("high", 1) < botZone)
                 or ((not isSupply) and self.series.get("low") <= topZone and self.series.get("low", 1) > topZone)
@@ -6834,6 +6969,21 @@ class SmartMoneyAlgoProE5:
                     zonesmit.set(i, 3 if zonesmit.get(i) == 1 else 2)
                 status = "retest" if prev_state == 1 else "touched"
                 self._register_box_event(zone, status=status, event_time=self.series.get_time())
+                if (
+                    self.inputs.order_block.showIdmob
+                    or self.inputs.order_block.showExob
+                    or self.inputs.order_block.showBrkob
+                    or self.inputs.order_block.showPOI
+                ):
+                    key = "SUPPLY_ZONE" if isSupply else "DEMAND_ZONE"
+                    label = "Supply Zone" if isSupply else "Demand Zone"
+                    self._register_simple_event(
+                        key,
+                        label,
+                        (zone.bottom, zone.top),
+                        int(self.series.get_time()),
+                        status=status,
+                    )
                 if self.inputs.order_block.showBrkob:
                     zones.remove(i)
                     zonesmit.remove(i)
@@ -6946,6 +7096,20 @@ class SmartMoneyAlgoProE5:
         self.motherLow_history.append(self.motherLow)
         self.motherBar_history.append(self.motherBar)
         self.isb_history.append(bool(isb))
+        if self.inputs.candle.showISB and isb:
+            price_range = (low, high)
+            self._register_simple_event(
+                "INSIDE_BAR",
+                "Inside Bar",
+                price_range,
+                int(time_val),
+            )
+            self._register_simple_event(
+                "INSIDE_BAR_CANDLE",
+                "Inside Bar Candle",
+                price_range,
+                int(time_val),
+            )
 
         # Top/bottom history -------------------------------------------------
         top = self.getNLastValue(self.arrTop, 1)
@@ -7288,6 +7452,22 @@ class SmartMoneyAlgoProE5:
         self.alertcondition(alertBearOfMajor, "Major Bearish order flow", "Major Bearish order flow")
         self.alertcondition(alertBullOfMinor, "Minor Bullish order flow", "Minor Bullish order flow")
         self.alertcondition(alertBearOfMinor, "Minor Bearish order flow", "Minor Bearish order flow")
+        if alertBullOfMajor or alertBearOfMajor:
+            self._register_simple_event(
+                "ORDER_FLOW_BREAK",
+                "Order Flow Break (Major)",
+                self.series.get("close"),
+                int(time_val),
+                direction="bullish" if alertBullOfMajor else "bearish",
+            )
+        if alertBullOfMinor or alertBearOfMinor:
+            self._register_simple_event(
+                "ORDER_FLOW_BREAK",
+                "Order Flow Break (Minor)",
+                self.series.get("close"),
+                int(time_val),
+                direction="bullish" if alertBullOfMinor else "bearish",
+            )
 
         # Order block zone processing ---------------------------------------
         isAlertextidmSell = self.processZones(self.supplyZone, True, self.supplyZoneIsMit)
@@ -7386,8 +7566,36 @@ class SmartMoneyAlgoProE5:
         scob_demand = self.scob(self.demandZone, False)
         if scob_supply:
             self.bar_colors.append((time_val, scob_supply))
+            self._register_simple_event(
+                "SCOB",
+                "Show SCOB",
+                self.series.get("close"),
+                int(time_val),
+                direction="bearish",
+            )
+            self._register_simple_event(
+                "SCOB_BEAR",
+                "Bearish SCOB",
+                self.series.get("close"),
+                int(time_val),
+                direction="bearish",
+            )
         if scob_demand:
             self.bar_colors.append((time_val, scob_demand))
+            self._register_simple_event(
+                "SCOB",
+                "Show SCOB",
+                self.series.get("close"),
+                int(time_val),
+                direction="bullish",
+            )
+            self._register_simple_event(
+                "SCOB_BULL",
+                "Bullish SCOB",
+                self.series.get("close"),
+                int(time_val),
+                direction="bullish",
+            )
         if self.inputs.candle.showISB and isb:
             self.bar_colors.append((time_val, self.inputs.candle.colorISB))
         if self.inputs.candle.showOSB and osb:
@@ -8933,11 +9141,24 @@ EVENT_DISPLAY_ORDER = [
     ("MSS_PLUS", "MSS+"),
     ("MSS", "MSS"),
     ("IDM", "IDM"),
+    ("ORDER_BLOCK", "Order Block"),
+    ("ORDER_BLOCK_BREAK", "Order Block Break"),
     ("IDM_OB", "IDM OB"),
     ("EXT_OB", "EXT OB"),
     ("HIST_IDM_OB", "Hist IDM OB"),
     ("HIST_EXT_OB", "Hist EXT OB"),
     ("GOLDEN_ZONE", "Golden zone"),
+    ("DEMAND_ZONE", "Demand Zone"),
+    ("SUPPLY_ZONE", "Supply Zone"),
+    ("SCOB", "Show SCOB"),
+    ("SCOB_BULL", "Bullish SCOB"),
+    ("SCOB_BEAR", "Bearish SCOB"),
+    ("ORDER_FLOW_BREAK", "Order Flow Break"),
+    ("MAJOR_OF", "Major OF"),
+    ("MINOR_OF", "Minor OF"),
+    ("INSIDE_BAR_CANDLE", "Inside Bar Candle"),
+    ("INSIDE_BAR", "Inside Bar"),
+    ("SWING_SWEEP", "Swing Sweep"),
     ("X", "X"),
     ("RED_CIRCLE", "الدوائر الحمراء"),
     ("GREEN_CIRCLE", "الدوائر الخضراء"),
