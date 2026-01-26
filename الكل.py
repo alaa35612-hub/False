@@ -203,7 +203,7 @@ TELEGRAM_MAX_MESSAGE_CHARS = 3800  # أقل من 4096 لتجنب رفض تيلي
 # -----------------------------------------------------------------------------
 # Scanner & Event Settings (عدّل هذه القيم من أعلى الملف)
 # -----------------------------------------------------------------------------
-SCANNER_TIMEFRAME = "4h"
+SCANNER_TIMEFRAME = "15m,1h,4h"
 SCANNER_LOOKBACK = 500
 SCANNER_CONCURRENCY = 1
 SCANNER_FAST_SCAN = True
@@ -284,7 +284,6 @@ EVENT_PRINT_TOGGLES = {
 GOLDEN_ZONE_TOUCH_ONCE = True
 
 # أطر المسح المعتمدة لتصفية السيولة فقط
-LIQUIDITY_SCAN_TIMEFRAMES = {"15m", "1h", "4h"}
 
 # -----------------------------------------------------------------------------
 # Feature Toggles (تشغيل/إيقاف منطق الكشف)
@@ -9116,12 +9115,6 @@ def scan_binance(
             latest_events = metrics.get("latest_events") or {}
             recent_hits, recent_times = _collect_recent_event_hits(runtime.series, latest_events, bars=window)
 
-            # -----------------------------------------------------------------
-            # Liquidity-only scan (touch/inside levels or sweep) for 15m/1h/4h
-            # -----------------------------------------------------------------
-            if timeframe not in LIQUIDITY_SCAN_TIMEFRAMES:
-                return idx, None, None
-
             def _touch_or_inside_liquidity() -> tuple[bool, Optional[str]]:
                 low = runtime.series.get("low")
                 high = runtime.series.get("high")
@@ -9331,7 +9324,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Smart Money Algo Pro E5 Python port")
     parser.add_argument("--data", type=Path, help="JSON file with OHLCV candles", required=False)
     parser.add_argument("--analysis-timeframe", type=str, default="", help="Override base timeframe when using --data")
-    parser.add_argument("--timeframe", type=str, default=SCANNER_TIMEFRAME, help="Timeframe used when scanning Binance")
+    parser.add_argument(
+        "--timeframe",
+        type=str,
+        default=SCANNER_TIMEFRAME,
+        help="Timeframe(s) used when scanning Binance (comma-separated list allowed)",
+    )
     parser.add_argument(
         "--lookback",
         type=int,
@@ -9450,6 +9448,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     manual_symbols = [s.strip() for s in args.symbols.split(",") if s.strip()] or None
+    timeframes = [tf.strip() for tf in args.timeframe.split(",") if tf.strip()]
+    if not timeframes:
+        timeframes = [SCANNER_TIMEFRAME]
 
     iteration = 0
     try:
@@ -9458,16 +9459,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             tracer.clear()
             if args.continuous_scan and iteration > 1:
                 print(f"\nإعادة تشغيل المسح (الدورة {iteration})", flush=True)
-            scan_binance(
-                args.timeframe,
-                args.lookback,
-                manual_symbols,
-                args.concurrency,
-                tracer,
-                min_daily_change=args.min_daily_change,
-                inputs=indicator_inputs,
-                fast_scan=args.fast_scan,
-            )
+            for timeframe in timeframes:
+                scan_binance(
+                    timeframe,
+                    args.lookback,
+                    manual_symbols,
+                    args.concurrency,
+                    tracer,
+                    min_daily_change=args.min_daily_change,
+                    inputs=indicator_inputs,
+                    fast_scan=args.fast_scan,
+                )
             perform_comparison()
             tracer.emit()
             if not args.continuous_scan:
