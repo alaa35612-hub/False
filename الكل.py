@@ -203,7 +203,7 @@ TELEGRAM_MAX_MESSAGE_CHARS = 3800  # أقل من 4096 لتجنب رفض تيلي
 # -----------------------------------------------------------------------------
 # Scanner & Event Settings (عدّل هذه القيم من أعلى الملف)
 # -----------------------------------------------------------------------------
-SCANNER_TIMEFRAME = "4h"
+SCANNER_TIMEFRAME = "5m"
 SCANNER_LOOKBACK = 500
 SCANNER_CONCURRENCY = 1
 SCANNER_FAST_SCAN = True
@@ -231,7 +231,10 @@ PRINT_LIQUIDITY_LEVELS = True
 
 # فلتر عمر الأحداث (بعدد الشموع)
 EVENT_PRINT_ENABLED = True
-EVENT_PRINT_MAX_AGE_BARS = 1
+EVENT_PRINT_MAX_AGE_BARS = 2
+
+# تأكد أن فحص السيولة يشمل الفريم المختار دائماً
+LIQUIDITY_SCAN_TIMEFRAMES = {SCANNER_TIMEFRAME}
 
 # تفعيل/تعطيل طباعة كل حدث جديد (مفاتيح الطباعة)
 # إذا كان المفتاح False فلن يتم طباعته حتى لو كان موجوداً في EVENT_PRINT_KEYS.
@@ -284,7 +287,6 @@ EVENT_PRINT_TOGGLES = {
 GOLDEN_ZONE_TOUCH_ONCE = True
 
 # أطر المسح المعتمدة لتصفية السيولة فقط
-LIQUIDITY_SCAN_TIMEFRAMES = {"15m", "1h", "4h"}
 
 # -----------------------------------------------------------------------------
 # Feature Toggles (تشغيل/إيقاف منطق الكشف)
@@ -9116,67 +9118,59 @@ def scan_binance(
             latest_events = metrics.get("latest_events") or {}
             recent_hits, recent_times = _collect_recent_event_hits(runtime.series, latest_events, bars=window)
 
-            # -----------------------------------------------------------------
-            # Liquidity-only scan (touch/inside levels or sweep) for 15m/1h/4h
-            # -----------------------------------------------------------------
-            if timeframe not in LIQUIDITY_SCAN_TIMEFRAMES:
-                return idx, None, None
+            liq_status = {
+                "created": False,
+                "touched": False,
+                "sweep": "LIQUIDITY_TOUCH" in recent_hits,
+                "touch_details": [],
+                "created_details": [],
+            }
 
-            def _touch_or_inside_liquidity() -> tuple[bool, Optional[str]]:
-                low = runtime.series.get("low")
-                high = runtime.series.get("high")
-                if math.isnan(low) or math.isnan(high):
-                    return False, None
-                for arr_name in ("highLineArrayHTF", "lowLineArrayHTF"):
+            low = runtime.series.get("low")
+            high = runtime.series.get("high")
+            if (
+                timeframe in LIQUIDITY_SCAN_TIMEFRAMES
+                and not math.isnan(low)
+                and not math.isnan(high)
+            ):
+                liq_payload = latest_events.get("LIQUIDITY_LEVELS")
+                if isinstance(liq_payload, dict):
+                    liq_ts = liq_payload.get("time") or liq_payload.get("ts") or liq_payload.get("timestamp")
+                    if isinstance(liq_ts, (int, float)) and int(liq_ts) in recent_times:
+                        liq_status["created"] = True
+                        liq_display = liq_payload.get("display")
+                        if isinstance(liq_display, str) and liq_display.strip():
+                            liq_status["created_details"].append(liq_display.strip())
+                        else:
+                            liq_price = liq_payload.get("price")
+                            if isinstance(liq_price, (int, float)):
+                                liq_status["created_details"].append(format_price(liq_price))
+
+                for arr_name, label in [
+                    ("highLineArrayHTF", "Resistance Line"),
+                    ("lowLineArrayHTF", "Support Line"),
+                    ("highBoxArrayHTF", "Liquidity High Zone"),
+                    ("lowBoxArrayHTF", "Liquidity Low Zone"),
+                ]:
                     arr = getattr(runtime, arr_name, PineArray())
                     for i in range(arr.size()):
-                        line = arr.get(i)
-                        if isinstance(line, Line):
-                            y = line.get_y1()
+                        item = arr.get(i)
+                        if isinstance(item, Line):
+                            y = item.get_y1()
                             if low <= y <= high:
-                                return True, f"line@{format_price(y)}"
-                for arr_name in ("highBoxArrayHTF", "lowBoxArrayHTF"):
-                    arr = getattr(runtime, arr_name, PineArray())
-                    for i in range(arr.size()):
-                        box = arr.get(i)
-                        if isinstance(box, Box):
-                            top = max(box.top, box.bottom)
-                            bottom = min(box.top, box.bottom)
+                                liq_status["touched"] = True
+                                liq_status["touch_details"].append(f"{label} @ {format_price(y)}")
+                        elif isinstance(item, Box):
+                            top = max(item.top, item.bottom)
+                            bottom = min(item.top, item.bottom)
                             if low <= top and high >= bottom:
-                                return True, f"box {format_price(bottom)} → {format_price(top)}"
-                return False, None
+                                liq_status["touched"] = True
+                                liq_status["touch_details"].append(
+                                    f"{label} [{format_price(bottom)}-{format_price(top)}]"
+                                )
 
-            liquidity_touch_or_inside, liquidity_detail = _touch_or_inside_liquidity()
-            touch_time = runtime.series.get_time(0)
-            touch_recent = isinstance(touch_time, (int, float)) and int(touch_time) in recent_times
-
-            liquidity_sweep_recent = False
-            liquidity_sweep_detail = None
-            sweep_payload = latest_events.get("LIQUIDITY_TOUCH")
-            if isinstance(sweep_payload, dict):
-                sweep_ts = sweep_payload.get("time") or sweep_payload.get("ts") or sweep_payload.get("timestamp")
-                if isinstance(sweep_ts, (int, float)) and int(sweep_ts) in recent_times:
-                    liquidity_sweep_recent = True
-                    sweep_display = sweep_payload.get("display")
-                    if isinstance(sweep_display, str) and sweep_display.strip():
-                        liquidity_sweep_detail = sweep_display
-                    else:
-                        sweep_price = sweep_payload.get("price")
-                        if isinstance(sweep_price, (int, float)):
-                            liquidity_sweep_detail = f"line@{format_price(sweep_price)}"
-
-            liquidity_created_recent = False
-            liquidity_created_detail = None
-            liq_payload = latest_events.get("LIQUIDITY_LEVELS")
-            if isinstance(liq_payload, dict):
-                liq_ts = liq_payload.get("time") or liq_payload.get("ts") or liq_payload.get("timestamp")
-                if isinstance(liq_ts, (int, float)) and int(liq_ts) in recent_times:
-                    liquidity_created_recent = True
-                    liq_price = liq_payload.get("price")
-                    if isinstance(liq_price, (int, float)):
-                        liquidity_created_detail = f"line@{format_price(liq_price)}"
-
-            if not (liquidity_touch_or_inside and touch_recent) and not liquidity_created_recent and not liquidity_sweep_recent:
+            event_lines = _emit_recent_events(symbol, timeframe, latest_events, recent_hits)
+            if not (recent_hits or liq_status["created"] or liq_status["touched"]):
                 if not SILENT_WHEN_NO_EVENTS:
                     print(
                         f"تخطي {_format_symbol(symbol)} لعدم وجود أحداث ضمن آخر {window} شموع",
@@ -9195,22 +9189,25 @@ def scan_binance(
                 return idx, None, None
 
             reasons: List[str] = []
-            if liquidity_created_recent:
-                reasons.append("Created")
-            if liquidity_sweep_recent:
-                reasons.append("Sweep")
-            if liquidity_touch_or_inside and touch_recent:
-                reasons.append("Touched/Inside")
+            if liq_status["sweep"]:
+                reasons.append("SWEEP ⚠️")
+            if liq_status["created"]:
+                reasons.append("NEW LEVEL CREATED ✨")
+            if liq_status["touched"]:
+                reasons.append("ACTIVE TOUCH/INSIDE 🎯")
 
             print(f"\n{_format_symbol(symbol)} ({timeframe})", flush=True)
-            print(f"decision: PASS", flush=True)
-            print(f"reason: {', '.join(reasons)}", flush=True)
-            if liquidity_touch_or_inside and liquidity_detail and touch_recent:
-                print(f"liquidity_level: {liquidity_detail}", flush=True)
-            if liquidity_created_recent and liquidity_created_detail:
-                print(f"liquidity_created: {liquidity_created_detail}", flush=True)
-            if liquidity_sweep_recent and liquidity_sweep_detail:
-                print(f"liquidity_sweep: {liquidity_sweep_detail}", flush=True)
+            if reasons:
+                print(f"Status: {' | '.join(reasons)} (Last {window} bars)", flush=True)
+            if event_lines:
+                for line in event_lines:
+                    print(f"  • {line}", flush=True)
+            if liq_status["created_details"]:
+                for detail in sorted(set(liq_status["created_details"])):
+                    print(f"  -> Created @ {detail}", flush=True)
+            if liq_status["touch_details"]:
+                for detail in sorted(set(liq_status["touch_details"])):
+                    print(f"  -> {detail}", flush=True)
 
             metrics["daily_change_percent"] = daily_change
             summary = {
@@ -9223,12 +9220,11 @@ def scan_binance(
                 "strategy": {
                     "decision": "PASS",
                     "reasons": reasons,
-                    "liquidity_touch_or_inside": liquidity_touch_or_inside,
-                    "liquidity_sweep_recent": liquidity_sweep_recent,
-                    "liquidity_created_recent": liquidity_created_recent,
-                    "liquidity_detail": liquidity_detail,
-                    "liquidity_created_detail": liquidity_created_detail,
-                    "liquidity_sweep_detail": liquidity_sweep_detail,
+                    "liquidity_touched": liq_status["touched"],
+                    "liquidity_sweep": liq_status["sweep"],
+                    "liquidity_created": liq_status["created"],
+                    "liquidity_touch_details": sorted(set(liq_status["touch_details"])),
+                    "liquidity_created_details": sorted(set(liq_status["created_details"])),
                 },
             }
             if not EVENT_PRINT_ONLY:
@@ -9331,7 +9327,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Smart Money Algo Pro E5 Python port")
     parser.add_argument("--data", type=Path, help="JSON file with OHLCV candles", required=False)
     parser.add_argument("--analysis-timeframe", type=str, default="", help="Override base timeframe when using --data")
-    parser.add_argument("--timeframe", type=str, default=SCANNER_TIMEFRAME, help="Timeframe used when scanning Binance")
+    parser.add_argument(
+        "--timeframe",
+        type=str,
+        default=SCANNER_TIMEFRAME,
+        help="Timeframe label for reports (scanner uses SCANNER_TIMEFRAME from settings)",
+    )
     parser.add_argument(
         "--lookback",
         type=int,
@@ -9450,6 +9451,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     manual_symbols = [s.strip() for s in args.symbols.split(",") if s.strip()] or None
+    target_timeframe = SCANNER_TIMEFRAME
 
     iteration = 0
     try:
@@ -9459,7 +9461,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if args.continuous_scan and iteration > 1:
                 print(f"\nإعادة تشغيل المسح (الدورة {iteration})", flush=True)
             scan_binance(
-                args.timeframe,
+                target_timeframe,
                 args.lookback,
                 manual_symbols,
                 args.concurrency,
