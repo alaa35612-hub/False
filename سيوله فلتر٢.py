@@ -8961,6 +8961,124 @@ def _emit_recent_events(symbol: str, timeframe: str, latest_events: Dict[str, An
     return lines_out
 
 
+def analyze_ict_setup(runtime: 'SmartMoneyAlgoProE5', lookback_bars: int = 50) -> dict:
+    """
+    تحليل تسلسل استراتيجية ICT:
+    1. Liquidity Sweep
+    2. MSS/ChoCh
+    3. FVG Creation
+    4. Retracement (Entry)
+    """
+    setup = {
+        "valid": False,
+        "direction": None,  # "bullish" or "bearish"
+        "stage": "None",    # Sweep, MSS, FVG, or Ready
+        "details": [],
+    }
+
+    current_time = runtime.series.get_time()
+
+    last_sweep_time = 0
+    last_sweep_dir = None  # 1 for bull (low sweep), -1 for bear (high sweep)
+
+    events = runtime.console_event_log
+    liq_event = events.get("LIQUIDITY_TOUCH") if isinstance(events, dict) else None
+    if isinstance(liq_event, dict) and runtime._event_print_within_age(liq_event.get("time")):
+        last_sweep_time = liq_event.get("time") or 0
+        if "Low" in liq_event.get("text", "") or "bullish" in liq_event.get("direction", ""):
+            last_sweep_dir = 1
+        else:
+            last_sweep_dir = -1
+
+    if last_sweep_time == 0:
+        for i in range(len(runtime.labels) - 1, -1, -1):
+            lbl = runtime.labels[i]
+            if lbl.x < current_time - (lookback_bars * runtime.base_tf_seconds * 1000):
+                break
+            if "Sweep" in lbl.text or "Liq" in lbl.text:
+                last_sweep_time = lbl.x
+                last_sweep_dir = 1 if lbl.yloc == "yloc.belowbar" else -1
+                break
+
+    if last_sweep_time == 0:
+        return setup
+
+    setup["stage"] = "Sweep Found"
+    setup["details"].append(f"Sweep @ {format_timestamp(last_sweep_time)}")
+
+    last_mss_time = 0
+    mss_type = None  # 1 for Bullish, -1 for Bearish
+
+    bc_labels = runtime.arrBCLabel
+    for i in range(bc_labels.size() - 1, -1, -1):
+        lbl = bc_labels.get(i)
+        if not isinstance(lbl, Label):
+            continue
+        if lbl.x <= last_sweep_time:
+            continue
+        txt = lbl.text.strip()
+        if "CHoCH" in txt or "MSS" in txt:
+            is_bull_mss = (lbl.style == "label.style_label_down")
+            if last_sweep_dir == 1 and is_bull_mss:
+                last_mss_time = lbl.x
+                mss_type = 1
+                break
+            if last_sweep_dir == -1 and not is_bull_mss:
+                last_mss_time = lbl.x
+                mss_type = -1
+                break
+
+    if last_mss_time == 0:
+        return setup
+
+    setup["stage"] = "MSS Confirmed"
+    setup["details"].append(f"MSS @ {format_timestamp(last_mss_time)}")
+
+    fvg_found = False
+    fvg_zone: tuple[float, float] | None = None
+
+    fvg_holder = runtime.bullish_gap_holder if mss_type == 1 else runtime.bearish_gap_holder
+
+    for i in range(fvg_holder.size()):
+        box = fvg_holder.get(i)
+        if not isinstance(box, Box):
+            continue
+        if box.left >= last_mss_time:
+            fvg_found = True
+            fvg_zone = (box.top, box.bottom)
+            break
+
+    if not fvg_found:
+        return setup
+
+    setup["stage"] = "FVG Found"
+    setup["direction"] = "bullish" if mss_type == 1 else "bearish"
+
+    current_close = runtime.series.get("close")
+
+    entry_signal = False
+
+    if fvg_zone is None:
+        return setup
+
+    fvg_top = max(fvg_zone)
+    fvg_bottom = min(fvg_zone)
+    if mss_type == 1:
+        if current_close <= fvg_top * 1.0005:
+            entry_signal = True
+            setup["details"].append(f"Price in Buy Zone ({format_price(current_close)})")
+    else:
+        if current_close >= fvg_bottom * 0.9995:
+            entry_signal = True
+            setup["details"].append(f"Price in Sell Zone ({format_price(current_close)})")
+
+    if entry_signal:
+        setup["valid"] = True
+        setup["stage"] = "ENTRY READY"
+
+    return setup
+
+
 def scan_binance(
     timeframe: str,
     limit: int,
@@ -8988,7 +9106,6 @@ def scan_binance(
         all_symbols = all_symbols[: int(max_symbols)]
     summaries: list[dict] = []
     primary_runtime = None
-    window = max(1, int(EVENT_PRINT_MAX_AGE_BARS))
 
     tickers: dict = {}
     ticker_error = None
@@ -9112,120 +9229,36 @@ def scan_binance(
                     liq_inputs.htfTF = timeframe
             runtime.process(candles)
             metrics = runtime.gather_console_metrics()
-            latest_events = metrics.get("latest_events") or {}
-            recent_hits, recent_times = _collect_recent_event_hits(runtime.series, latest_events, bars=window)
+            ict_setup = analyze_ict_setup(runtime, lookback_bars=60)
 
-            def _touch_or_inside_liquidity() -> tuple[bool, Optional[str]]:
-                low = runtime.series.get("low")
-                high = runtime.series.get("high")
-                if math.isnan(low) or math.isnan(high):
-                    return False, None
-                for arr_name in ("highLineArrayHTF", "lowLineArrayHTF"):
-                    arr = getattr(runtime, arr_name, PineArray())
-                    for i in range(arr.size()):
-                        line = arr.get(i)
-                        if isinstance(line, Line):
-                            y = line.get_y1()
-                            if low <= y <= high:
-                                return True, f"line@{format_price(y)}"
-                for arr_name in ("highBoxArrayHTF", "lowBoxArrayHTF"):
-                    arr = getattr(runtime, arr_name, PineArray())
-                    for i in range(arr.size()):
-                        box = arr.get(i)
-                        if isinstance(box, Box):
-                            top = max(box.top, box.bottom)
-                            bottom = min(box.top, box.bottom)
-                            if low <= top and high >= bottom:
-                                return True, f"box {format_price(bottom)} → {format_price(top)}"
-                return False, None
+            pass_filter = False
+            if ict_setup["valid"]:
+                pass_filter = True
+                print(f"\n{ANSI_BOLD}{ANSI_ALERT_BULL}★ ICT SETUP FOUND: {symbol} ★{ANSI_RESET}")
+                print(f"   Direction: {ict_setup['direction']}")
+                print(f"   Sequence: {' -> '.join(ict_setup['details'])}")
 
-            liquidity_touch_or_inside, liquidity_detail = _touch_or_inside_liquidity()
-            touch_time = runtime.series.get_time(0)
-            touch_recent = isinstance(touch_time, (int, float)) and int(touch_time) in recent_times
-
-            liquidity_sweep_recent = False
-            liquidity_sweep_detail = None
-            sweep_payload = latest_events.get("LIQUIDITY_TOUCH")
-            if isinstance(sweep_payload, dict):
-                sweep_ts = sweep_payload.get("time") or sweep_payload.get("ts") or sweep_payload.get("timestamp")
-                if isinstance(sweep_ts, (int, float)) and int(sweep_ts) in recent_times:
-                    liquidity_sweep_recent = True
-                    sweep_display = sweep_payload.get("display")
-                    if isinstance(sweep_display, str) and sweep_display.strip():
-                        liquidity_sweep_detail = sweep_display
-                    else:
-                        sweep_price = sweep_payload.get("price")
-                        if isinstance(sweep_price, (int, float)):
-                            liquidity_sweep_detail = f"line@{format_price(sweep_price)}"
-
-            liquidity_created_recent = False
-            liquidity_created_detail = None
-            liq_payload = latest_events.get("LIQUIDITY_LEVELS")
-            if isinstance(liq_payload, dict):
-                liq_ts = liq_payload.get("time") or liq_payload.get("ts") or liq_payload.get("timestamp")
-                if isinstance(liq_ts, (int, float)) and int(liq_ts) in recent_times:
-                    liquidity_created_recent = True
-                    liq_price = liq_payload.get("price")
-                    if isinstance(liq_price, (int, float)):
-                        liquidity_created_detail = f"line@{format_price(liq_price)}"
-
-            if not (liquidity_touch_or_inside and touch_recent) and not liquidity_created_recent and not liquidity_sweep_recent:
+            if not pass_filter:
                 if not SILENT_WHEN_NO_EVENTS:
-                    print(
-                        f"تخطي {_format_symbol(symbol)} لعدم وجود أحداث ضمن آخر {window} شموع",
-                        flush=True,
-                    )
-                if tracer and tracer.enabled:
-                    tracer.log(
-                        "scan",
-                        "symbol_skipped_stale_events",
-                        timestamp=runtime.series.get_time(0) or None,
-                        symbol=symbol,
-                        timeframe=timeframe,
-                        reference_times=recent_times,
-                        window=window,
-                    )
+                    print(f"Skipping {symbol}: No complete ICT setup.", flush=True)
                 return idx, None, None
-
-            reasons: List[str] = []
-            if liquidity_created_recent:
-                reasons.append("Created")
-            if liquidity_sweep_recent:
-                reasons.append("Sweep")
-            if liquidity_touch_or_inside and touch_recent:
-                reasons.append("Touched/Inside")
-
-            print(f"\n{_format_symbol(symbol)} ({timeframe})", flush=True)
-            print(f"decision: PASS", flush=True)
-            print(f"reason: {', '.join(reasons)}", flush=True)
-            if liquidity_touch_or_inside and liquidity_detail and touch_recent:
-                print(f"liquidity_level: {liquidity_detail}", flush=True)
-            if liquidity_created_recent and liquidity_created_detail:
-                print(f"liquidity_created: {liquidity_created_detail}", flush=True)
-            if liquidity_sweep_recent and liquidity_sweep_detail:
-                print(f"liquidity_sweep: {liquidity_sweep_detail}", flush=True)
 
             metrics["daily_change_percent"] = daily_change
             summary = {
                 "symbol": symbol,
                 "timeframe": timeframe,
                 "candles": len(candles),
+                "strategy": {
+                    "decision": "PASS",
+                    "ict_setup": ict_setup,
+                },
                 "alerts": metrics.get("alerts", len(getattr(runtime, "alerts", []))),
                 "boxes": metrics.get("boxes", len(runtime.boxes)),
                 "metrics": metrics,
-                "strategy": {
-                    "decision": "PASS",
-                    "reasons": reasons,
-                    "liquidity_touch_or_inside": liquidity_touch_or_inside,
-                    "liquidity_sweep_recent": liquidity_sweep_recent,
-                    "liquidity_created_recent": liquidity_created_recent,
-                    "liquidity_detail": liquidity_detail,
-                    "liquidity_created_detail": liquidity_created_detail,
-                    "liquidity_sweep_detail": liquidity_sweep_detail,
-                },
             }
-            if not EVENT_PRINT_ONLY:
-                print_symbol_summary(idx, symbol, timeframe, len(candles), metrics)
+            print_symbol_summary(idx, symbol, timeframe, len(candles), metrics)
+            direction_emoji = "🟢" if ict_setup["direction"] == "bullish" else "🔴"
+            print(f"{direction_emoji} ICT ENTRY: {symbol} is retracing to FVG after Sweep+MSS!", flush=True)
             if tracer and tracer.enabled:
                 tracer.log(
                     "scan",
