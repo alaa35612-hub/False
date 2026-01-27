@@ -1514,9 +1514,11 @@ def _parse_timeframe_to_seconds(timeframe: str, base_seconds: Optional[int]) -> 
     """
     if timeframe in ("", None):
         return base_seconds
-    tf = str(timeframe).strip().upper()
+    tf = str(timeframe).strip()
     if not tf:
         return base_seconds
+    unit = tf[-1]
+    tf_upper = tf.upper()
     # Handle pure unit strings like "M" or "H" by falling back gracefully
     def _num(part: str) -> Optional[float]:
         part = (part or "").strip()
@@ -1527,23 +1529,26 @@ def _parse_timeframe_to_seconds(timeframe: str, base_seconds: Optional[int]) -> 
         except (TypeError, ValueError):
             return None
 
-    if tf.endswith("H"):
+    if unit in ("H", "h"):
         n = _num(tf[:-1])
         return int(n * 3600) if n is not None else base_seconds
-    if tf.endswith("D"):
+    if unit in ("D", "d"):
         n = _num(tf[:-1])
         return int(n * 86400) if n is not None else base_seconds
-    if tf.endswith("W"):
+    if unit in ("W", "w"):
         n = _num(tf[:-1])
         return int(n * 7 * 86400) if n is not None else base_seconds
-    if tf.endswith("M"):
+    if unit == "M":
         n = _num(tf[:-1])
         return int(n * 30 * 86400) if n is not None else base_seconds
-    if tf.endswith("S"):
+    if unit == "m":
+        n = _num(tf[:-1])
+        return int(n * 60) if n is not None else base_seconds
+    if unit in ("S", "s"):
         n = _num(tf[:-1])
         return int(n) if n is not None else base_seconds
-    if tf.isdigit():
-        return int(tf) * 60
+    if tf_upper.isdigit():
+        return int(tf_upper) * 60
     return base_seconds
 
 class SecuritySeries:
