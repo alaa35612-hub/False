@@ -53,6 +53,14 @@ except Exception:  # pragma: no cover - optional dependency
 
 
 # ----------------------------------------------------------------------------
+# User Configuration Header (إعدادات الاستراتيجية)
+# ----------------------------------------------------------------------------
+HTF_TIMEFRAME = "15m"          # إطار السيولة الأعلى
+LTF_TIMEFRAME = "3m"           # إطار الدخول الأدنى
+ENTRY_RETRACE_PERCENT = 0.05   # نسبة سماح الارتداد إلى FVG (٪)
+LOOKBACK_BARS = 300            # عدد الشموع للفحص في كل إطار
+
+# ----------------------------------------------------------------------------
 # Pine compatibility helpers
 # ----------------------------------------------------------------------------
 
@@ -8961,6 +8969,138 @@ def _emit_recent_events(symbol: str, timeframe: str, latest_events: Dict[str, An
     return lines_out
 
 
+def _within_lookback(runtime: 'SmartMoneyAlgoProE5', timestamp: Any, lookback_bars: int) -> bool:
+    bars_ago = runtime._bars_ago_from_time(timestamp)
+    if bars_ago is None:
+        return True
+    return bars_ago <= lookback_bars
+
+
+def _find_liquidity_sweep(runtime: 'SmartMoneyAlgoProE5', lookback_bars: int) -> dict | None:
+    current_time = runtime.series.get_time()
+    last_sweep_time = 0
+    last_sweep_dir = None  # 1 for bull (low sweep), -1 for bear (high sweep)
+
+    events = runtime.console_event_log
+    liq_event = events.get("LIQUIDITY_TOUCH") if isinstance(events, dict) else None
+    if isinstance(liq_event, dict) and _within_lookback(runtime, liq_event.get("time"), lookback_bars):
+        last_sweep_time = liq_event.get("time") or 0
+        if "Low" in liq_event.get("text", "") or "bullish" in liq_event.get("direction", ""):
+            last_sweep_dir = 1
+        else:
+            last_sweep_dir = -1
+
+    if last_sweep_time == 0:
+        for i in range(len(runtime.labels) - 1, -1, -1):
+            lbl = runtime.labels[i]
+            if lbl.x < current_time - (lookback_bars * runtime.base_tf_seconds * 1000):
+                break
+            if "Sweep" in lbl.text or "Liq" in lbl.text:
+                last_sweep_time = lbl.x
+                last_sweep_dir = 1 if lbl.yloc == "yloc.belowbar" else -1
+                break
+
+    if last_sweep_time == 0 or last_sweep_dir is None:
+        return None
+
+    return {
+        "time": last_sweep_time,
+        "direction": last_sweep_dir,
+        "stage": "Sweep Found",
+        "detail": f"Sweep @ {format_timestamp(last_sweep_time)}",
+    }
+
+
+def analyze_ict_setup_mtf(
+    ltf_runtime: 'SmartMoneyAlgoProE5',
+    sweep_time: int,
+    sweep_direction: int,
+    lookback_bars: int,
+) -> dict:
+    """
+    تحليل تسلسل استراتيجية ICT (LTF) بعد تأكيد سحب السيولة من HTF.
+    """
+    setup = {
+        "valid": False,
+        "direction": None,  # "bullish" or "bearish"
+        "htf_stage": "Sweep Found",
+        "ltf_stage": "None",
+        "stage": "None",
+        "details": [],
+    }
+
+    last_mss_time = 0
+    mss_type = None  # 1 for Bullish, -1 for Bearish
+
+    bc_labels = ltf_runtime.arrBCLabel
+    for i in range(bc_labels.size() - 1, -1, -1):
+        lbl = bc_labels.get(i)
+        if not isinstance(lbl, Label):
+            continue
+        if lbl.x <= sweep_time:
+            continue
+        if not _within_lookback(ltf_runtime, lbl.x, lookback_bars):
+            continue
+        txt = lbl.text.strip()
+        if "CHoCH" in txt or "MSS" in txt:
+            is_bull_mss = (lbl.style == "label.style_label_down")
+            if sweep_direction == 1 and is_bull_mss:
+                last_mss_time = lbl.x
+                mss_type = 1
+                break
+            if sweep_direction == -1 and not is_bull_mss:
+                last_mss_time = lbl.x
+                mss_type = -1
+                break
+
+    if last_mss_time == 0 or mss_type is None:
+        return setup
+
+    setup["ltf_stage"] = "MSS Confirmed"
+    setup["details"].append(f"MSS @ {format_timestamp(last_mss_time)}")
+
+    fvg_found = False
+    fvg_zone: tuple[float, float] | None = None
+
+    fvg_holder = ltf_runtime.bullish_gap_holder if mss_type == 1 else ltf_runtime.bearish_gap_holder
+    for i in range(fvg_holder.size()):
+        box = fvg_holder.get(i)
+        if not isinstance(box, Box):
+            continue
+        if box.left >= last_mss_time:
+            fvg_found = True
+            fvg_zone = (box.top, box.bottom)
+            break
+
+    if not fvg_found or fvg_zone is None:
+        return setup
+
+    setup["ltf_stage"] = "FVG Found"
+    setup["direction"] = "bullish" if mss_type == 1 else "bearish"
+
+    current_close = ltf_runtime.series.get("close")
+    entry_signal = False
+    tolerance = ENTRY_RETRACE_PERCENT / 100.0
+    fvg_top = max(fvg_zone)
+    fvg_bottom = min(fvg_zone)
+
+    if mss_type == 1:
+        if current_close <= fvg_top * (1 + tolerance):
+            entry_signal = True
+            setup["details"].append(f"Price in Buy Zone ({format_price(current_close)})")
+    else:
+        if current_close >= fvg_bottom * (1 - tolerance):
+            entry_signal = True
+            setup["details"].append(f"Price in Sell Zone ({format_price(current_close)})")
+
+    if entry_signal:
+        setup["valid"] = True
+        setup["stage"] = "ENTRY READY"
+        setup["ltf_stage"] = "ENTRY READY"
+
+    return setup
+
+
 def scan_binance(
     timeframe: str,
     limit: int,
@@ -8988,7 +9128,10 @@ def scan_binance(
         all_symbols = all_symbols[: int(max_symbols)]
     summaries: list[dict] = []
     primary_runtime = None
-    window = max(1, int(EVENT_PRINT_MAX_AGE_BARS))
+    ltf_timeframe = LTF_TIMEFRAME or timeframe
+    htf_timeframe = HTF_TIMEFRAME or timeframe
+    ltf_limit = LOOKBACK_BARS if LOOKBACK_BARS > 0 else limit
+    htf_limit = LOOKBACK_BARS if LOOKBACK_BARS > 0 else limit
 
     tickers: dict = {}
     ticker_error = None
@@ -9009,19 +9152,19 @@ def scan_binance(
         else:
             ticker_error = exc
 
-    bulk_candles: Dict[str, Sequence[Sequence[Any]]] = {}
+    bulk_candles_ltf: Dict[str, Sequence[Sequence[Any]]] = {}
     if SCANNER_BULK_OHLCV_ENABLED and fast_scan and all_symbols:
         try:
-            bulk_candles = _bulk_fetch_recent_ohlcv(
+            bulk_candles_ltf = _bulk_fetch_recent_ohlcv(
                 exchange,
                 all_symbols,
-                timeframe,
-                limit,
+                ltf_timeframe,
+                ltf_limit,
                 max_workers=SCANNER_BULK_OHLCV_MAX_WORKERS,
             )
         except Exception as exc:
             print(f"تعذر جلب شموع مجمعة للوضع السريع: {exc}", flush=True)
-            bulk_candles = {}
+            bulk_candles_ltf = {}
 
     exchange_local = threading.local()
 
@@ -9082,13 +9225,30 @@ def scan_binance(
                             threshold=SCANNER_MAX_QUOTE_VOLUME,
                         )
                     return idx, None, None
-            candles: List[Dict[str, float]]
-            if bulk_candles and symbol in bulk_candles:
-                candles = _convert_raw_ohlcv(bulk_candles.get(symbol, []))
+            ltf_candles: List[Dict[str, float]]
+            if bulk_candles_ltf and symbol in bulk_candles_ltf:
+                ltf_candles = _convert_raw_ohlcv(bulk_candles_ltf.get(symbol, []))
             else:
-                candles = fetch_ohlcv(_get_exchange(), symbol, timeframe, limit, fast_scan=fast_scan)
+                ltf_candles = fetch_ohlcv(
+                    _get_exchange(),
+                    symbol,
+                    ltf_timeframe,
+                    ltf_limit,
+                    fast_scan=fast_scan,
+                )
+            htf_candles = fetch_ohlcv(
+                _get_exchange(),
+                symbol,
+                htf_timeframe,
+                htf_limit,
+                fast_scan=fast_scan,
+            )
+            if not ltf_candles or not htf_candles:
+                if not SILENT_WHEN_NO_EVENTS:
+                    print(f"Skipping {symbol}: missing HTF/LTF data.", flush=True)
+                return idx, None, None
             if SCANNER_PRICE_CHANGE_FILTER_ENABLED and SCANNER_PRICE_CHANGE_MIN_ABS_PERCENT > 0:
-                price_change = _percent_change_over_bars(candles, SCANNER_PRICE_CHANGE_LOOKBACK_BARS)
+                price_change = _percent_change_over_bars(ltf_candles, SCANNER_PRICE_CHANGE_LOOKBACK_BARS)
                 if price_change is not None and abs(price_change) >= SCANNER_PRICE_CHANGE_MIN_ABS_PERCENT:
                     print(
                         f"تخطي {_format_symbol(symbol)} (تغير {price_change:.2f}% خلال {SCANNER_PRICE_CHANGE_LOOKBACK_BARS} شمعة)",
@@ -9105,137 +9265,85 @@ def scan_binance(
                             threshold=SCANNER_PRICE_CHANGE_MIN_ABS_PERCENT,
                         )
                     return idx, None, None
-            runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
-            if hasattr(runtime, "inputs") and hasattr(runtime.inputs, "liquidity"):
-                liq_inputs = runtime.inputs.liquidity
+            htf_runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=htf_timeframe, tracer=tracer)
+            if hasattr(htf_runtime, "inputs") and hasattr(htf_runtime.inputs, "liquidity"):
+                liq_inputs = htf_runtime.inputs.liquidity
                 if getattr(liq_inputs, "htfTF", "") in ("", None):
-                    liq_inputs.htfTF = timeframe
-            runtime.process(candles)
-            metrics = runtime.gather_console_metrics()
-            latest_events = metrics.get("latest_events") or {}
-            recent_hits, recent_times = _collect_recent_event_hits(runtime.series, latest_events, bars=window)
-
-            def _touch_or_inside_liquidity() -> tuple[bool, Optional[str]]:
-                low = runtime.series.get("low")
-                high = runtime.series.get("high")
-                if math.isnan(low) or math.isnan(high):
-                    return False, None
-                for arr_name in ("highLineArrayHTF", "lowLineArrayHTF"):
-                    arr = getattr(runtime, arr_name, PineArray())
-                    for i in range(arr.size()):
-                        line = arr.get(i)
-                        if isinstance(line, Line):
-                            y = line.get_y1()
-                            if low <= y <= high:
-                                return True, f"line@{format_price(y)}"
-                for arr_name in ("highBoxArrayHTF", "lowBoxArrayHTF"):
-                    arr = getattr(runtime, arr_name, PineArray())
-                    for i in range(arr.size()):
-                        box = arr.get(i)
-                        if isinstance(box, Box):
-                            top = max(box.top, box.bottom)
-                            bottom = min(box.top, box.bottom)
-                            if low <= top and high >= bottom:
-                                return True, f"box {format_price(bottom)} → {format_price(top)}"
-                return False, None
-
-            liquidity_touch_or_inside, liquidity_detail = _touch_or_inside_liquidity()
-            touch_time = runtime.series.get_time(0)
-            touch_recent = isinstance(touch_time, (int, float)) and int(touch_time) in recent_times
-
-            liquidity_sweep_recent = False
-            liquidity_sweep_detail = None
-            sweep_payload = latest_events.get("LIQUIDITY_TOUCH")
-            if isinstance(sweep_payload, dict):
-                sweep_ts = sweep_payload.get("time") or sweep_payload.get("ts") or sweep_payload.get("timestamp")
-                if isinstance(sweep_ts, (int, float)) and int(sweep_ts) in recent_times:
-                    liquidity_sweep_recent = True
-                    sweep_display = sweep_payload.get("display")
-                    if isinstance(sweep_display, str) and sweep_display.strip():
-                        liquidity_sweep_detail = sweep_display
-                    else:
-                        sweep_price = sweep_payload.get("price")
-                        if isinstance(sweep_price, (int, float)):
-                            liquidity_sweep_detail = f"line@{format_price(sweep_price)}"
-
-            liquidity_created_recent = False
-            liquidity_created_detail = None
-            liq_payload = latest_events.get("LIQUIDITY_LEVELS")
-            if isinstance(liq_payload, dict):
-                liq_ts = liq_payload.get("time") or liq_payload.get("ts") or liq_payload.get("timestamp")
-                if isinstance(liq_ts, (int, float)) and int(liq_ts) in recent_times:
-                    liquidity_created_recent = True
-                    liq_price = liq_payload.get("price")
-                    if isinstance(liq_price, (int, float)):
-                        liquidity_created_detail = f"line@{format_price(liq_price)}"
-
-            if not (liquidity_touch_or_inside and touch_recent) and not liquidity_created_recent and not liquidity_sweep_recent:
+                    liq_inputs.htfTF = htf_timeframe
+            htf_runtime.process(htf_candles)
+            sweep_info = _find_liquidity_sweep(htf_runtime, LOOKBACK_BARS)
+            if sweep_info is None:
                 if not SILENT_WHEN_NO_EVENTS:
-                    print(
-                        f"تخطي {_format_symbol(symbol)} لعدم وجود أحداث ضمن آخر {window} شموع",
-                        flush=True,
-                    )
-                if tracer and tracer.enabled:
-                    tracer.log(
-                        "scan",
-                        "symbol_skipped_stale_events",
-                        timestamp=runtime.series.get_time(0) or None,
-                        symbol=symbol,
-                        timeframe=timeframe,
-                        reference_times=recent_times,
-                        window=window,
-                    )
+                    print(f"Skipping {symbol}: No HTF sweep found.", flush=True)
                 return idx, None, None
 
-            reasons: List[str] = []
-            if liquidity_created_recent:
-                reasons.append("Created")
-            if liquidity_sweep_recent:
-                reasons.append("Sweep")
-            if liquidity_touch_or_inside and touch_recent:
-                reasons.append("Touched/Inside")
+            ltf_runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=ltf_timeframe, tracer=tracer)
+            if hasattr(ltf_runtime, "inputs") and hasattr(ltf_runtime.inputs, "liquidity"):
+                liq_inputs = ltf_runtime.inputs.liquidity
+                if getattr(liq_inputs, "htfTF", "") in ("", None):
+                    liq_inputs.htfTF = htf_timeframe
+            ltf_runtime.process(ltf_candles)
+            metrics = ltf_runtime.gather_console_metrics()
+            ict_setup = analyze_ict_setup_mtf(
+                ltf_runtime,
+                sweep_info["time"],
+                sweep_info["direction"],
+                LOOKBACK_BARS,
+            )
+            if sweep_info.get("detail"):
+                ict_setup["details"].insert(0, sweep_info["detail"])
 
-            print(f"\n{_format_symbol(symbol)} ({timeframe})", flush=True)
-            print(f"decision: PASS", flush=True)
-            print(f"reason: {', '.join(reasons)}", flush=True)
-            if liquidity_touch_or_inside and liquidity_detail and touch_recent:
-                print(f"liquidity_level: {liquidity_detail}", flush=True)
-            if liquidity_created_recent and liquidity_created_detail:
-                print(f"liquidity_created: {liquidity_created_detail}", flush=True)
-            if liquidity_sweep_recent and liquidity_sweep_detail:
-                print(f"liquidity_sweep: {liquidity_sweep_detail}", flush=True)
+            pass_filter = ict_setup["ltf_stage"] != "None"
+            if not pass_filter:
+                if not SILENT_WHEN_NO_EVENTS:
+                    print(f"Skipping {symbol}: No LTF confirmation after HTF sweep.", flush=True)
+                return idx, None, None
 
             metrics["daily_change_percent"] = daily_change
             summary = {
                 "symbol": symbol,
-                "timeframe": timeframe,
-                "candles": len(candles),
-                "alerts": metrics.get("alerts", len(getattr(runtime, "alerts", []))),
-                "boxes": metrics.get("boxes", len(runtime.boxes)),
-                "metrics": metrics,
+                "timeframe": ltf_timeframe,
+                "htf_timeframe": htf_timeframe,
+                "ltf_timeframe": ltf_timeframe,
+                "candles": len(ltf_candles),
                 "strategy": {
-                    "decision": "PASS",
-                    "reasons": reasons,
-                    "liquidity_touch_or_inside": liquidity_touch_or_inside,
-                    "liquidity_sweep_recent": liquidity_sweep_recent,
-                    "liquidity_created_recent": liquidity_created_recent,
-                    "liquidity_detail": liquidity_detail,
-                    "liquidity_created_detail": liquidity_created_detail,
-                    "liquidity_sweep_detail": liquidity_sweep_detail,
+                    "decision": "PASS" if ict_setup["valid"] else "WATCH",
+                    "ict_setup": ict_setup,
+                    "htf_sweep": sweep_info,
                 },
+                "alerts": metrics.get("alerts", len(getattr(ltf_runtime, "alerts", []))),
+                "boxes": metrics.get("boxes", len(ltf_runtime.boxes)),
+                "metrics": metrics,
             }
-            if not EVENT_PRINT_ONLY:
-                print_symbol_summary(idx, symbol, timeframe, len(candles), metrics)
+            status_text = "ENTRY READY" if ict_setup["valid"] else ict_setup["ltf_stage"]
+            print(
+                f"[{symbol}] HTF ({htf_timeframe}): {sweep_info['stage']} | "
+                f"LTF ({ltf_timeframe}): {ict_setup['ltf_stage']} | Status: {status_text}",
+                flush=True,
+            )
+            print_symbol_summary(idx, symbol, ltf_timeframe, len(ltf_candles), metrics)
+            if ict_setup["direction"] == "bullish":
+                direction_emoji = "🟢"
+            elif ict_setup["direction"] == "bearish":
+                direction_emoji = "🔴"
+            else:
+                direction_emoji = "🟡"
+            entry_text = (
+                f"{direction_emoji} ICT ENTRY: {symbol} is retracing to FVG after Sweep+MSS!"
+                if ict_setup["valid"]
+                else f"{direction_emoji} ICT WATCH: {symbol} awaiting entry after Sweep+MSS."
+            )
+            print(entry_text, flush=True)
             if tracer and tracer.enabled:
                 tracer.log(
                     "scan",
                     "symbol_complete",
-                    timestamp=runtime.series.get_time(0),
+                    timestamp=ltf_runtime.series.get_time(0),
                     symbol=symbol,
-                    timeframe=timeframe,
-                    candles=len(candles),
+                    timeframe=ltf_timeframe,
+                    candles=len(ltf_candles),
                 )
-            return idx, runtime, summary
+            return idx, ltf_runtime, summary
         except Exception as exc:
             print(f"فشل مسح {_format_symbol(symbol)}: {exc}", flush=True)
             return idx, None, None
