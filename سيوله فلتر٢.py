@@ -101,6 +101,7 @@ def _coerce_float(value: Any, *, default: float = NA) -> float:
 _OB_CACHE_DIR = Path(__file__).resolve().parent
 _OB_TOUCHED_CACHE_PATH = _OB_CACHE_DIR / "ob_touched_cache.json"
 _OB_RETEST_CACHE_PATH = _OB_CACHE_DIR / "ob_retested_cache.json"
+_LIQ_TOUCH_CACHE_PATH = _OB_CACHE_DIR / "liquidity_touch_cache.json"
 
 def _load_json_set(path: Path) -> set[str]:
     try:
@@ -130,6 +131,8 @@ def _ob_event_key(symbol: str, ob_kind: str, bottom: float, top: float, created_
 
 _OB_TOUCHED_SEEN: set[str] = _load_json_set(_OB_TOUCHED_CACHE_PATH)
 _OB_RETEST_SEEN: set[str] = _load_json_set(_OB_RETEST_CACHE_PATH)
+_LIQ_TOUCH_SEEN: set[str] = _load_json_set(_LIQ_TOUCH_CACHE_PATH)
+_LIQ_TOUCH_LOCK = threading.Lock()
 
 
 
@@ -212,6 +215,9 @@ SCANNER_INTERVAL = 2.0
 SCANNER_MIN_DAILY_CHANGE = 0.0
 # حد السرعة (بالـثواني) بين الطلبات لتفادي الحظر
 SCANNER_RATE_LIMIT_SECONDS = 0.2
+# تسريع إضافي: حفظ الشموع واستخدام المسح التزايدي لجلب الشموع الجديدة فقط
+SCANNER_INCREMENTAL_CACHE = True
+SCANNER_CACHE_MAX_BARS = 2000
 
 # تسريع المسح عبر جلب شموع متعددة بالواجهة السريعة
 SCANNER_BULK_OHLCV_ENABLED = True
@@ -228,6 +234,8 @@ SCANNER_PRICE_CHANGE_MIN_ABS_PERCENT = 10.0  # تجاهل العملات الت�
 # تفعيل/تعطيل طباعة لمس السيولة وإنشاء مناطق سيولة جديدة
 PRINT_LIQUIDITY_TOUCH = True
 PRINT_LIQUIDITY_LEVELS = False
+# اطبع لمس السيولة لأول مرة فقط (ولا تكرر إذا تم لمس نفس المنطقة سابقًا)
+PRINT_LIQUIDITY_TOUCH_ONCE = False
 
 # فلتر عمر الأحداث (بعدد الشموع)
 EVENT_PRINT_ENABLED = True
@@ -8541,6 +8549,43 @@ class _GlobalRateLimiter:
 
 GLOBAL_RATE_LIMITER = _GlobalRateLimiter(min_interval=SCANNER_RATE_LIMIT_SECONDS)
 
+_CANDLE_CACHE_LOCK = threading.Lock()
+_CANDLE_CACHE: Dict[Tuple[str, str], List[Dict[str, float]]] = {}
+
+
+def _merge_candles(existing: List[Dict[str, float]], new: List[Dict[str, float]]) -> List[Dict[str, float]]:
+    if not new:
+        return existing
+    existing_by_time = {int(candle["time"]): candle for candle in existing if "time" in candle}
+    for candle in new:
+        ts = int(candle.get("time") or 0)
+        if ts <= 0:
+            continue
+        existing_by_time[ts] = candle
+    merged = [existing_by_time[ts] for ts in sorted(existing_by_time)]
+    return merged
+
+
+def _fetch_incremental_ohlcv(
+    exchange: Any,
+    symbol: str,
+    timeframe: str,
+    *,
+    since_ts: Optional[int],
+    limit: int,
+) -> List[Dict[str, float]]:
+    request_limit = max(1, int(limit or 1))
+    raw = _call_with_retries(
+        lambda: exchange.fetch_ohlcv(
+            symbol,
+            timeframe=timeframe,
+            limit=request_limit,
+            since=since_ts if since_ts and since_ts > 0 else None,
+        ),
+        retries=3,
+    )
+    return _convert_raw_ohlcv(raw)
+
 
 def _call_with_retries(action: Callable[[], Any], *, retries: int = 3) -> Any:
     last_exc: Optional[Exception] = None
@@ -9088,10 +9133,37 @@ def scan_binance(
                         )
                     return idx, None, None
             candles: List[Dict[str, float]]
-            if bulk_candles and symbol in bulk_candles:
-                candles = _convert_raw_ohlcv(bulk_candles.get(symbol, []))
+            cache_key = (symbol, timeframe)
+            cached: Optional[List[Dict[str, float]]] = None
+            if SCANNER_INCREMENTAL_CACHE and fast_scan:
+                with _CANDLE_CACHE_LOCK:
+                    cached = _CANDLE_CACHE.get(cache_key)
+            if cached:
+                timeframe_seconds = _parse_timeframe_to_seconds(timeframe, None) or 60
+                since_ts = int(cached[-1]["time"]) + int(timeframe_seconds * 1000)
+                try:
+                    new_candles = _fetch_incremental_ohlcv(
+                        _get_exchange(),
+                        symbol,
+                        timeframe,
+                        since_ts=since_ts,
+                        limit=max(1, limit),
+                    )
+                except Exception as exc:
+                    print(f"تعذر جلب الشموع الجديدة لـ {symbol}: {exc}", flush=True)
+                    new_candles = []
+                candles = _merge_candles(cached, new_candles)
+                max_keep = max(1, int(max(limit, SCANNER_CACHE_MAX_BARS)))
+                if len(candles) > max_keep:
+                    candles = candles[-max_keep:]
             else:
-                candles = fetch_ohlcv(_get_exchange(), symbol, timeframe, limit, fast_scan=fast_scan)
+                if bulk_candles and symbol in bulk_candles:
+                    candles = _convert_raw_ohlcv(bulk_candles.get(symbol, []))
+                else:
+                    candles = fetch_ohlcv(_get_exchange(), symbol, timeframe, limit, fast_scan=fast_scan)
+            if SCANNER_INCREMENTAL_CACHE and fast_scan:
+                with _CANDLE_CACHE_LOCK:
+                    _CANDLE_CACHE[cache_key] = candles
             if SCANNER_PRICE_CHANGE_FILTER_ENABLED and SCANNER_PRICE_CHANGE_MIN_ABS_PERCENT > 0:
                 price_change = _percent_change_over_bars(candles, SCANNER_PRICE_CHANGE_LOOKBACK_BARS)
                 if price_change is not None and abs(price_change) >= SCANNER_PRICE_CHANGE_MIN_ABS_PERCENT:
@@ -9145,6 +9217,15 @@ def scan_binance(
                 return False, None
 
             liquidity_touch_or_inside, liquidity_detail = _touch_or_inside_liquidity()
+            if liquidity_touch_or_inside and PRINT_LIQUIDITY_TOUCH_ONCE and liquidity_detail:
+                token = f"{symbol}|{timeframe}|{liquidity_detail}"
+                with _LIQ_TOUCH_LOCK:
+                    if token in _LIQ_TOUCH_SEEN:
+                        liquidity_touch_or_inside = False
+                        liquidity_detail = None
+                    else:
+                        _LIQ_TOUCH_SEEN.add(token)
+                        _save_json_set(_LIQ_TOUCH_CACHE_PATH, _LIQ_TOUCH_SEEN)
             touch_time = runtime.series.get_time(0)
             touch_recent = isinstance(touch_time, (int, float)) and int(touch_time) in recent_times
 
