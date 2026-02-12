@@ -1047,16 +1047,8 @@ def scan_binance_usdtm() -> None:
         except Exception:
             continue
 
-    if CONFIG.get("scan_limit_symbols", 0) and int(CONFIG["scan_limit_symbols"]) > 0:
-        symbols = symbols[: int(CONFIG["scan_limit_symbols"])]
-
     if not symbols:
         return
-
-    daily_rise_by_symbol = get_daily_rise_percentages(exchange, symbols)
-    min_daily_rise_pct = safe_float(CONFIG.get("min_daily_rise_pct", 0.0), 0.0)
-    filter_enabled = bool(CONFIG.get("daily_rise_filter_enabled", True))
-    top_n = int(CONFIG.get("top_n_after_filter", 0) or 0)
 
     symbol_results: Dict[str, Tuple[List[str], bool, float]] = {}
 
@@ -1096,25 +1088,9 @@ def scan_binance_usdtm() -> None:
             if CONFIG["rate_limit_sleep"]:
                 exchange.sleep(exchange.rateLimit)
 
-    # Apply daily-rise filtering after scanning all symbols
-    ranked_symbols = sorted(
-        symbol_results.keys(),
-        key=lambda sym: daily_rise_by_symbol.get(sym, float("-inf")),
-        reverse=True,
-    )
-
-    if filter_enabled:
-        ranked_symbols = [
-            sym for sym in ranked_symbols
-            if daily_rise_by_symbol.get(sym, float("-inf")) >= min_daily_rise_pct
-        ]
-
-    if top_n > 0:
-        ranked_symbols = ranked_symbols[:top_n]
-
+    # No filters: process all scanned symbols
     candidates: List[Tuple[float, str]] = []
-    for sym in ranked_symbols:
-        msgs, is_cand, score = symbol_results[sym]
+    for sym, (msgs, is_cand, score) in symbol_results.items():
 
         for m in msgs:
             print(m)
