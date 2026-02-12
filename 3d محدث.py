@@ -16,6 +16,7 @@ Caches saved next to script:
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict, Any
 import time as pytime
@@ -36,12 +37,15 @@ CONFIG = {
     "scan_limit_symbols": 0,          # 0 = all
     "rate_limit_sleep": True,
 
-    # High coins first (sorting/filtering)
-    "high_coins_first": True,
-    "sort_by": "quoteVolume",         # "quoteVolume" | "absPercentage" | "percentage"
-    "min_quote_volume_24h": 2.0,      # set >0 to filter
-    "min_abs_change_24h_pct": 2.0,    # set >0 to filter
-    "top_n_after_sort": 0,        # 0 = all
+    # Daily rise filter (replaces high-coins/liquidity filters)
+    "daily_rise_filter_enabled": True,
+    "min_daily_rise_pct": 1.0,         # include symbols with 24h percentage >= this value
+    "top_n_after_filter": 0,           # 0 = all
+
+    # Parallel scanner (fast + safer limits)
+    "parallel_scan": True,
+    "max_workers": 4,
+    "worker_pause_ms": 125,
 
     # Timeframes / bars
     "timeframe": "1m",
@@ -931,58 +935,44 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, f
     return out_msgs, bullish_candidate, candidate_score
 
 
-def sort_and_filter_symbols_high_first(exchange: ccxt.Exchange, symbols: List[str]) -> List[str]:
-    if not CONFIG.get("high_coins_first", True) or not symbols:
+def filter_symbols_by_daily_rise(exchange: ccxt.Exchange, symbols: List[str]) -> List[str]:
+    if not symbols:
         return symbols
 
-    sort_by = str(CONFIG.get("sort_by", "quoteVolume"))
-    min_qv = safe_float(CONFIG.get("min_quote_volume_24h", 0.0), 0.0)
-    min_abs_pct = safe_float(CONFIG.get("min_abs_change_24h_pct", 0.0), 0.0)
+    if not CONFIG.get("daily_rise_filter_enabled", True):
+        filtered = symbols[:]
+    else:
+        min_daily_rise_pct = safe_float(CONFIG.get("min_daily_rise_pct", 0.0), 0.0)
 
-    tickers: Dict[str, Any] = {}
-    try:
-        tickers = exchange.fetch_tickers(symbols)
-    except Exception:
+        tickers: Dict[str, Any] = {}
         try:
-            tickers = exchange.fetch_tickers()
+            tickers = exchange.fetch_tickers(symbols)
         except Exception:
-            tickers = {}
+            try:
+                tickers = exchange.fetch_tickers()
+            except Exception:
+                tickers = {}
 
-    scored: List[Tuple[float, str]] = []
-    for sym in symbols:
-        t = tickers.get(sym) if tickers else None
-        if not t:
-            scored.append((0.0, sym))
-            continue
+        scored: List[Tuple[float, str]] = []
+        for sym in symbols:
+            t = tickers.get(sym) if tickers else None
+            if not t:
+                continue
 
-        quote_vol = safe_float(t.get("quoteVolume"), 0.0)
-        pct = safe_float(t.get("percentage"), 0.0)
-        abs_pct = abs(pct)
+            pct = safe_float(t.get("percentage"), 0.0)
+            if pct < min_daily_rise_pct:
+                continue
 
-        if min_qv > 0 and quote_vol < min_qv:
-            continue
-        if min_abs_pct > 0 and abs_pct < min_abs_pct:
-            continue
+            scored.append((pct, sym))
 
-        if sort_by == "quoteVolume":
-            score = quote_vol
-        elif sort_by == "absPercentage":
-            score = abs_pct
-        elif sort_by == "percentage":
-            score = pct
-        else:
-            score = quote_vol
+        scored.sort(key=lambda x: x[0], reverse=True)
+        filtered = [s for _, s in scored]
 
-        scored.append((score, sym))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    sorted_syms = [s for _, s in scored]
-
-    top_n = int(CONFIG.get("top_n_after_sort", 0) or 0)
+    top_n = int(CONFIG.get("top_n_after_filter", 0) or 0)
     if top_n > 0:
-        sorted_syms = sorted_syms[:top_n]
+        filtered = filtered[:top_n]
 
-    return sorted_syms
+    return filtered
 
 
 # ============================================================
@@ -1015,26 +1005,60 @@ def scan_binance_usdtm() -> None:
     if CONFIG.get("scan_limit_symbols", 0) and int(CONFIG["scan_limit_symbols"]) > 0:
         symbols = symbols[: int(CONFIG["scan_limit_symbols"])]
 
-    symbols = sort_and_filter_symbols_high_first(exchange, symbols)
+    symbols = filter_symbols_by_daily_rise(exchange, symbols)
+
+    if not symbols:
+        return
 
     candidates: List[Tuple[float, str]] = []
 
-    for sym in symbols:
-        try:
-            msgs, is_cand, score = run_symbol(sym, exchange)
+    def create_worker_exchange() -> ccxt.Exchange:
+        return getattr(ccxt, CONFIG["exchange_id"])({
+            "enableRateLimit": True,
+            "options": {"defaultType": "future"},
+        })
 
-            # prints only selected events
-            for m in msgs:
-                print(m)
+    def scan_symbol_worker(sym: str) -> Tuple[str, List[str], bool, float]:
+        worker_exchange = create_worker_exchange()
+        msgs, is_cand, score = run_symbol(sym, worker_exchange)
+        pause_ms = max(0, int(CONFIG.get("worker_pause_ms", 125)))
+        if pause_ms > 0:
+            pytime.sleep(pause_ms / 1000.0)
+        return sym, msgs, is_cand, score
 
-            if CONFIG.get("print_candidates", True) and is_cand:
-                candidates.append((score, sym))
+    if CONFIG.get("parallel_scan", True):
+        max_workers = max(1, int(CONFIG.get("max_workers", 4)))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {executor.submit(scan_symbol_worker, sym): sym for sym in symbols}
 
-        except Exception:
-            pass
+            for future in as_completed(future_map):
+                try:
+                    _, msgs, is_cand, score = future.result()
+                except Exception:
+                    continue
 
-        if CONFIG["rate_limit_sleep"]:
-            exchange.sleep(exchange.rateLimit)
+                for m in msgs:
+                    print(m)
+
+                if CONFIG.get("print_candidates", True) and is_cand:
+                    candidates.append((score, future_map[future]))
+    else:
+        for sym in symbols:
+            try:
+                msgs, is_cand, score = run_symbol(sym, exchange)
+
+                # prints only selected events
+                for m in msgs:
+                    print(m)
+
+                if CONFIG.get("print_candidates", True) and is_cand:
+                    candidates.append((score, sym))
+
+            except Exception:
+                pass
+
+            if CONFIG["rate_limit_sleep"]:
+                exchange.sleep(exchange.rateLimit)
 
     # print candidates at end of cycle
     if CONFIG.get("print_candidates", True) and candidates:
