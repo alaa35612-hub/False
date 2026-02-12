@@ -34,19 +34,12 @@ CONFIG = {
     # Exchange / scan
     "exchange_id": "binanceusdm",
     "quote": "USDT",
-    "scan_limit_symbols": 0,          # 0 = all
     "rate_limit_sleep": True,
-
-    # Daily rise filter (replaces high-coins/liquidity filters)
-    "daily_rise_filter_enabled": True,
-    "min_daily_rise_pct": 1.0,         # include symbols with 24h percentage >= this value
-    "top_n_after_filter": 0,           # 0 = all
 
     # Parallel scanner (fast + safer limits)
     "parallel_scan": True,
     "max_workers": 4,
     "worker_pause_ms": 125,
-    "tickers_chunk_size": 80,
 
     # Timeframes / bars
     "timeframe": "1m",
@@ -168,12 +161,6 @@ def safe_float(x: Any, default: float = 0.0) -> float:
         return float(x)
     except Exception:
         return default
-
-def chunked(items: List[str], size: int) -> List[List[str]]:
-    if size <= 0:
-        return [items]
-    return [items[i:i + size] for i in range(0, len(items), size)]
-
 
 def round_half_away_from_zero(x: float) -> int:
     # Pine math.round behavior
@@ -941,85 +928,6 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, f
     return out_msgs, bullish_candidate, candidate_score
 
 
-def filter_symbols_by_daily_rise(exchange: ccxt.Exchange, symbols: List[str]) -> List[str]:
-    if not symbols:
-        return symbols
-
-    if not CONFIG.get("daily_rise_filter_enabled", True):
-        filtered = symbols[:]
-    else:
-        min_daily_rise_pct = safe_float(CONFIG.get("min_daily_rise_pct", 0.0), 0.0)
-
-        tickers: Dict[str, Any] = {}
-        try:
-            tickers = exchange.fetch_tickers(symbols)
-        except Exception:
-            try:
-                tickers = exchange.fetch_tickers()
-            except Exception:
-                tickers = {}
-
-        scored: List[Tuple[float, str]] = []
-        for sym in symbols:
-            t = tickers.get(sym) if tickers else None
-            if not t:
-                continue
-
-            pct = safe_float(t.get("percentage"), 0.0)
-            if pct < min_daily_rise_pct:
-                continue
-
-            scored.append((pct, sym))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        filtered = [s for _, s in scored]
-
-    top_n = int(CONFIG.get("top_n_after_filter", 0) or 0)
-    if top_n > 0:
-        filtered = filtered[:top_n]
-
-    return filtered
-
-
-def get_daily_rise_percentages(exchange: ccxt.Exchange, symbols: List[str]) -> Dict[str, float]:
-    if not symbols:
-        return {}
-
-    rises: Dict[str, float] = {}
-    chunk_size = max(1, int(CONFIG.get("tickers_chunk_size", 80)))
-
-    for sym_chunk in chunked(symbols, chunk_size):
-        tickers: Dict[str, Any] = {}
-        try:
-            tickers = exchange.fetch_tickers(sym_chunk)
-        except Exception:
-            tickers = {}
-
-        for sym in sym_chunk:
-            t = tickers.get(sym) if tickers else None
-            if not t:
-                continue
-            rises[sym] = safe_float(t.get("percentage"), 0.0)
-
-        if CONFIG.get("rate_limit_sleep", True):
-            exchange.sleep(exchange.rateLimit)
-
-    # Final fallback: if chunked calls failed, try global fetch once.
-    if not rises:
-        try:
-            all_tickers = exchange.fetch_tickers()
-        except Exception:
-            all_tickers = {}
-
-        for sym in symbols:
-            t = all_tickers.get(sym) if all_tickers else None
-            if not t:
-                continue
-            rises[sym] = safe_float(t.get("percentage"), 0.0)
-
-    return rises
-
-
 # ============================================================
 # =========================== SCANNER =========================
 # ============================================================
@@ -1088,7 +996,7 @@ def scan_binance_usdtm() -> None:
             if CONFIG["rate_limit_sleep"]:
                 exchange.sleep(exchange.rateLimit)
 
-    # No filters: process all scanned symbols
+    # Process all scanned symbols
     candidates: List[Tuple[float, str]] = []
     for sym, (msgs, is_cand, score) in symbol_results.items():
 
