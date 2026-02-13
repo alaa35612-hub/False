@@ -35,6 +35,8 @@ CONFIG = {
     "exchange_id": "binanceusdm",
     "quote": "USDT",
     "rate_limit_sleep": True,
+    "min_daily_change_pct": 0.0,      # فلتر العملات الصاعدة: استبعد أي عملة أقل من هذه النسبة خلال 24h
+    "sort_by_quote_volume": True,     # ترتيب العملات من الأعلى سيولة (24h quoteVolume)
 
     # Parallel scanner (fast + safer limits)
     "parallel_scan": True,
@@ -161,6 +163,34 @@ def safe_float(x: Any, default: float = 0.0) -> float:
         return float(x)
     except Exception:
         return default
+
+
+def extract_daily_change_pct(ticker: Dict[str, Any]) -> Optional[float]:
+    pct = ticker.get("percentage")
+    if pct is not None:
+        return safe_float(pct, 0.0)
+
+    info = ticker.get("info") if isinstance(ticker, dict) else None
+    if isinstance(info, dict):
+        raw = info.get("priceChangePercent")
+        if raw is not None:
+            return safe_float(raw, 0.0)
+
+    return None
+
+
+def extract_quote_volume(ticker: Dict[str, Any]) -> float:
+    qv = ticker.get("quoteVolume")
+    if qv is not None:
+        return safe_float(qv, 0.0)
+
+    info = ticker.get("info") if isinstance(ticker, dict) else None
+    if isinstance(info, dict):
+        raw = info.get("quoteVolume")
+        if raw is not None:
+            return safe_float(raw, 0.0)
+
+    return 0.0
 
 def round_half_away_from_zero(x: float) -> int:
     # Pine math.round behavior
@@ -956,6 +986,34 @@ def scan_binance_usdtm() -> None:
             continue
 
     if not symbols:
+        return
+
+    min_daily_change_pct = safe_float(CONFIG.get("min_daily_change_pct", 0.0), 0.0)
+    sort_by_quote_volume = bool(CONFIG.get("sort_by_quote_volume", True))
+
+    try:
+        tickers = exchange.fetch_tickers(symbols)
+    except Exception:
+        tickers = {}
+
+    symbols_with_rank: List[Tuple[str, float]] = []
+    for sym in symbols:
+        t = tickers.get(sym, {}) if isinstance(tickers, dict) else {}
+        daily_change_pct = extract_daily_change_pct(t) if isinstance(t, dict) else None
+
+        if daily_change_pct is not None and daily_change_pct < min_daily_change_pct:
+            continue
+
+        volume_rank = extract_quote_volume(t) if isinstance(t, dict) else 0.0
+        symbols_with_rank.append((sym, volume_rank))
+
+    if sort_by_quote_volume:
+        symbols_with_rank.sort(key=lambda x: x[1], reverse=True)
+
+    symbols = [sym for sym, _ in symbols_with_rank]
+
+    if not symbols:
+        print(f"No symbols matched min_daily_change_pct >= {min_daily_change_pct}")
         return
 
     symbol_results: Dict[str, Tuple[List[str], bool, float]] = {}
