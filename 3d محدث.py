@@ -52,6 +52,9 @@ CONFIG = {
     "trigger_lookback_bars": 5,       # grace window in trigger TF (last X candles)
     "bars_back": 5000,
     "fetch_batch_limit": 1500,
+    "fast_scan_mode": True,
+    "fast_scan_bars_back": 1500,
+    "sleep_after_symbol": False,
 
     # LTF coverage tuning
     "LTF_EXTRA_BUFFER_CANDLES": 2000,
@@ -562,9 +565,6 @@ def monitor_trigger_timeframe_touches(
     except Exception:
         return []
 
-    if CONFIG.get("rate_limit_sleep", True):
-        exchange.sleep(exchange.rateLimit)
-
     if len(trigger_candles) < 2:
         return []
 
@@ -740,6 +740,8 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, f
     tf = CONFIG["timeframe"]
     vd_tf = CONFIG.get("vd_timeframe", "")
     bars_back = int(CONFIG["bars_back"])
+    if CONFIG.get("fast_scan_mode", False):
+        bars_back = min(bars_back, int(CONFIG.get("fast_scan_bars_back", bars_back)))
     batch_limit = int(CONFIG["fetch_batch_limit"])
 
     tick_size = get_tick_size_from_market(exchange, symbol)
@@ -1024,6 +1026,55 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, f
     return out_msgs, bullish_candidate, candidate_score
 
 
+def classify_event(msg: str) -> str:
+    if msg.startswith("[TOUCH FIRST][TRIGGER]") or msg.startswith("[TOUCH FIRST]"):
+        return "touch"
+    if msg.startswith("[NEW OB]"):
+        return "new"
+    if msg.startswith("▲") or msg.startswith("▼"):
+        return "retest"
+    return "other"
+
+
+def print_events_table(events: List[Tuple[str, str]]) -> None:
+    if not events:
+        return
+
+    colors = {
+        "touch": "[94m",   # blue
+        "new": "[92m",     # green
+        "retest": "[93m",  # yellow
+        "other": "[0m",
+    }
+    labels = {
+        "touch": "ملامسة",
+        "new": "جديد",
+        "retest": "إعادة اختبار",
+        "other": "أخرى",
+    }
+    reset = "[0m"
+
+    ordered = [e for e in events if e[0] == "touch"]
+    ordered += [e for e in events if e[0] == "new"]
+    ordered += [e for e in events if e[0] == "retest"]
+    ordered += [e for e in events if e[0] == "other"]
+
+    idx_w = len(str(len(ordered)))
+    type_w = max(len(labels[k]) for k, _ in ordered)
+    msg_w = max(len(m) for _, m in ordered)
+
+    header = f"{'#':<{idx_w}} | {'النوع':<{type_w}} | {'التفاصيل':<{msg_w}}"
+    sep = "-" * len(header)
+    print(sep)
+    print(header)
+    print(sep)
+    for i, (kind, msg) in enumerate(ordered, 1):
+        label = labels.get(kind, "أخرى")
+        color = colors.get(kind, reset)
+        print(f"{i:<{idx_w}} | {color}{label:<{type_w}}{reset} | {msg}")
+    print(sep)
+
+
 def sort_and_filter_symbols_high_first(exchange: ccxt.Exchange, symbols: List[str]) -> List[str]:
     if not CONFIG.get("high_coins_first", True) or not symbols:
         return symbols
@@ -1117,14 +1168,14 @@ def scan_binance_usdtm() -> None:
     symbols = sort_and_filter_symbols_high_first(exchange, symbols)
 
     candidates: List[Tuple[float, str]] = []
+    cycle_events: List[Tuple[str, str]] = []
 
     for sym in symbols:
         try:
             msgs, is_cand, score = run_symbol(sym, exchange)
 
-            # prints only selected events
             for m in msgs:
-                print(m)
+                cycle_events.append((classify_event(m), m))
 
             if CONFIG.get("print_candidates", True) and is_cand:
                 candidates.append((score, sym))
@@ -1132,8 +1183,10 @@ def scan_binance_usdtm() -> None:
         except Exception:
             pass
 
-        if CONFIG["rate_limit_sleep"]:
+        if CONFIG.get("sleep_after_symbol", False) and CONFIG["rate_limit_sleep"]:
             exchange.sleep(exchange.rateLimit)
+
+    print_events_table(cycle_events)
 
     # print candidates at end of cycle
     if CONFIG.get("print_candidates", True) and candidates:
