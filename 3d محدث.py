@@ -46,6 +46,8 @@ CONFIG = {
     # Timeframes / bars
     "timeframe": "1m",
     "vd_timeframe": "",             # "" to use chart TF volume (no LTF)
+    "trigger_timeframe": "1m",      # micro timeframe for first-touch execution
+    "trigger_lookback_bars": 5,       # grace window in trigger TF (last X candles)
     "bars_back": 5000,
     "fetch_batch_limit": 1500,
 
@@ -60,7 +62,7 @@ CONFIG = {
     "poc_bins": 40,
 
     # ==================== TOUCH ALERTS ====================
-    "alert_touch_zone": False,
+    "alert_touch_zone": True,
     "touch_age_bars": 1,            # ✅ 0 = only current candle (prevents printing old touches)
     "first_touch_only": True,         # ✅ persistent first touch only
     "alert_only_last_candle": True,   # ✅ emit alerts only when evaluating last candle
@@ -213,6 +215,16 @@ def format_touch(symbol: str, close_px: float, ob: ObRec, touch_time_ms: int) ->
     return (
         f"[TOUCH FIRST] {symbol} close={close_px} | {side} OB "
         f"top={ob.top} bottom={ob.bottom} | created_time={ob.created_time} | touch_time={touch_time_ms}"
+    )
+
+
+def format_trigger_touch(symbol: str, ob: ObRec, touch_time_ms: int) -> str:
+    side = "BULL" if ob.is_bull else "BEAR"
+    entry = ob.top if ob.is_bull else ob.bottom
+    return (
+        f"[TOUCH FIRST][TRIGGER] {symbol} | side={side} | entry={entry} "
+        f"| zone_top={ob.top} zone_bottom={ob.bottom} "
+        f"| created_time_htf={ob.created_time} | touch_time_trigger={touch_time_ms}"
     )
 
 
@@ -524,6 +536,59 @@ def volume_at_price(
     return touches, math.fsum(tot_list), math.fsum(bull_list), math.fsum(bear_list)
 
 
+def monitor_trigger_timeframe_touches(
+    exchange: ccxt.Exchange,
+    symbol: str,
+    active_obs: List[ObRec],
+    tick_size: float,
+) -> List[str]:
+    if not active_obs:
+        return []
+
+    trigger_tf = str(CONFIG.get("trigger_timeframe", "1m") or "1m")
+    lookback = max(1, int(CONFIG.get("trigger_lookback_bars", 5) or 5))
+    fetch_limit = max(lookback, 2) + 1
+
+    try:
+        trigger_candles = exchange.fetch_ohlcv(symbol, timeframe=trigger_tf, since=None, limit=fetch_limit)
+    except Exception:
+        return []
+
+    if CONFIG.get("rate_limit_sleep", True):
+        exchange.sleep(exchange.rateLimit)
+
+    if not trigger_candles:
+        return []
+
+    recent = trigger_candles[-lookback:]
+    out: List[str] = []
+    cache_updated = False
+
+    for ob in active_obs:
+        key = stable_ob_key(symbol, ob, tick_size)
+        if key in FIRST_TOUCH_SEEN:
+            continue
+
+        touch_time_ms: Optional[int] = None
+        for tbar in recent:
+            ts_ms, _, hi, lo, _, _ = tbar
+            if touches_zone(ob.top, ob.bottom, float(hi), float(lo)):
+                touch_time_ms = int(ts_ms)
+                break
+
+        if touch_time_ms is None:
+            continue
+
+        FIRST_TOUCH_SEEN.add(key)
+        cache_updated = True
+        out.append(format_trigger_touch(symbol, ob, touch_time_ms))
+
+    if cache_updated:
+        _save_cache(TOUCH_CACHE_FILE, FIRST_TOUCH_SEEN)
+
+    return out
+
+
 def calc_most_touched_price_vol(
     highs: List[float],
     lows: List[float],
@@ -647,6 +712,8 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, f
     Returns:
       messages_to_print, bullish_candidate_flag, candidate_score
     NOTE: Touch / candidate logic remains configurable, but defaults can be disabled in CONFIG.
+    Structural extraction stays on CONFIG["timeframe"], while first-touch execution can run
+    on CONFIG["trigger_timeframe"] over the last CONFIG["trigger_lookback_bars"] candles.
     """
     tf = CONFIG["timeframe"]
     vd_tf = CONFIG.get("vd_timeframe", "")
@@ -927,6 +994,10 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, f
                     if (not ob.is_bull) and ob.retest_time is not None and ob.retest_time == ts[bi - 1]:
                         out_msgs.append(format_triangle(symbol, ob, ts[bi - 1]))
                         break
+
+    active_obs = [ob for ob in obs if ob.active]
+    if CONFIG.get("alert_touch_zone", True):
+        out_msgs.extend(monitor_trigger_timeframe_touches(exchange, symbol, active_obs, tick_size))
 
     return out_msgs, bullish_candidate, candidate_score
 
