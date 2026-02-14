@@ -38,14 +38,18 @@ CONFIG = {
 
     # High coins first (sorting/filtering)
     "high_coins_first": True,
-    "sort_by": "quoteVolume",         # "quoteVolume" | "absPercentage" | "percentage"
+    "sort_by": "percentage",          # "quoteVolume" | "absPercentage" | "percentage"
     "min_quote_volume_24h": 2.0,      # set >0 to filter
     "min_abs_change_24h_pct": 2.0,    # set >0 to filter
+    "min_change_24h_pct": 0.0,        # set >0 to require positive daily rise threshold
+    "only_rising_24h": True,          # ignore coins with non-positive 24h change
     "top_n_after_sort": 0,        # 0 = all
 
     # Timeframes / bars
     "timeframe": "1m",
     "vd_timeframe": "",             # "" to use chart TF volume (no LTF)
+    "trigger_timeframe": "1m",      # micro timeframe for first-touch execution
+    "trigger_lookback_bars": 5,       # grace window in trigger TF (last X candles)
     "bars_back": 5000,
     "fetch_batch_limit": 1500,
 
@@ -60,7 +64,7 @@ CONFIG = {
     "poc_bins": 40,
 
     # ==================== TOUCH ALERTS ====================
-    "alert_touch_zone": False,
+    "alert_touch_zone": True,
     "touch_age_bars": 1,            # ✅ 0 = only current candle (prevents printing old touches)
     "first_touch_only": True,         # ✅ persistent first touch only
     "alert_only_last_candle": True,   # ✅ emit alerts only when evaluating last candle
@@ -186,6 +190,12 @@ def touches_zone(z_top: float, z_bot: float, c_high: float, c_low: float) -> boo
     return (c_high >= z_bot) and (c_low <= z_top)
 
 
+def is_inside_zone(price: float, z_top: float, z_bot: float) -> bool:
+    top = max(z_top, z_bot)
+    bot = min(z_top, z_bot)
+    return bot <= price <= top
+
+
 def should_emit_alert(symbol: str, event_type: str, bar_time_ms: int) -> bool:
     key = (symbol, event_type)
     last = LAST_ALERT_BAR_TIME.get(key)
@@ -213,6 +223,16 @@ def format_touch(symbol: str, close_px: float, ob: ObRec, touch_time_ms: int) ->
     return (
         f"[TOUCH FIRST] {symbol} close={close_px} | {side} OB "
         f"top={ob.top} bottom={ob.bottom} | created_time={ob.created_time} | touch_time={touch_time_ms}"
+    )
+
+
+def format_trigger_touch(symbol: str, ob: ObRec, touch_time_ms: int) -> str:
+    side = "BULL" if ob.is_bull else "BEAR"
+    entry = ob.top if ob.is_bull else ob.bottom
+    return (
+        f"[TOUCH FIRST][TRIGGER] {symbol} | side={side} | entry={entry} "
+        f"| zone_top={ob.top} zone_bottom={ob.bottom} "
+        f"| created_time_htf={ob.created_time} | touch_time_trigger={touch_time_ms}"
     )
 
 
@@ -524,6 +544,73 @@ def volume_at_price(
     return touches, math.fsum(tot_list), math.fsum(bull_list), math.fsum(bear_list)
 
 
+def monitor_trigger_timeframe_touches(
+    exchange: ccxt.Exchange,
+    symbol: str,
+    active_obs: List[ObRec],
+    tick_size: float,
+) -> List[str]:
+    if not active_obs:
+        return []
+
+    trigger_tf = str(CONFIG.get("trigger_timeframe", "1m") or "1m")
+    lookback = max(1, int(CONFIG.get("trigger_lookback_bars", 5) or 5))
+    fetch_limit = max(lookback, 2) + 2
+
+    try:
+        trigger_candles = exchange.fetch_ohlcv(symbol, timeframe=trigger_tf, since=None, limit=fetch_limit)
+    except Exception:
+        return []
+
+    if CONFIG.get("rate_limit_sleep", True):
+        exchange.sleep(exchange.rateLimit)
+
+    if len(trigger_candles) < 2:
+        return []
+
+    start_idx = max(1, len(trigger_candles) - lookback)
+    out: List[str] = []
+    cache_updated = False
+
+    for ob in active_obs:
+        key = stable_ob_key(symbol, ob, tick_size)
+        if key in FIRST_TOUCH_SEEN:
+            continue
+
+        z_top = max(ob.top, ob.bottom)
+        z_bot = min(ob.top, ob.bottom)
+        touch_time_ms: Optional[int] = None
+
+        for idx in range(start_idx, len(trigger_candles)):
+            prev_close = float(trigger_candles[idx - 1][4])
+            ts_ms, o_, hi, lo, c_, _ = trigger_candles[idx]
+            hi = float(hi)
+            lo = float(lo)
+            o_ = float(o_)
+            c_ = float(c_)
+
+            overlap = touches_zone(z_top, z_bot, hi, lo)
+            boundary_touch = (hi >= z_top) or (lo <= z_bot)
+            prev_inside = is_inside_zone(prev_close, z_top, z_bot)
+            fully_inside_candle = (lo >= z_bot and hi <= z_top and is_inside_zone(o_, z_top, z_bot) and is_inside_zone(c_, z_top, z_bot))
+
+            if overlap and boundary_touch and (not prev_inside) and (not fully_inside_candle):
+                touch_time_ms = int(ts_ms)
+                break
+
+        if touch_time_ms is None:
+            continue
+
+        FIRST_TOUCH_SEEN.add(key)
+        cache_updated = True
+        out.append(format_trigger_touch(symbol, ob, touch_time_ms))
+
+    if cache_updated:
+        _save_cache(TOUCH_CACHE_FILE, FIRST_TOUCH_SEEN)
+
+    return out
+
+
 def calc_most_touched_price_vol(
     highs: List[float],
     lows: List[float],
@@ -647,6 +734,8 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, f
     Returns:
       messages_to_print, bullish_candidate_flag, candidate_score
     NOTE: Touch / candidate logic remains configurable, but defaults can be disabled in CONFIG.
+    Structural extraction stays on CONFIG["timeframe"], while first-touch execution can run
+    on CONFIG["trigger_timeframe"] over the last CONFIG["trigger_lookback_bars"] candles.
     """
     tf = CONFIG["timeframe"]
     vd_tf = CONFIG.get("vd_timeframe", "")
@@ -928,6 +1017,10 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, f
                         out_msgs.append(format_triangle(symbol, ob, ts[bi - 1]))
                         break
 
+    active_obs = [ob for ob in obs if ob.active]
+    if CONFIG.get("alert_touch_zone", True):
+        out_msgs.extend(monitor_trigger_timeframe_touches(exchange, symbol, active_obs, tick_size))
+
     return out_msgs, bullish_candidate, candidate_score
 
 
@@ -938,6 +1031,8 @@ def sort_and_filter_symbols_high_first(exchange: ccxt.Exchange, symbols: List[st
     sort_by = str(CONFIG.get("sort_by", "quoteVolume"))
     min_qv = safe_float(CONFIG.get("min_quote_volume_24h", 0.0), 0.0)
     min_abs_pct = safe_float(CONFIG.get("min_abs_change_24h_pct", 0.0), 0.0)
+    min_pos_pct = safe_float(CONFIG.get("min_change_24h_pct", 0.0), 0.0)
+    only_rising = bool(CONFIG.get("only_rising_24h", True))
 
     tickers: Dict[str, Any] = {}
     try:
@@ -962,6 +1057,10 @@ def sort_and_filter_symbols_high_first(exchange: ccxt.Exchange, symbols: List[st
         if min_qv > 0 and quote_vol < min_qv:
             continue
         if min_abs_pct > 0 and abs_pct < min_abs_pct:
+            continue
+        if only_rising and pct <= 0:
+            continue
+        if min_pos_pct > 0 and pct < min_pos_pct:
             continue
 
         if sort_by == "quoteVolume":
