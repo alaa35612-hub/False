@@ -1036,10 +1036,13 @@ def classify_event(msg: str) -> str:
     return "other"
 
 
-def print_events_table(events: List[Tuple[str, str]]) -> None:
-    if not events:
-        return
+def print_event_stream_header() -> None:
+    print("-------------------------------------------------------------")
+    print("# | النوع | التفاصيل")
+    print("-------------------------------------------------------------")
 
+
+def print_event_row(kind: str, msg: str, idx: int) -> None:
     colors = {
         "touch": "[94m",   # blue
         "new": "[92m",     # green
@@ -1053,27 +1056,9 @@ def print_events_table(events: List[Tuple[str, str]]) -> None:
         "other": "أخرى",
     }
     reset = "[0m"
-
-    ordered = [e for e in events if e[0] == "touch"]
-    ordered += [e for e in events if e[0] == "new"]
-    ordered += [e for e in events if e[0] == "retest"]
-    ordered += [e for e in events if e[0] == "other"]
-
-    idx_w = len(str(len(ordered)))
-    type_w = max(len(labels[k]) for k, _ in ordered)
-    msg_w = max(len(m) for _, m in ordered)
-
-    header = f"{'#':<{idx_w}} | {'النوع':<{type_w}} | {'التفاصيل':<{msg_w}}"
-    sep = "-" * len(header)
-    print(sep)
-    print(header)
-    print(sep)
-    for i, (kind, msg) in enumerate(ordered, 1):
-        label = labels.get(kind, "أخرى")
-        color = colors.get(kind, reset)
-        print(f"{i:<{idx_w}} | {color}{label:<{type_w}}{reset} | {msg}")
-    print(sep)
-
+    label = labels.get(kind, "أخرى")
+    color = colors.get(kind, reset)
+    print(f"{idx} | {color}{label}{reset} | {msg}")
 
 def sort_and_filter_symbols_high_first(exchange: ccxt.Exchange, symbols: List[str]) -> List[str]:
     if not CONFIG.get("high_coins_first", True) or not symbols:
@@ -1168,14 +1153,16 @@ def scan_binance_usdtm() -> None:
     symbols = sort_and_filter_symbols_high_first(exchange, symbols)
 
     candidates: List[Tuple[float, str]] = []
-    cycle_events: List[Tuple[str, str]] = []
+    print_event_stream_header()
+    event_counter = 0
 
     for sym in symbols:
         try:
             msgs, is_cand, score = run_symbol(sym, exchange)
 
             for m in msgs:
-                cycle_events.append((classify_event(m), m))
+                event_counter += 1
+                print_event_row(classify_event(m), m, event_counter)
 
             if CONFIG.get("print_candidates", True) and is_cand:
                 candidates.append((score, sym))
@@ -1185,8 +1172,6 @@ def scan_binance_usdtm() -> None:
 
         if CONFIG.get("sleep_after_symbol", False) and CONFIG["rate_limit_sleep"]:
             exchange.sleep(exchange.rateLimit)
-
-    print_events_table(cycle_events)
 
     # print candidates at end of cycle
     if CONFIG.get("print_candidates", True) and candidates:
