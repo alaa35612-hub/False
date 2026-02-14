@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Tuple
 import math
 import time
 import traceback
+import threading
 
 import ccxt
 
@@ -41,8 +42,10 @@ CONFIG = {
     "run_forever": True,            # False => run once then exit
 
     # Concurrency
-    "parallel": False,
-    "max_workers": 6,
+    "parallel": True,
+    "max_workers": 3,
+    "task_pause_ms": 40,          # pause between worker tasks to reduce burst load
+    "symbol_refresh_cycles": 5,   # refresh sorted symbols every N scan cycles
 
     # Pine-mapped settings
     "swing_length": 5,
@@ -83,6 +86,12 @@ class Setup:
     created_index: int
     bars_active: int = 0
     is_active: bool = True
+
+
+# fast runtime caches
+_SYMBOLS_CACHE: List[str] = []
+_SYMBOLS_CACHE_CYCLE: int = -10**9
+_TLS = threading.local()
 
 
 # ============================== MATH ================================
@@ -208,7 +217,6 @@ def analyze_symbol_tf(symbol: str, tf: str, exchange: ccxt.Exchange) -> List[Set
     if candles is None or len(candles) < max(60, CONFIG["swing_length"] * 4):
         return []
 
-    t = [int(c[0]) for c in candles]
     o = [float(c[1]) for c in candles]
     h = [float(c[2]) for c in candles]
     l = [float(c[3]) for c in candles]
@@ -341,8 +349,16 @@ def analyze_symbol_tf(symbol: str, tf: str, exchange: ccxt.Exchange) -> List[Set
 # ============================== EXCHANGE ============================
 def build_exchange() -> ccxt.Exchange:
     ex_class = getattr(ccxt, CONFIG["exchange_id"])
-    ex = ex_class({"enableRateLimit": True, "options": {"defaultType": "future"}})
+    ex = ex_class({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     ex.load_markets()
+    return ex
+
+
+def get_thread_exchange() -> ccxt.Exchange:
+    ex = getattr(_TLS, "exchange", None)
+    if ex is None:
+        ex = build_exchange()
+        _TLS.exchange = ex
     return ex
 
 
@@ -375,7 +391,13 @@ def fetch_tickers_safe(exchange: ccxt.Exchange, symbols: List[str]) -> Dict[str,
     return out
 
 
-def get_usdtm_symbols(exchange: ccxt.Exchange) -> List[str]:
+def get_usdtm_symbols(exchange: ccxt.Exchange, cycle_index: int) -> List[str]:
+    global _SYMBOLS_CACHE, _SYMBOLS_CACHE_CYCLE
+
+    refresh_each = max(1, int(CONFIG.get("symbol_refresh_cycles", 5)))
+    if _SYMBOLS_CACHE and (cycle_index - _SYMBOLS_CACHE_CYCLE) < refresh_each:
+        return _SYMBOLS_CACHE
+
     symbols: List[str] = []
     for sym, m in exchange.markets.items():
         if not isinstance(m, dict):
@@ -400,7 +422,10 @@ def get_usdtm_symbols(exchange: ccxt.Exchange) -> List[str]:
         symbols.append(sym)
 
     if not CONFIG["sort_by_quote_volume"]:
-        return symbols[: CONFIG["symbols_limit"]]
+        result = symbols[: CONFIG["symbols_limit"]]
+        _SYMBOLS_CACHE = result
+        _SYMBOLS_CACHE_CYCLE = cycle_index
+        return result
 
     tickers = fetch_tickers_safe(exchange, symbols)
     scored = []
@@ -409,18 +434,29 @@ def get_usdtm_symbols(exchange: ccxt.Exchange) -> List[str]:
         qv = float(tk.get("quoteVolume") or tk.get("baseVolume") or 0.0)
         scored.append((s, qv))
     scored.sort(key=lambda x: x[1], reverse=True)
-    return [s for s, _ in scored[: CONFIG["symbols_limit"]]]
+    result = [s for s, _ in scored[: CONFIG["symbols_limit"]]]
+    _SYMBOLS_CACHE = result
+    _SYMBOLS_CACHE_CYCLE = cycle_index
+    return result
 
 
-def scan_once(exchange: ccxt.Exchange) -> List[Setup]:
-    symbols = get_usdtm_symbols(exchange)
+def scan_once(exchange: ccxt.Exchange, cycle_index: int) -> List[Setup]:
+    symbols = get_usdtm_symbols(exchange, cycle_index)
     all_hits: List[Setup] = []
 
     tasks: List[Tuple[str, str]] = [(s, tf) for s in symbols for tf in CONFIG["timeframes"]]
 
     if CONFIG["parallel"]:
+        def _worker(sym: str, tf: str) -> List[Setup]:
+            ex = get_thread_exchange()
+            result = analyze_symbol_tf(sym, tf, ex)
+            pause_ms = int(CONFIG.get("task_pause_ms", 0))
+            if pause_ms > 0:
+                time.sleep(pause_ms / 1000.0)
+            return result
+
         with ThreadPoolExecutor(max_workers=CONFIG["max_workers"]) as pool:
-            futs = {pool.submit(analyze_symbol_tf, s, tf, exchange): (s, tf) for s, tf in tasks}
+            futs = {pool.submit(_worker, s, tf): (s, tf) for s, tf in tasks}
             for fut in as_completed(futs):
                 s, tf = futs[fut]
                 try:
@@ -432,6 +468,8 @@ def scan_once(exchange: ccxt.Exchange) -> List[Setup]:
         for s, tf in tasks:
             try:
                 all_hits.extend(analyze_symbol_tf(s, tf, exchange))
+                if CONFIG.get("task_pause_ms", 0) > 0:
+                    time.sleep(CONFIG["task_pause_ms"] / 1000.0)
             except Exception:
                 print(f"[ERR] {s} {tf}:\n{traceback.format_exc(limit=1)}")
 
@@ -463,13 +501,16 @@ def main() -> None:
 
     exchange = build_exchange()
 
+    cycle = 0
     while True:
         started = time.strftime("%Y-%m-%d %H:%M:%S")
         print("\n" + "=" * 80)
         print(f"Scan started: {started}")
 
-        hits = scan_once(exchange)
+        hits = scan_once(exchange, cycle)
         print_hits(hits)
+
+        cycle += 1
 
         if not CONFIG["run_forever"]:
             break
