@@ -59,6 +59,9 @@ CONFIG = {
     "max_stored_obs": 50,
     "poc_bins": 40,
 
+    # ==================== BIG OB FILTER ====================
+    "big_ob_min_dominance_pct": 70,  # configurable: print/keep OB only if dominant side >= this percent
+
     # ==================== TOUCH ALERTS ====================
     "alert_touch_zone": False,
     "touch_age_bars": 1,            # ✅ 0 = only current candle (prevents printing old touches)
@@ -574,6 +577,23 @@ def has_gap_between(highs: List[float], lows: List[float], anchor_idx: int, bos_
     return False
 
 
+def ob_dominance_pct(tot_vol: float, bull_vol: float, bear_vol: float) -> int:
+    tot = float(tot_vol)
+    if tot <= 0:
+        return 50
+
+    bull_raw = (float(bull_vol) / tot) * 100.0
+    bull_pct = round_half_away_from_zero(bull_raw)
+    bull_pct = max(0, min(100, bull_pct))
+    bear_pct = 100 - bull_pct
+    return max(bull_pct, bear_pct)
+
+
+def passes_big_ob_filter(tot_vol: float, bull_vol: float, bear_vol: float) -> bool:
+    min_dom = safe_float(CONFIG.get("big_ob_min_dominance_pct", 70), 70.0)
+    return ob_dominance_pct(tot_vol, bull_vol, bear_vol) >= min_dom
+
+
 def prune_obs(obs: List[ObRec], max_stored: int) -> None:
     while len(obs) > max_stored:
         removed = False
@@ -695,9 +715,10 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, f
     # --- Formatting for Pine-like alerts ---
     def format_new_ob(ob: ObRec) -> str:
         side = "BULL" if ob.is_bull else "BEAR"
+        dom = max(ob.bull_pct, ob.bear_pct)
         return (
             f"[NEW OB] {symbol} | {side} | top={ob.top} bottom={ob.bottom} "
-            f"| created_time={ob.created_time}"
+            f"| dominance={dom}% | created_time={ob.created_time}"
         )
 
     # --- Retest formatting already exists: format_triangle(...) ---
@@ -793,7 +814,7 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, f
                     if best_idx is not None and not gap_leg:
                         top = h[best_idx]
                         bottom = l[best_idx]
-                        if not ob_overlaps_active(obs, top, bottom):
+                        if passes_big_ob_filter(tot_vol, bull_vol, bear_vol) and not ob_overlaps_active(obs, top, bottom):
                             ob = add_ob_from_poc(obs, best_idx, ts[best_idx], top, bottom, False, tot_vol, bull_vol, bear_vol, bos_idx_bear, ts[bos_idx_bear], max_stored)
                             ev_new_bear_ob = True
             # Pine resets swing low state after processing
@@ -824,7 +845,7 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, f
                     if best_idx2 is not None and not gap_leg2:
                         top2 = h[best_idx2]
                         bottom2 = l[best_idx2]
-                        if not ob_overlaps_active(obs, top2, bottom2):
+                        if passes_big_ob_filter(tot_vol, bull_vol, bear_vol) and not ob_overlaps_active(obs, top2, bottom2):
                             ob = add_ob_from_poc(obs, best_idx2, ts[best_idx2], top2, bottom2, True, tot_vol, bull_vol, bear_vol, bos_idx_bull, ts[bos_idx_bull], max_stored)
                             ev_new_bull_ob = True
             # Pine resets swing high state after processing
@@ -886,16 +907,12 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, f
                     ob.retest_index = retest_bar
                     ob.retest_time = ts[retest_bar]
 
-                    last_side_bar = last_bull_retest_bar if ob.is_bull else last_bear_retest_bar
-                    can_log = (last_side_bar is None) or ((retest_bar - last_side_bar) >= 4)
-
-                    if can_log:
-                        if ob.is_bull:
-                            ev_bull_retest = True
-                            last_bull_retest_bar = retest_bar
-                        else:
-                            ev_bear_retest = True
-                            last_bear_retest_bar = retest_bar
+                    if ob.is_bull:
+                        ev_bull_retest = True
+                        last_bull_retest_bar = retest_bar
+                    else:
+                        ev_bear_retest = True
+                        last_bear_retest_bar = retest_bar
 
         # Emit alerts ONLY on last candle (scanner behavior), and only once per candle time.
         if bi == last_idx:
