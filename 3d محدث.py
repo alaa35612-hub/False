@@ -59,6 +59,11 @@ CONFIG = {
     "max_stored_obs": 50,
     "poc_bins": 40,
 
+    # ==================== BIG OB FILTER ====================
+    "filter_big_ob_only": True,
+    "big_ob_min_range_pct": 0.20,      # OB range as % of close price (0.20 = 0.20%)
+    "big_ob_min_leg_multiplier": 1.8,  # OB range must be >= (avg candle range in BOS leg * multiplier)
+
     # ==================== TOUCH ALERTS ====================
     "alert_touch_zone": False,
     "touch_age_bars": 1,            # ✅ 0 = only current candle (prevents printing old touches)
@@ -574,6 +579,29 @@ def has_gap_between(highs: List[float], lows: List[float], anchor_idx: int, bos_
     return False
 
 
+def is_big_ob_zone(
+    top: float,
+    bottom: float,
+    close_ref: float,
+    avg_leg_range: float,
+) -> bool:
+    if not CONFIG.get("filter_big_ob_only", False):
+        return True
+
+    ob_range = abs(float(top) - float(bottom))
+    if ob_range <= 0:
+        return False
+
+    close_ref = abs(float(close_ref))
+    min_pct = safe_float(CONFIG.get("big_ob_min_range_pct", 0.20), 0.20)
+    pct_ok = (ob_range / close_ref) * 100.0 >= min_pct if close_ref > 0 else False
+
+    mult = safe_float(CONFIG.get("big_ob_min_leg_multiplier", 1.8), 1.8)
+    leg_ok = ob_range >= (float(avg_leg_range) * mult) if avg_leg_range > 0 else False
+
+    return pct_ok and leg_ok
+
+
 def prune_obs(obs: List[ObRec], max_stored: int) -> None:
     while len(obs) > max_stored:
         removed = False
@@ -793,7 +821,8 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, f
                     if best_idx is not None and not gap_leg:
                         top = h[best_idx]
                         bottom = l[best_idx]
-                        if not ob_overlaps_active(obs, top, bottom):
+                        avg_leg_range = math.fsum((h[k] - l[k]) for k in range(from_idx, to_idx + 1)) / float((to_idx - from_idx) + 1)
+                        if is_big_ob_zone(top, bottom, c[bi], avg_leg_range) and not ob_overlaps_active(obs, top, bottom):
                             ob = add_ob_from_poc(obs, best_idx, ts[best_idx], top, bottom, False, tot_vol, bull_vol, bear_vol, bos_idx_bear, ts[bos_idx_bear], max_stored)
                             ev_new_bear_ob = True
             # Pine resets swing low state after processing
@@ -824,7 +853,8 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, f
                     if best_idx2 is not None and not gap_leg2:
                         top2 = h[best_idx2]
                         bottom2 = l[best_idx2]
-                        if not ob_overlaps_active(obs, top2, bottom2):
+                        avg_leg_range = math.fsum((h[k] - l[k]) for k in range(from_idx, to_idx + 1)) / float((to_idx - from_idx) + 1)
+                        if is_big_ob_zone(top2, bottom2, c[bi], avg_leg_range) and not ob_overlaps_active(obs, top2, bottom2):
                             ob = add_ob_from_poc(obs, best_idx2, ts[best_idx2], top2, bottom2, True, tot_vol, bull_vol, bear_vol, bos_idx_bull, ts[bos_idx_bull], max_stored)
                             ev_new_bull_ob = True
             # Pine resets swing high state after processing
