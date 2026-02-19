@@ -16,6 +16,7 @@ Caches saved next to script:
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict, Any
 import time as pytime
@@ -33,15 +34,14 @@ CONFIG = {
     # Exchange / scan
     "exchange_id": "binanceusdm",
     "quote": "USDT",
-    "scan_limit_symbols": 0,          # 0 = all
     "rate_limit_sleep": True,
+    "min_daily_change_pct": 0.0,      # فلتر العملات الصاعدة: استبعد أي عملة أقل من هذه النسبة خلال 24h
+    "sort_by_quote_volume": True,     # ترتيب العملات من الأعلى سيولة (24h quoteVolume)
 
-    # High coins first (sorting/filtering)
-    "high_coins_first": True,
-    "sort_by": "quoteVolume",         # "quoteVolume" | "absPercentage" | "percentage"
-    "min_quote_volume_24h": 2.0,      # set >0 to filter
-    "min_abs_change_24h_pct": 2.0,    # set >0 to filter
-    "top_n_after_sort": 0,        # 0 = all
+    # Parallel scanner (fast + safer limits)
+    "parallel_scan": True,
+    "max_workers": 4,
+    "worker_pause_ms": 125,
 
     # Timeframes / bars
     "timeframe": "1m",
@@ -164,6 +164,33 @@ def safe_float(x: Any, default: float = 0.0) -> float:
     except Exception:
         return default
 
+
+def extract_daily_change_pct(ticker: Dict[str, Any]) -> Optional[float]:
+    pct = ticker.get("percentage")
+    if pct is not None:
+        return safe_float(pct, 0.0)
+
+    info = ticker.get("info") if isinstance(ticker, dict) else None
+    if isinstance(info, dict):
+        raw = info.get("priceChangePercent")
+        if raw is not None:
+            return safe_float(raw, 0.0)
+
+    return None
+
+
+def extract_quote_volume(ticker: Dict[str, Any]) -> float:
+    qv = ticker.get("quoteVolume")
+    if qv is not None:
+        return safe_float(qv, 0.0)
+
+    info = ticker.get("info") if isinstance(ticker, dict) else None
+    if isinstance(info, dict):
+        raw = info.get("quoteVolume")
+        if raw is not None:
+            return safe_float(raw, 0.0)
+
+    return 0.0
 
 def round_half_away_from_zero(x: float) -> int:
     # Pine math.round behavior
@@ -931,60 +958,6 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, f
     return out_msgs, bullish_candidate, candidate_score
 
 
-def sort_and_filter_symbols_high_first(exchange: ccxt.Exchange, symbols: List[str]) -> List[str]:
-    if not CONFIG.get("high_coins_first", True) or not symbols:
-        return symbols
-
-    sort_by = str(CONFIG.get("sort_by", "quoteVolume"))
-    min_qv = safe_float(CONFIG.get("min_quote_volume_24h", 0.0), 0.0)
-    min_abs_pct = safe_float(CONFIG.get("min_abs_change_24h_pct", 0.0), 0.0)
-
-    tickers: Dict[str, Any] = {}
-    try:
-        tickers = exchange.fetch_tickers(symbols)
-    except Exception:
-        try:
-            tickers = exchange.fetch_tickers()
-        except Exception:
-            tickers = {}
-
-    scored: List[Tuple[float, str]] = []
-    for sym in symbols:
-        t = tickers.get(sym) if tickers else None
-        if not t:
-            scored.append((0.0, sym))
-            continue
-
-        quote_vol = safe_float(t.get("quoteVolume"), 0.0)
-        pct = safe_float(t.get("percentage"), 0.0)
-        abs_pct = abs(pct)
-
-        if min_qv > 0 and quote_vol < min_qv:
-            continue
-        if min_abs_pct > 0 and abs_pct < min_abs_pct:
-            continue
-
-        if sort_by == "quoteVolume":
-            score = quote_vol
-        elif sort_by == "absPercentage":
-            score = abs_pct
-        elif sort_by == "percentage":
-            score = pct
-        else:
-            score = quote_vol
-
-        scored.append((score, sym))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    sorted_syms = [s for _, s in scored]
-
-    top_n = int(CONFIG.get("top_n_after_sort", 0) or 0)
-    if top_n > 0:
-        sorted_syms = sorted_syms[:top_n]
-
-    return sorted_syms
-
-
 # ============================================================
 # =========================== SCANNER =========================
 # ============================================================
@@ -1012,29 +985,84 @@ def scan_binance_usdtm() -> None:
         except Exception:
             continue
 
-    if CONFIG.get("scan_limit_symbols", 0) and int(CONFIG["scan_limit_symbols"]) > 0:
-        symbols = symbols[: int(CONFIG["scan_limit_symbols"])]
+    if not symbols:
+        return
 
-    symbols = sort_and_filter_symbols_high_first(exchange, symbols)
+    min_daily_change_pct = safe_float(CONFIG.get("min_daily_change_pct", 0.0), 0.0)
+    sort_by_quote_volume = bool(CONFIG.get("sort_by_quote_volume", True))
 
-    candidates: List[Tuple[float, str]] = []
+    try:
+        tickers = exchange.fetch_tickers(symbols)
+    except Exception:
+        tickers = {}
 
+    symbols_with_rank: List[Tuple[str, float]] = []
     for sym in symbols:
-        try:
-            msgs, is_cand, score = run_symbol(sym, exchange)
+        t = tickers.get(sym, {}) if isinstance(tickers, dict) else {}
+        daily_change_pct = extract_daily_change_pct(t) if isinstance(t, dict) else None
 
-            # prints only selected events
-            for m in msgs:
-                print(m)
+        if daily_change_pct is not None and daily_change_pct < min_daily_change_pct:
+            continue
 
-            if CONFIG.get("print_candidates", True) and is_cand:
-                candidates.append((score, sym))
+        volume_rank = extract_quote_volume(t) if isinstance(t, dict) else 0.0
+        symbols_with_rank.append((sym, volume_rank))
 
-        except Exception:
-            pass
+    if sort_by_quote_volume:
+        symbols_with_rank.sort(key=lambda x: x[1], reverse=True)
 
-        if CONFIG["rate_limit_sleep"]:
-            exchange.sleep(exchange.rateLimit)
+    symbols = [sym for sym, _ in symbols_with_rank]
+
+    if not symbols:
+        print(f"No symbols matched min_daily_change_pct >= {min_daily_change_pct}")
+        return
+
+    symbol_results: Dict[str, Tuple[List[str], bool, float]] = {}
+
+    def create_worker_exchange() -> ccxt.Exchange:
+        return getattr(ccxt, CONFIG["exchange_id"])({
+            "enableRateLimit": True,
+            "options": {"defaultType": "future"},
+        })
+
+    def scan_symbol_worker(sym: str) -> Tuple[str, List[str], bool, float]:
+        worker_exchange = create_worker_exchange()
+        msgs, is_cand, score = run_symbol(sym, worker_exchange)
+        pause_ms = max(0, int(CONFIG.get("worker_pause_ms", 125)))
+        if pause_ms > 0:
+            pytime.sleep(pause_ms / 1000.0)
+        return sym, msgs, is_cand, score
+
+    if CONFIG.get("parallel_scan", True):
+        max_workers = max(1, int(CONFIG.get("max_workers", 4)))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {executor.submit(scan_symbol_worker, sym): sym for sym in symbols}
+
+            for future in as_completed(future_map):
+                try:
+                    sym, msgs, is_cand, score = future.result()
+                except Exception:
+                    continue
+                symbol_results[sym] = (msgs, is_cand, score)
+    else:
+        for sym in symbols:
+            try:
+                msgs, is_cand, score = run_symbol(sym, exchange)
+                symbol_results[sym] = (msgs, is_cand, score)
+            except Exception:
+                pass
+
+            if CONFIG["rate_limit_sleep"]:
+                exchange.sleep(exchange.rateLimit)
+
+    # Process all scanned symbols
+    candidates: List[Tuple[float, str]] = []
+    for sym, (msgs, is_cand, score) in symbol_results.items():
+
+        for m in msgs:
+            print(m)
+
+        if CONFIG.get("print_candidates", True) and is_cand:
+            candidates.append((score, sym))
 
     # print candidates at end of cycle
     if CONFIG.get("print_candidates", True) and candidates:
