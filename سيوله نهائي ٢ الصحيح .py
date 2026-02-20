@@ -1646,7 +1646,7 @@ class SecuritySeries:
     def _get_from_lists(self, data: List[float], offset: int, pending_key: str) -> float:
         total_final = len(data)
         total = self.length()
-        idx = total - 1 - offset
+        idx = int(total - 1 - int(offset))
         if idx < 0:
             return NA
         if self.pending is not None and idx == total_final:
@@ -1671,7 +1671,7 @@ class SecuritySeries:
     def get_time(self, offset: int = 0) -> int:
         total_final = len(self.final_time)
         total = self.length()
-        idx = total - 1 - offset
+        idx = int(total - 1 - int(offset))
         if idx < 0:
             return 0
         if self.pending is not None and idx == total_final:
@@ -1987,6 +1987,62 @@ class SmartMoneyAlgoProE5:
             seen.add(sig)
             latest[key] = payload
         return latest
+
+    def evaluate_custom_strategy(self) -> tuple[bool, str]:
+        """تقييم استراتيجية القناص: سحب سيولة + CHoCH + ملامسة منطقة دخول."""
+        try:
+            close_price = float(self.series.get("close", 0.0))
+            if close_price <= 0 or math.isnan(close_price):
+                return False, ""
+
+            is_bullish = bool(getattr(self, "isCocUp", False))
+            is_bearish = bool(getattr(self, "isCocDn", False))
+            if not (is_bullish or is_bearish):
+                return False, ""
+
+            liquidity_lows_logs = getattr(self, "liquidity_lows_logs", PineArray())
+            liquidity_highs_logs = getattr(self, "liquidity_highs_logs", PineArray())
+            target_logs = liquidity_lows_logs if is_bullish else liquidity_highs_logs
+
+            has_sweep = False
+            swept_liquidity_type = "Sell-side liquidity swept" if is_bullish else "Buy-side liquidity swept"
+            for i in range(int(target_logs.size()) - 1, -1, -1):
+                log = target_logs.get(int(i))
+                if log and isinstance(log, dict) and log.get("status") == "swept":
+                    has_sweep = True
+                    break
+            if not has_sweep:
+                return False, ""
+
+            ob_boxes = getattr(self, "ob_boxes", PineArray())
+            price_in_zone = False
+            for i in range(int(ob_boxes.size()) - 1, -1, -1):
+                ob = ob_boxes.get(int(i))
+                if not isinstance(ob, Box):
+                    continue
+
+                ob_text = str(getattr(ob, "text", ""))
+                is_correct_ob = (
+                    (is_bullish and "bullish" in ob_text.lower())
+                    or (is_bearish and "bearish" in ob_text.lower())
+                )
+                if not is_correct_ob:
+                    continue
+
+                top = max(float(ob.top), float(ob.bottom))
+                bottom = min(float(ob.top), float(ob.bottom))
+                buffer = close_price * 0.0005
+                if (close_price <= top + buffer) and (close_price >= bottom - buffer):
+                    price_in_zone = True
+                    break
+
+            if not price_in_zone:
+                return False, ""
+
+            direction = "🟢 شراء (BULLISH)" if is_bullish else "🔴 بيع (BEARISH)"
+            return True, f"{direction} | {swept_liquidity_type}"
+        except Exception:
+            return False, ""
 
 
     def gather_console_metrics(self) -> Dict[str, Any]:
@@ -9194,61 +9250,23 @@ def scan_binance(
                 if getattr(liq_inputs, "htfTF", "") in ("", None):
                     liq_inputs.htfTF = timeframe
             runtime.process(candles)
-            metrics = runtime.gather_console_metrics()
-            current_price = runtime.series.get("close")
 
-            def _distance_percent(level: float) -> Optional[float]:
-                if not isinstance(current_price, (int, float)) or not isinstance(level, (int, float)):
-                    return None
-                if math.isnan(current_price) or math.isnan(level) or level == 0:
-                    return None
-                return abs(float(current_price) - float(level)) / abs(float(level)) * 100.0
-
-            proximity_threshold = max(0.0, float(PROXIMITY_PERCENT))
-            near_hits: List[Tuple[str, float, float]] = []
-
-            for level_name, level_value in (("PDH", getattr(runtime, "pdh", NA)), ("PDL", getattr(runtime, "pdl", NA))):
-                distance_pct = _distance_percent(level_value)
-                if distance_pct is not None and distance_pct <= proximity_threshold:
-                    near_hits.append((level_name, float(level_value), distance_pct))
-
-            for arr_name in ("highLineArrayHTF", "lowLineArrayHTF"):
-                arr = getattr(runtime, arr_name, PineArray())
-                for i in range(arr.size()):
-                    line = arr.get(i)
-                    if isinstance(line, Line):
-                        y = line.get_y1()
-                        distance_pct = _distance_percent(y)
-                        if distance_pct is not None and distance_pct <= proximity_threshold:
-                            near_hits.append(("Liquidity", float(y), distance_pct))
-
-            for arr_name in ("highBoxArrayHTF", "lowBoxArrayHTF"):
-                arr = getattr(runtime, arr_name, PineArray())
-                for i in range(arr.size()):
-                    box = arr.get(i)
-                    if not isinstance(box, Box):
-                        continue
-                    top = max(box.top, box.bottom)
-                    bottom = min(box.top, box.bottom)
-                    if isinstance(current_price, (int, float)) and not math.isnan(current_price) and bottom <= current_price <= top:
-                        near_hits.append(("Liquidity", float(current_price), 0.0))
-                        continue
-                    for boundary in (bottom, top):
-                        distance_pct = _distance_percent(boundary)
-                        if distance_pct is not None and distance_pct <= proximity_threshold:
-                            near_hits.append(("Liquidity", float(boundary), distance_pct))
-
-            if not near_hits:
+            is_match, signal_text = runtime.evaluate_custom_strategy()
+            if not is_match:
                 return idx, None, None
 
-            near_hits.sort(key=lambda item: item[2])
-            best_level_type, best_level_price, best_distance_pct = near_hits[0]
+            metrics = runtime.gather_console_metrics()
+            current_close = float(runtime.series.get("close", 0.0))
 
-            if EVENT_PRINT_TOGGLES.get("PRICE_NEAR_LIQUIDITY", True):
-                print(
-                    f"[X] {_format_symbol(symbol)} - Near {best_level_type} (Distance: {best_distance_pct:.2f}%).",
-                    flush=True,
-                )
+            print(f"\n{'=' * 50}", flush=True)
+            print(
+                f"🎯 [فرصة قنص] {ANSI_BOLD}{ANSI_VALUE_ZERO}{symbol}{ANSI_RESET} | {timeframe}",
+                flush=True,
+            )
+            print(f"📊 الاتجاه: {signal_text}", flush=True)
+            print(f"💰 السعر الحالي: {current_close:.5f}", flush=True)
+            print("✅ الحالة: سحب سيولة + CHoCH + السعر في منطقة الدخول", flush=True)
+            print(f"{'=' * 50}\n", flush=True)
 
             metrics["daily_change_percent"] = daily_change
             summary = {
@@ -9260,12 +9278,9 @@ def scan_binance(
                 "metrics": metrics,
                 "strategy": {
                     "decision": "PASS",
-                    "reasons": ["PRICE_NEAR_LIQUIDITY"],
-                    "current_price": float(current_price) if isinstance(current_price, (int, float)) else None,
-                    "level_type": best_level_type,
-                    "level_price": best_level_price,
-                    "distance_percent": best_distance_pct,
-                    "threshold_percent": proximity_threshold,
+                    "reasons": ["SWEEP_CHOCH_OB_TOUCH"],
+                    "current_price": current_close,
+                    "signal": signal_text,
                 },
             }
             if not EVENT_PRINT_ONLY:
