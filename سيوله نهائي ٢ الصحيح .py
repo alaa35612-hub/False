@@ -241,6 +241,13 @@ PRINT_LIQUIDITY_TOUCH_ONCE = True
 EVENT_PRINT_ENABLED = True
 EVENT_PRINT_MAX_AGE_BARS = 5
 
+# -----------------------------------------------------------------------------
+# إعدادات دقة الملامسة على الفريم الصغير (LTF Touch Precision)
+# -----------------------------------------------------------------------------
+LTF_PRECISION_ENABLED = True
+LTF_TIMEFRAME = "1m"
+LTF_MAX_AGE_MINUTES = 15
+
 # تفعيل/تعطيل طباعة كل حدث جديد (مفاتيح الطباعة)
 # إذا كان المفتاح False فلن يتم طباعته حتى لو كان موجوداً في EVENT_PRINT_KEYS.
 EVENT_PRINT_TOGGLES = {
@@ -1695,8 +1702,10 @@ class SmartMoneyAlgoProE5:
         inputs: Optional[IndicatorInputs] = None,
         base_timeframe: Optional[str] = None,
         tracer: Optional[ExecutionTracer] = None,
+        ltf_candles: Optional[List[Dict[str, float]]] = None,
     ) -> None:
         self.inputs = inputs or IndicatorInputs()
+        self.ltf_candles = ltf_candles or []
         self.series = SeriesAccessor()
         self.base_tf_seconds: Optional[int] = _parse_timeframe_to_seconds(base_timeframe, None)
         self.base_timeframe = base_timeframe or ""
@@ -1928,6 +1937,34 @@ class SmartMoneyAlgoProE5:
         )
         print(f"{ANSI_BOLD}{label}{ANSI_RESET}: {colored_display}", flush=True)
 
+    def _refine_touch_time(
+        self,
+        htf_time: int,
+        target_top: Optional[float],
+        target_bottom: Optional[float],
+    ) -> int:
+        """Search LTF candles for the precise minute when the zone was touched."""
+        if not self.ltf_candles:
+            return htf_time
+        if target_top is None or target_bottom is None:
+            return htf_time
+
+        top = max(float(target_top), float(target_bottom))
+        bottom = min(float(target_top), float(target_bottom))
+        for candle in reversed(self.ltf_candles):
+            c_time_raw = candle.get("time")
+            c_high = _coerce_float(candle.get("high"))
+            c_low = _coerce_float(candle.get("low"))
+            if not isinstance(c_time_raw, (int, float)):
+                continue
+            c_time = int(c_time_raw)
+            if math.isnan(c_high) or math.isnan(c_low):
+                continue
+            if c_low <= top and c_high >= bottom and c_time >= int(htf_time):
+                return c_time
+
+        return htf_time
+
     def _record_console_event(self, key: str, payload: Dict[str, Any]) -> None:
         """Store console event (do not print during historical backfills).
 
@@ -1935,6 +1972,40 @@ class SmartMoneyAlgoProE5:
         يؤدي إلى سيل كبير من الإشعارات القديمة. لذلك نكتفي بتسجيل الحدث هنا فقط،
         ثم نطبع/نرسل أحدث الأحداث بعد انتهاء المعالجة (انظر scan_binance).
         """
+
+        status = str(payload.get("status", ""))
+        if LTF_PRECISION_ENABLED and (
+            status in ("touched", "retest", "breaker")
+            or "TOUCH" in key
+            or "SWEEP" in key
+        ):
+            original_time = payload.get("time", 0)
+            if isinstance(original_time, (int, float)):
+                price_val = payload.get("price")
+                target_top: Optional[float] = None
+                target_bottom: Optional[float] = None
+                if (
+                    isinstance(price_val, tuple)
+                    and len(price_val) == 2
+                    and all(isinstance(v, (int, float)) for v in price_val)
+                ):
+                    target_bottom, target_top = min(price_val), max(price_val)
+                elif isinstance(price_val, (int, float)):
+                    target_top = float(price_val)
+                    target_bottom = float(price_val)
+
+                refined_time = self._refine_touch_time(int(original_time), target_top, target_bottom)
+                payload["time"] = refined_time
+                payload["time_display"] = format_timestamp(refined_time)
+
+        if LTF_PRECISION_ENABLED:
+            event_time = payload.get("time", 0)
+            if isinstance(event_time, (int, float)) and event_time > 0:
+                current_time_ms = int(time.time() * 1000)
+                age_in_minutes = (current_time_ms - int(event_time)) / 60000.0
+                if age_in_minutes > LTF_MAX_AGE_MINUTES:
+                    return
+
         self.console_event_log[key] = payload
 
     def _collect_latest_console_events(self) -> Dict[str, Any]:
@@ -9182,7 +9253,26 @@ def scan_binance(
                             threshold=SCANNER_PRICE_CHANGE_MIN_ABS_PERCENT,
                         )
                     return idx, None, None
-            runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
+            ltf_candles_data: List[Dict[str, float]] = []
+            if LTF_PRECISION_ENABLED:
+                try:
+                    ltf_limit = max(60, int(LTF_MAX_AGE_MINUTES * 1.5))
+                    ltf_candles_data = fetch_ohlcv(
+                        _get_exchange(),
+                        symbol,
+                        LTF_TIMEFRAME,
+                        limit=ltf_limit,
+                        fast_scan=fast_scan,
+                    )
+                except Exception as exc:
+                    print(f"تعذر جلب شموع {LTF_TIMEFRAME} لـ {symbol}: {exc}", flush=True)
+
+            runtime = SmartMoneyAlgoProE5(
+                inputs=inputs,
+                base_timeframe=timeframe,
+                tracer=tracer,
+                ltf_candles=ltf_candles_data,
+            )
             if hasattr(runtime, "inputs") and hasattr(runtime.inputs, "liquidity"):
                 liq_inputs = runtime.inputs.liquidity
                 if getattr(liq_inputs, "htfTF", "") in ("", None):
