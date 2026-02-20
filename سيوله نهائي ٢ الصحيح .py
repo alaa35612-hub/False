@@ -231,6 +231,9 @@ SCANNER_PRICE_CHANGE_FILTER_ENABLED = False
 SCANNER_PRICE_CHANGE_LOOKBACK_BARS = 24  # عدد الشموع للحساب
 SCANNER_PRICE_CHANGE_MIN_ABS_PERCENT = 10.0  # تجاهل العملات التي تحركت أكثر من هذه النسبة (+/-)
 
+# نسبة القرب المسموحة من مستويات السيولة (مثال 0.1 = 0.1%)
+PROXIMITY_PERCENT = 0.1
+
 # تفعيل/تعطيل طباعة لمس السيولة وإنشاء مناطق سيولة جديدة
 PRINT_LIQUIDITY_TOUCH = True
 PRINT_LIQUIDITY_LEVELS = False
@@ -286,6 +289,7 @@ EVENT_PRINT_TOGGLES = {
     "KEY_LEVEL_WEEKLY": False,
     "GREEN_CIRCLE": False,
     "RED_CIRCLE": False,
+    "PRICE_NEAR_LIQUIDITY": True,
 }
 
 # طباعة ملامسة Golden zone لأول مرة فقط
@@ -421,6 +425,7 @@ EVENT_PRINT_KEYS = {
     "KEY_LEVEL_WEEKLY",
     "GREEN_CIRCLE",
     "RED_CIRCLE",
+    "PRICE_NEAR_LIQUIDITY",
 }
 
 EVENT_PRINT_LABELS = {
@@ -466,6 +471,7 @@ EVENT_PRINT_LABELS = {
     "KEY_LEVEL_WEEKLY": "Key Levels Weekly",
     "GREEN_CIRCLE": "الدوائر الخضراء",
     "RED_CIRCLE": "الدوائر الحمراء",
+    "PRICE_NEAR_LIQUIDITY": "Price Near Liquidity",
 }
 
 
@@ -9189,107 +9195,60 @@ def scan_binance(
                     liq_inputs.htfTF = timeframe
             runtime.process(candles)
             metrics = runtime.gather_console_metrics()
-            latest_events = metrics.get("latest_events") or {}
-            recent_hits, recent_times = _collect_recent_event_hits(runtime.series, latest_events, bars=window)
+            current_price = runtime.series.get("close")
 
-            def _touch_or_inside_liquidity() -> tuple[bool, Optional[str]]:
-                low = runtime.series.get("low")
-                high = runtime.series.get("high")
-                if math.isnan(low) or math.isnan(high):
-                    return False, None
-                for arr_name in ("highLineArrayHTF", "lowLineArrayHTF"):
-                    arr = getattr(runtime, arr_name, PineArray())
-                    for i in range(arr.size()):
-                        line = arr.get(i)
-                        if isinstance(line, Line):
-                            y = line.get_y1()
-                            if low <= y <= high:
-                                return True, f"line@{format_price(y)}"
-                for arr_name in ("highBoxArrayHTF", "lowBoxArrayHTF"):
-                    arr = getattr(runtime, arr_name, PineArray())
-                    for i in range(arr.size()):
-                        box = arr.get(i)
-                        if isinstance(box, Box):
-                            top = max(box.top, box.bottom)
-                            bottom = min(box.top, box.bottom)
-                            if low <= top and high >= bottom:
-                                return True, f"box {format_price(bottom)} → {format_price(top)}"
-                return False, None
+            def _distance_percent(level: float) -> Optional[float]:
+                if not isinstance(current_price, (int, float)) or not isinstance(level, (int, float)):
+                    return None
+                if math.isnan(current_price) or math.isnan(level) or level == 0:
+                    return None
+                return abs(float(current_price) - float(level)) / abs(float(level)) * 100.0
 
-            liquidity_touch_or_inside, liquidity_detail = _touch_or_inside_liquidity()
-            if liquidity_touch_or_inside and PRINT_LIQUIDITY_TOUCH_ONCE and liquidity_detail:
-                token = f"{symbol}|{timeframe}|{liquidity_detail}"
-                with _LIQ_TOUCH_LOCK:
-                    if token in _LIQ_TOUCH_SEEN:
-                        liquidity_touch_or_inside = False
-                        liquidity_detail = None
-                    else:
-                        _LIQ_TOUCH_SEEN.add(token)
-                        _save_json_set(_LIQ_TOUCH_CACHE_PATH, _LIQ_TOUCH_SEEN)
-            touch_time = runtime.series.get_time(0)
-            touch_recent = isinstance(touch_time, (int, float)) and int(touch_time) in recent_times
+            proximity_threshold = max(0.0, float(PROXIMITY_PERCENT))
+            near_hits: List[Tuple[str, float, float]] = []
 
-            liquidity_sweep_recent = False
-            liquidity_sweep_detail = None
-            sweep_payload = latest_events.get("LIQUIDITY_TOUCH")
-            if isinstance(sweep_payload, dict):
-                sweep_ts = sweep_payload.get("time") or sweep_payload.get("ts") or sweep_payload.get("timestamp")
-                if isinstance(sweep_ts, (int, float)) and int(sweep_ts) in recent_times:
-                    liquidity_sweep_recent = True
-                    sweep_display = sweep_payload.get("display")
-                    if isinstance(sweep_display, str) and sweep_display.strip():
-                        liquidity_sweep_detail = sweep_display
-                    else:
-                        sweep_price = sweep_payload.get("price")
-                        if isinstance(sweep_price, (int, float)):
-                            liquidity_sweep_detail = f"line@{format_price(sweep_price)}"
+            for level_name, level_value in (("PDH", getattr(runtime, "pdh", NA)), ("PDL", getattr(runtime, "pdl", NA))):
+                distance_pct = _distance_percent(level_value)
+                if distance_pct is not None and distance_pct <= proximity_threshold:
+                    near_hits.append((level_name, float(level_value), distance_pct))
 
-            liquidity_created_recent = False
-            liquidity_created_detail = None
-            liq_payload = latest_events.get("LIQUIDITY_LEVELS")
-            if isinstance(liq_payload, dict):
-                liq_ts = liq_payload.get("time") or liq_payload.get("ts") or liq_payload.get("timestamp")
-                if isinstance(liq_ts, (int, float)) and int(liq_ts) in recent_times:
-                    liquidity_created_recent = True
-                    liq_price = liq_payload.get("price")
-                    if isinstance(liq_price, (int, float)):
-                        liquidity_created_detail = f"line@{format_price(liq_price)}"
+            for arr_name in ("highLineArrayHTF", "lowLineArrayHTF"):
+                arr = getattr(runtime, arr_name, PineArray())
+                for i in range(arr.size()):
+                    line = arr.get(i)
+                    if isinstance(line, Line):
+                        y = line.get_y1()
+                        distance_pct = _distance_percent(y)
+                        if distance_pct is not None and distance_pct <= proximity_threshold:
+                            near_hits.append(("Liquidity", float(y), distance_pct))
 
-            if not (liquidity_touch_or_inside and touch_recent) and not liquidity_created_recent and not liquidity_sweep_recent:
-                if not SILENT_WHEN_NO_EVENTS:
-                    print(
-                        f"تخطي {_format_symbol(symbol)} لعدم وجود أحداث ضمن آخر {window} شموع",
-                        flush=True,
-                    )
-                if tracer and tracer.enabled:
-                    tracer.log(
-                        "scan",
-                        "symbol_skipped_stale_events",
-                        timestamp=runtime.series.get_time(0) or None,
-                        symbol=symbol,
-                        timeframe=timeframe,
-                        reference_times=recent_times,
-                        window=window,
-                    )
+            for arr_name in ("highBoxArrayHTF", "lowBoxArrayHTF"):
+                arr = getattr(runtime, arr_name, PineArray())
+                for i in range(arr.size()):
+                    box = arr.get(i)
+                    if not isinstance(box, Box):
+                        continue
+                    top = max(box.top, box.bottom)
+                    bottom = min(box.top, box.bottom)
+                    if isinstance(current_price, (int, float)) and not math.isnan(current_price) and bottom <= current_price <= top:
+                        near_hits.append(("Liquidity", float(current_price), 0.0))
+                        continue
+                    for boundary in (bottom, top):
+                        distance_pct = _distance_percent(boundary)
+                        if distance_pct is not None and distance_pct <= proximity_threshold:
+                            near_hits.append(("Liquidity", float(boundary), distance_pct))
+
+            if not near_hits:
                 return idx, None, None
 
-            reasons: List[str] = []
-            if liquidity_created_recent:
-                reasons.append("Created")
-            if liquidity_sweep_recent:
-                reasons.append("Sweep")
-            if liquidity_touch_or_inside and touch_recent:
-                reasons.append("Touched/Inside")
+            near_hits.sort(key=lambda item: item[2])
+            best_level_type, best_level_price, best_distance_pct = near_hits[0]
 
-            print(f"\n{_format_symbol(symbol)} ({timeframe})", flush=True)
-            print(f"decision: PASS", flush=True)
-            print(f"reason: {', '.join(reasons)}", flush=True)
-            if liquidity_touch_or_inside and liquidity_detail and touch_recent:
-                print(f"liquidity_level: {liquidity_detail}", flush=True)
-            if liquidity_created_recent and liquidity_created_detail:
-                print(f"liquidity_created: {liquidity_created_detail}", flush=True)
-            if liquidity_sweep_recent and liquidity_sweep_detail:
-                print(f"liquidity_sweep: {liquidity_sweep_detail}", flush=True)
+            if EVENT_PRINT_TOGGLES.get("PRICE_NEAR_LIQUIDITY", True):
+                print(
+                    f"[X] {_format_symbol(symbol)} - Near {best_level_type} (Distance: {best_distance_pct:.2f}%).",
+                    flush=True,
+                )
 
             metrics["daily_change_percent"] = daily_change
             summary = {
@@ -9301,13 +9260,12 @@ def scan_binance(
                 "metrics": metrics,
                 "strategy": {
                     "decision": "PASS",
-                    "reasons": reasons,
-                    "liquidity_touch_or_inside": liquidity_touch_or_inside,
-                    "liquidity_sweep_recent": liquidity_sweep_recent,
-                    "liquidity_created_recent": liquidity_created_recent,
-                    "liquidity_detail": liquidity_detail,
-                    "liquidity_created_detail": liquidity_created_detail,
-                    "liquidity_sweep_detail": liquidity_sweep_detail,
+                    "reasons": ["PRICE_NEAR_LIQUIDITY"],
+                    "current_price": float(current_price) if isinstance(current_price, (int, float)) else None,
+                    "level_type": best_level_type,
+                    "level_price": best_level_price,
+                    "distance_percent": best_distance_pct,
+                    "threshold_percent": proximity_threshold,
                 },
             }
             if not EVENT_PRINT_ONLY:
