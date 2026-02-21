@@ -9345,10 +9345,11 @@ def scan_binance(
                     if isinstance(liq_price, (int, float)):
                         liquidity_created_detail = f"line@{format_price(liq_price)}"
 
-            if not (liquidity_touch_or_inside and touch_recent) and not liquidity_created_recent and not liquidity_sweep_recent:
+            # طباعة العملات فقط عندما يكون السعر داخل/يلامس منطقة LIQUIDITY LEVELS
+            if not (liquidity_touch_or_inside and touch_recent):
                 if not SILENT_WHEN_NO_EVENTS:
                     print(
-                        f"تخطي {_format_symbol(symbol)} لعدم وجود أحداث ضمن آخر {window} شموع",
+                        f"تخطي {_format_symbol(symbol)} لأنه ليس داخل منطقة LIQUIDITY LEVELS ضمن آخر {window} شموع",
                         flush=True,
                     )
                 if tracer and tracer.enabled:
@@ -9363,23 +9364,13 @@ def scan_binance(
                     )
                 return idx, None, None
 
-            reasons: List[str] = []
-            if liquidity_created_recent:
-                reasons.append("Created")
-            if liquidity_sweep_recent:
-                reasons.append("Sweep")
-            if liquidity_touch_or_inside and touch_recent:
-                reasons.append("Touched/Inside")
+            reasons: List[str] = ["Touched/Inside"]
 
             print(f"\n{_format_symbol(symbol)} ({timeframe})", flush=True)
             print(f"decision: PASS", flush=True)
             print(f"reason: {', '.join(reasons)}", flush=True)
             if liquidity_touch_or_inside and liquidity_detail and touch_recent:
                 print(f"liquidity_level: {liquidity_detail}", flush=True)
-            if liquidity_created_recent and liquidity_created_detail:
-                print(f"liquidity_created: {liquidity_created_detail}", flush=True)
-            if liquidity_sweep_recent and liquidity_sweep_detail:
-                print(f"liquidity_sweep: {liquidity_sweep_detail}", flush=True)
 
             metrics["daily_change_percent"] = daily_change
             summary = {
