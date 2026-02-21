@@ -8215,6 +8215,7 @@ def _bulk_fetch_recent_ohlcv(
     timeframe: str,
     candle_window: int,
     *,
+    exchange_name: str = "binance",
     max_workers: Optional[int] = None,
 ) -> Dict[str, Sequence[Sequence[Any]]]:
     """Fetch OHLC candles in parallel when possible to speed up filtering."""
@@ -8231,9 +8232,21 @@ def _bulk_fetch_recent_ohlcv(
             for symbol in unique_symbols
         }
 
-    rest_mapping: Dict[str, Optional[str]] = {
-        symbol: _binance_linear_symbol_id(symbol) for symbol in unique_symbols
-    }
+    normalized_exchange = _normalize_exchange_name(exchange_name)
+    # Only Binance has the dedicated ultra-fast REST path in this scanner.
+    # For other exchanges (e.g. MEXC), we use ccxt fetch_ohlcv directly.
+    if normalized_exchange != "binance":
+        return {
+            symbol: _fetch_recent_ohlcv(exchange, symbol, timeframe, candle_window)
+            for symbol in unique_symbols
+        }
+
+    rest_mapping: Dict[str, Optional[str]] = {}
+    markets = getattr(exchange, "markets", {}) or {}
+    for symbol in unique_symbols:
+        market = markets.get(symbol, {}) if isinstance(markets, dict) else {}
+        market_id = market.get("id") if isinstance(market, dict) else None
+        rest_mapping[symbol] = str(market_id) if market_id else _binance_linear_symbol_id(symbol)
 
     results: Dict[str, Sequence[Sequence[Any]]] = {}
     endpoint = "https://fapi.binance.com/fapi/v1/klines"
@@ -8275,10 +8288,12 @@ def _bulk_fetch_recent_ohlcv(
             response.raise_for_status()
             payload = response.json()
         except Exception as exc:  # pragma: no cover - network variability
-            print(
-                f"تعذر جلب شموع {symbol} عبر واجهة Binance السريعة: {exc}",
-                flush=True,
-            )
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status not in (400, 404):
+                print(
+                    f"تعذر جلب شموع {symbol} عبر واجهة Binance السريعة: {exc}",
+                    flush=True,
+                )
             return _fetch_recent_ohlcv(exchange, symbol, timeframe, candle_window)
 
         if not isinstance(payload, list):
@@ -8323,6 +8338,23 @@ def _fetch_recent_ohlcv(
         return []
 
 
+def _is_binance_usdtm_tradeable_market(market: Dict[str, Any]) -> bool:
+    if not isinstance(market, dict):
+        return False
+    if not (market.get("linear") and market.get("quote") == "USDT" and market.get("type") == "swap"):
+        return False
+    if market.get("active") is False:
+        return False
+    info = market.get("info") if isinstance(market.get("info"), dict) else {}
+    contract_type = str(info.get("contractType") or "").upper()
+    status = str(info.get("status") or "").upper()
+    if contract_type and contract_type != "PERPETUAL":
+        return False
+    if status and status not in {"TRADING", "TRADING_ACTIVE"}:
+        return False
+    return True
+
+
 def _binance_pick_symbols(
     exchange: Any,
     limit: int,
@@ -8363,7 +8395,7 @@ def _binance_pick_symbols(
     usdtm_markets: List[Dict[str, Any]] = [
         market
         for market in markets.values()
-        if market.get("linear") and market.get("quote") == "USDT" and market.get("type") == "swap" and market.get("active")
+        if _is_binance_usdtm_tradeable_market(market)
     ]
     if not usdtm_markets:
         print("لم يتم العثور على عقود Binance USDT-M نشطة.")
@@ -8593,7 +8625,7 @@ def fetch_binance_usdtm_symbols(
     symbols = [
         symbol
         for symbol, market in markets.items()
-        if market.get("linear") and market.get("quote") == "USDT" and market.get("type") == "swap"
+        if _is_binance_usdtm_tradeable_market(market)
     ]
     symbols.sort()
     if limit and limit > 0:
@@ -9199,6 +9231,7 @@ def scan_binance(
                 all_symbols,
                 timeframe,
                 limit,
+                exchange_name=normalized_exchange,
                 max_workers=SCANNER_BULK_OHLCV_MAX_WORKERS,
             )
         except Exception as exc:
@@ -9623,7 +9656,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         dest="continuous_scan",
         action=_OptionalBoolAction,
         default=SCANNER_CONTINUOUS,
-        help="تشغيل ماسح Binance في حلقة متواصلة بدون توقف (يدعم true/false)",
+        help="تشغيل ماسح العقود في حلقة متواصلة بدون توقف (يدعم true/false)",
     )
     parser.add_argument(
         "--no-continuous",
