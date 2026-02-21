@@ -208,10 +208,12 @@ TELEGRAM_MAX_MESSAGE_CHARS = 3800  # أقل من 4096 لتجنب رفض تيلي
 # -----------------------------------------------------------------------------
 SCANNER_TIMEFRAME = "15m"
 SCANNER_LOOKBACK = 500
-SCANNER_CONCURRENCY = 5
+# المنصة الافتراضية للماسح: binance أو mexc
+SCANNER_EXCHANGE = "binance"
+SCANNER_CONCURRENCY = 10
 SCANNER_FAST_SCAN = True
 SCANNER_CONTINUOUS = False
-SCANNER_INTERVAL = 2.0
+SCANNER_INTERVAL = 1.0
 SCANNER_MIN_DAILY_CHANGE = 0.0
 # حد السرعة (بالـثواني) بين الطلبات لتفادي الحظر
 SCANNER_RATE_LIMIT_SECONDS = 0.2
@@ -221,7 +223,7 @@ SCANNER_CACHE_MAX_BARS = 500
 
 # تسريع المسح عبر جلب شموع متعددة بالواجهة السريعة
 SCANNER_BULK_OHLCV_ENABLED = True
-SCANNER_BULK_OHLCV_MAX_WORKERS = 14
+SCANNER_BULK_OHLCV_MAX_WORKERS = 24
 # فلتر الحجم (يتجاهل العملات ذات حجم كبير حسب الحد)
 SCANNER_VOLUME_FILTER_ENABLED = False
 SCANNER_MAX_QUOTE_VOLUME = 2_000_000_000.0  # قيمة حجم (Quote Volume) لتجاهل العملات الأعلى منها
@@ -478,6 +480,7 @@ EVENT_PRINT_LABELS = {
 
 @dataclass(frozen=True)
 class _EditorAutorunDefaults:
+    exchange: str = SCANNER_EXCHANGE
     timeframe: str = SCANNER_TIMEFRAME
     candle_limit: int = 500
     max_symbols: int = 600
@@ -8212,6 +8215,7 @@ def _bulk_fetch_recent_ohlcv(
     timeframe: str,
     candle_window: int,
     *,
+    exchange_name: str = "binance",
     max_workers: Optional[int] = None,
 ) -> Dict[str, Sequence[Sequence[Any]]]:
     """Fetch OHLC candles in parallel when possible to speed up filtering."""
@@ -8228,9 +8232,21 @@ def _bulk_fetch_recent_ohlcv(
             for symbol in unique_symbols
         }
 
-    rest_mapping: Dict[str, Optional[str]] = {
-        symbol: _binance_linear_symbol_id(symbol) for symbol in unique_symbols
-    }
+    normalized_exchange = _normalize_exchange_name(exchange_name)
+    # Only Binance has the dedicated ultra-fast REST path in this scanner.
+    # For other exchanges (e.g. MEXC), we use ccxt fetch_ohlcv directly.
+    if normalized_exchange != "binance":
+        return {
+            symbol: _fetch_recent_ohlcv(exchange, symbol, timeframe, candle_window)
+            for symbol in unique_symbols
+        }
+
+    rest_mapping: Dict[str, Optional[str]] = {}
+    markets = getattr(exchange, "markets", {}) or {}
+    for symbol in unique_symbols:
+        market = markets.get(symbol, {}) if isinstance(markets, dict) else {}
+        market_id = market.get("id") if isinstance(market, dict) else None
+        rest_mapping[symbol] = str(market_id) if market_id else _binance_linear_symbol_id(symbol)
 
     results: Dict[str, Sequence[Sequence[Any]]] = {}
     endpoint = "https://fapi.binance.com/fapi/v1/klines"
@@ -8272,10 +8288,12 @@ def _bulk_fetch_recent_ohlcv(
             response.raise_for_status()
             payload = response.json()
         except Exception as exc:  # pragma: no cover - network variability
-            print(
-                f"تعذر جلب شموع {symbol} عبر واجهة Binance السريعة: {exc}",
-                flush=True,
-            )
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status not in (400, 404):
+                print(
+                    f"تعذر جلب شموع {symbol} عبر واجهة Binance السريعة: {exc}",
+                    flush=True,
+                )
             return _fetch_recent_ohlcv(exchange, symbol, timeframe, candle_window)
 
         if not isinstance(payload, list):
@@ -8320,6 +8338,23 @@ def _fetch_recent_ohlcv(
         return []
 
 
+def _is_binance_usdtm_tradeable_market(market: Dict[str, Any]) -> bool:
+    if not isinstance(market, dict):
+        return False
+    if not (market.get("linear") and market.get("quote") == "USDT" and market.get("type") == "swap"):
+        return False
+    if market.get("active") is False:
+        return False
+    info = market.get("info") if isinstance(market.get("info"), dict) else {}
+    contract_type = str(info.get("contractType") or "").upper()
+    status = str(info.get("status") or "").upper()
+    if contract_type and contract_type != "PERPETUAL":
+        return False
+    if status and status not in {"TRADING", "TRADING_ACTIVE"}:
+        return False
+    return True
+
+
 def _binance_pick_symbols(
     exchange: Any,
     limit: int,
@@ -8360,7 +8395,7 @@ def _binance_pick_symbols(
     usdtm_markets: List[Dict[str, Any]] = [
         market
         for market in markets.values()
-        if market.get("linear") and market.get("quote") == "USDT" and market.get("type") == "swap" and market.get("active")
+        if _is_binance_usdtm_tradeable_market(market)
     ]
     if not usdtm_markets:
         print("لم يتم العثور على عقود Binance USDT-M نشطة.")
@@ -8515,6 +8550,60 @@ def _binance_pick_symbols(
     return BinanceSymbolSelection(final, prioritized_symbols, used_height_filter, have_ticker_data)
 
 
+def _normalize_exchange_name(name: str) -> str:
+    normalized = (name or "").strip().lower()
+    if normalized in {"binance", "binanceusdm", "binance-usdm", "binance_futures"}:
+        return "binance"
+    if normalized in {"mexc", "mexcusdtm", "mexc-usdtm", "mexc_futures"}:
+        return "mexc"
+    raise ValueError(f"منصة غير مدعومة: {name}. الخيارات المتاحة: binance أو mexc")
+
+
+def create_exchange_client(exchange_name: str) -> Any:
+    if ccxt is None:
+        raise RuntimeError("ccxt is not available")
+    name = _normalize_exchange_name(exchange_name)
+    if name == "binance":
+        return ccxt.binanceusdm({"enableRateLimit": True})
+    return ccxt.mexc({"enableRateLimit": True, "options": {"defaultType": "swap"}})
+
+
+def fetch_usdtm_symbols(
+    exchange: Any,
+    *,
+    exchange_name: str,
+    limit: Optional[int] = None,
+    explicit: Optional[str] = None,
+    selector: Optional['BinanceSymbolSelectorConfig'] = None,
+) -> List[str]:
+    name = _normalize_exchange_name(exchange_name)
+    if name == "binance":
+        return fetch_binance_usdtm_symbols(exchange, limit=limit, explicit=explicit, selector=selector)
+
+    if explicit:
+        symbols = [item.strip() for item in explicit.split(",") if item.strip()]
+        if limit and limit > 0:
+            return symbols[:limit]
+        return symbols
+
+    markets = exchange.load_markets()
+    symbols: List[str] = []
+    for symbol, market in markets.items():
+        if not isinstance(market, dict):
+            continue
+        if not market.get("swap"):
+            continue
+        if market.get("quote") != "USDT":
+            continue
+        if market.get("linear") is False:
+            continue
+        symbols.append(symbol)
+    symbols.sort()
+    if limit and limit > 0:
+        return symbols[:limit]
+    return symbols
+
+
 def fetch_binance_usdtm_symbols(
     exchange: Any,
     *,
@@ -8536,7 +8625,7 @@ def fetch_binance_usdtm_symbols(
     symbols = [
         symbol
         for symbol, market in markets.items()
-        if market.get("linear") and market.get("quote") == "USDT" and market.get("type") == "swap"
+        if _is_binance_usdtm_tradeable_market(market)
     ]
     symbols.sort()
     if limit and limit > 0:
@@ -8544,7 +8633,7 @@ def fetch_binance_usdtm_symbols(
     return symbols
 
 
-def _ensure_markets_loaded(exchange: Any) -> bool:
+def _ensure_markets_loaded(exchange: Any, exchange_name: str = "Binance") -> bool:
     """Load exchange markets once per client for faster repeated OHLCV calls."""
 
     markets = getattr(exchange, "markets", None)
@@ -8554,9 +8643,9 @@ def _ensure_markets_loaded(exchange: Any) -> bool:
         _call_with_retries(exchange.load_markets, retries=3)
     except Exception as exc:
         if _is_rate_limit_error(exc):
-            print(f"تحذير: تعذر تحميل أسواق Binance بسبب معدل الطلبات: {exc}", flush=True)
+            print(f"تحذير: تعذر تحميل أسواق {exchange_name} بسبب معدل الطلبات: {exc}", flush=True)
         else:
-            print(f"تحذير: تعذر تحميل أسواق Binance: {exc}", flush=True)
+            print(f"تحذير: تعذر تحميل أسواق {exchange_name}: {exc}", flush=True)
         return False
     return True
 
@@ -9089,6 +9178,7 @@ def scan_binance(
     concurrency: int,
     tracer: 'ExecutionTracer' | None = None,
     *,
+    exchange_name: str = SCANNER_EXCHANGE,
     min_daily_change: float = 0.0,
     inputs: 'IndicatorInputs' | None = None,
     recent_window_bars: int | None = None,
@@ -9098,10 +9188,13 @@ def scan_binance(
 ) -> tuple['SmartMoneyAlgoProE5', list[dict]]:
     if ccxt is None:
         raise RuntimeError("ccxt is not available")
-    exchange = ccxt.binanceusdm({"enableRateLimit": True})
-    _ensure_markets_loaded(exchange)
-    all_symbols = symbols or fetch_binance_usdtm_symbols(
+    normalized_exchange = _normalize_exchange_name(exchange_name)
+    exchange_label = "Binance USDT-M" if normalized_exchange == "binance" else "MEXC Futures USDT-M"
+    exchange = create_exchange_client(normalized_exchange)
+    _ensure_markets_loaded(exchange, exchange_label)
+    all_symbols = symbols or fetch_usdtm_symbols(
         exchange,
+        exchange_name=normalized_exchange,
         limit=max_symbols,
         selector=symbol_selector,
     )
@@ -9138,6 +9231,7 @@ def scan_binance(
                 all_symbols,
                 timeframe,
                 limit,
+                exchange_name=normalized_exchange,
                 max_workers=SCANNER_BULK_OHLCV_MAX_WORKERS,
             )
         except Exception as exc:
@@ -9149,8 +9243,8 @@ def scan_binance(
     def _get_exchange() -> object:
         local_exchange = getattr(exchange_local, "client", None)
         if local_exchange is None:
-            local_exchange = ccxt.binanceusdm({"enableRateLimit": True})
-            if not _ensure_markets_loaded(local_exchange):
+            local_exchange = create_exchange_client(normalized_exchange)
+            if not _ensure_markets_loaded(local_exchange, exchange_label):
                 raise RuntimeError("تعذر تحميل الأسواق بسبب معدل الطلبات")
             exchange_local.client = local_exchange
         return local_exchange
@@ -9285,7 +9379,8 @@ def scan_binance(
             def _touch_or_inside_liquidity() -> tuple[bool, Optional[str]]:
                 low = runtime.series.get("low")
                 high = runtime.series.get("high")
-                if math.isnan(low) or math.isnan(high):
+                close_price = runtime.series.get("close")
+                if math.isnan(low) or math.isnan(high) or math.isnan(close_price):
                     return False, None
                 for arr_name in ("highLineArrayHTF", "lowLineArrayHTF"):
                     arr = getattr(runtime, arr_name, PineArray())
@@ -9302,11 +9397,33 @@ def scan_binance(
                         if isinstance(box, Box):
                             top = max(box.top, box.bottom)
                             bottom = min(box.top, box.bottom)
-                            if low <= top and high >= bottom:
+                            # شرط صارم: السعر الحالي داخل حدود صندوق السيولة بالكامل
+                            if bottom <= close_price <= top:
                                 return True, f"box {format_price(bottom)} → {format_price(top)}"
                 return False, None
 
+            def _inside_golden_zone() -> tuple[bool, Optional[str]]:
+                close_price = runtime.series.get("close")
+                if math.isnan(close_price):
+                    return False, None
+                for key in ("GOLDEN_ZONE_TOUCH", "GOLDEN_ZONE"):
+                    payload = latest_events.get(key)
+                    if not isinstance(payload, dict):
+                        continue
+                    price = payload.get("price")
+                    if not (isinstance(price, tuple) and len(price) == 2):
+                        continue
+                    try:
+                        p0, p1 = float(price[0]), float(price[1])
+                    except (TypeError, ValueError):
+                        continue
+                    bottom, top = min(p0, p1), max(p0, p1)
+                    if bottom <= close_price <= top:
+                        return True, f"Golden zone {format_price(bottom)} → {format_price(top)}"
+                return False, None
+
             liquidity_touch_or_inside, liquidity_detail = _touch_or_inside_liquidity()
+            in_golden_zone, golden_zone_detail = _inside_golden_zone()
             if liquidity_touch_or_inside and PRINT_LIQUIDITY_TOUCH_ONCE and liquidity_detail:
                 token = f"{symbol}|{timeframe}|{liquidity_detail}"
                 with _LIQ_TOUCH_LOCK:
@@ -9345,11 +9462,11 @@ def scan_binance(
                     if isinstance(liq_price, (int, float)):
                         liquidity_created_detail = f"line@{format_price(liq_price)}"
 
-            # طباعة العملات فقط عندما يكون السعر داخل/يلامس منطقة LIQUIDITY LEVELS
-            if not (liquidity_touch_or_inside and touch_recent):
+            # طباعة العملات فقط عندما يكون السعر داخل صندوق السيولة وداخل Golden zone
+            if not (liquidity_touch_or_inside and touch_recent and in_golden_zone):
                 if not SILENT_WHEN_NO_EVENTS:
                     print(
-                        f"تخطي {_format_symbol(symbol)} لأنه ليس داخل منطقة LIQUIDITY LEVELS ضمن آخر {window} شموع",
+                        f"تخطي {_format_symbol(symbol)} لأنه لا يطابق شرط صندوق السيولة + Golden zone ضمن آخر {window} شموع",
                         flush=True,
                     )
                 if tracer and tracer.enabled:
@@ -9364,13 +9481,16 @@ def scan_binance(
                     )
                 return idx, None, None
 
-            reasons: List[str] = ["Touched/Inside"]
+            reasons: List[str] = ["Liquidity Box Bounds", "Golden Zone"]
 
             print(f"\n{_format_symbol(symbol)} ({timeframe})", flush=True)
+            print(f"exchange: {exchange_label}", flush=True)
             print(f"decision: PASS", flush=True)
             print(f"reason: {', '.join(reasons)}", flush=True)
             if liquidity_touch_or_inside and liquidity_detail and touch_recent:
                 print(f"liquidity_level: {liquidity_detail}", flush=True)
+            if in_golden_zone and golden_zone_detail:
+                print(f"golden_zone: {golden_zone_detail}", flush=True)
 
             metrics["daily_change_percent"] = daily_change
             summary = {
@@ -9387,6 +9507,8 @@ def scan_binance(
                     "liquidity_sweep_recent": liquidity_sweep_recent,
                     "liquidity_created_recent": liquidity_created_recent,
                     "liquidity_detail": liquidity_detail,
+                    "in_golden_zone": in_golden_zone,
+                    "golden_zone_detail": golden_zone_detail,
                     "liquidity_created_detail": liquidity_created_detail,
                     "liquidity_sweep_detail": liquidity_sweep_detail,
                 },
@@ -9495,7 +9617,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--timeframe",
         type=str,
         default=SCANNER_TIMEFRAME,
-        help="Timeframe(s) used when scanning Binance (comma-separated list allowed)",
+        help="Timeframe(s) used when scanning futures exchange (comma-separated list allowed)",
     )
     parser.add_argument(
         "--lookback",
@@ -9507,10 +9629,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--symbols", type=str, default="")
     parser.add_argument("--concurrency", type=int, default=EDITOR_AUTORUN_DEFAULTS.concurrency)
     parser.add_argument(
+        "--exchange",
+        type=str,
+        default=EDITOR_AUTORUN_DEFAULTS.exchange,
+        help="منصة المسح: binance أو mexc (Futures USDT-M)",
+    )
+    parser.add_argument(
         "--min-daily-change",
         type=float,
         default=SCANNER_MIN_DAILY_CHANGE,
-        help="الحد الأدنى لتغير 24 ساعة (٪) لاختيار الرمز عند مسح Binance، 0 لتعطيل الفلتر",
+        help="الحد الأدنى لتغير 24 ساعة (٪) لاختيار الرمز عند المسح، 0 لتعطيل الفلتر",
     )
     parser.add_argument("--no-scan", action="store_true")
     parser.add_argument("--trace", action="store_true", help="Enable execution tracing")
@@ -9528,7 +9656,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         dest="continuous_scan",
         action=_OptionalBoolAction,
         default=SCANNER_CONTINUOUS,
-        help="تشغيل ماسح Binance في حلقة متواصلة بدون توقف (يدعم true/false)",
+        help="تشغيل ماسح العقود في حلقة متواصلة بدون توقف (يدعم true/false)",
     )
     parser.add_argument(
         "--no-continuous",
@@ -9557,6 +9685,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="تعطيل وضع المسح السريع (الحصول على التاريخ الكامل)",
     )
     args = parser.parse_args(argv)
+    try:
+        args.exchange = _normalize_exchange_name(args.exchange)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.min_daily_change < 0.0:
         parser.error("--min-daily-change يجب أن يكون رقمًا غير سالب")
     if args.max_age_bars <= 0:
@@ -9633,6 +9765,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     manual_symbols,
                     args.concurrency,
                     tracer,
+                    exchange_name=args.exchange,
                     min_daily_change=args.min_daily_change,
                     inputs=indicator_inputs,
                     fast_scan=args.fast_scan,
