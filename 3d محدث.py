@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import time as pytime
 import math
 import json
@@ -35,6 +36,11 @@ CONFIG = {
     "quote": "USDT",
     "scan_limit_symbols": 0,          # 0 = all
     "rate_limit_sleep": True,
+
+    # Scanner mode
+    "scan_exchanges": ["binanceusdm", "mexc"],
+    "parallel_scan": True,
+    "parallel_workers": 3,
 
     # High coins first (sorting/filtering)
     "high_coins_first": True,
@@ -58,6 +64,9 @@ CONFIG = {
     "invalidation": "Wick",           # "Wick" or "Close"
     "max_stored_obs": 50,
     "poc_bins": 40,
+
+    # ==================== BIG OB FILTER ====================
+    "big_ob_min_dominance_pct": 70,  # configurable: print/keep OB only if dominant side >= this percent
 
     # ==================== TOUCH ALERTS ====================
     "alert_touch_zone": False,
@@ -574,6 +583,23 @@ def has_gap_between(highs: List[float], lows: List[float], anchor_idx: int, bos_
     return False
 
 
+def ob_dominance_pct(tot_vol: float, bull_vol: float, bear_vol: float) -> int:
+    tot = float(tot_vol)
+    if tot <= 0:
+        return 50
+
+    bull_raw = (float(bull_vol) / tot) * 100.0
+    bull_pct = round_half_away_from_zero(bull_raw)
+    bull_pct = max(0, min(100, bull_pct))
+    bear_pct = 100 - bull_pct
+    return max(bull_pct, bear_pct)
+
+
+def passes_big_ob_filter(tot_vol: float, bull_vol: float, bear_vol: float) -> bool:
+    min_dom = safe_float(CONFIG.get("big_ob_min_dominance_pct", 70), 70.0)
+    return ob_dominance_pct(tot_vol, bull_vol, bear_vol) >= min_dom
+
+
 def prune_obs(obs: List[ObRec], max_stored: int) -> None:
     while len(obs) > max_stored:
         removed = False
@@ -695,9 +721,10 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, f
     # --- Formatting for Pine-like alerts ---
     def format_new_ob(ob: ObRec) -> str:
         side = "BULL" if ob.is_bull else "BEAR"
+        dom = max(ob.bull_pct, ob.bear_pct)
         return (
             f"[NEW OB] {symbol} | {side} | top={ob.top} bottom={ob.bottom} "
-            f"| created_time={ob.created_time}"
+            f"| dominance={dom}% | created_time={ob.created_time}"
         )
 
     # --- Retest formatting already exists: format_triangle(...) ---
@@ -793,7 +820,7 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, f
                     if best_idx is not None and not gap_leg:
                         top = h[best_idx]
                         bottom = l[best_idx]
-                        if not ob_overlaps_active(obs, top, bottom):
+                        if passes_big_ob_filter(tot_vol, bull_vol, bear_vol) and not ob_overlaps_active(obs, top, bottom):
                             ob = add_ob_from_poc(obs, best_idx, ts[best_idx], top, bottom, False, tot_vol, bull_vol, bear_vol, bos_idx_bear, ts[bos_idx_bear], max_stored)
                             ev_new_bear_ob = True
             # Pine resets swing low state after processing
@@ -824,7 +851,7 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, f
                     if best_idx2 is not None and not gap_leg2:
                         top2 = h[best_idx2]
                         bottom2 = l[best_idx2]
-                        if not ob_overlaps_active(obs, top2, bottom2):
+                        if passes_big_ob_filter(tot_vol, bull_vol, bear_vol) and not ob_overlaps_active(obs, top2, bottom2):
                             ob = add_ob_from_poc(obs, best_idx2, ts[best_idx2], top2, bottom2, True, tot_vol, bull_vol, bear_vol, bos_idx_bull, ts[bos_idx_bull], max_stored)
                             ev_new_bull_ob = True
             # Pine resets swing high state after processing
@@ -886,16 +913,12 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, f
                     ob.retest_index = retest_bar
                     ob.retest_time = ts[retest_bar]
 
-                    last_side_bar = last_bull_retest_bar if ob.is_bull else last_bear_retest_bar
-                    can_log = (last_side_bar is None) or ((retest_bar - last_side_bar) >= 4)
-
-                    if can_log:
-                        if ob.is_bull:
-                            ev_bull_retest = True
-                            last_bull_retest_bar = retest_bar
-                        else:
-                            ev_bear_retest = True
-                            last_bear_retest_bar = retest_bar
+                    if ob.is_bull:
+                        ev_bull_retest = True
+                        last_bull_retest_bar = retest_bar
+                    else:
+                        ev_bear_retest = True
+                        last_bear_retest_bar = retest_bar
 
         # Emit alerts ONLY on last candle (scanner behavior), and only once per candle time.
         if bi == last_idx:
@@ -989,15 +1012,19 @@ def sort_and_filter_symbols_high_first(exchange: ccxt.Exchange, symbols: List[st
 # =========================== SCANNER =========================
 # ============================================================
 
-def scan_binance_usdtm() -> None:
-    exchange = getattr(ccxt, CONFIG["exchange_id"])({
+def create_exchange(exchange_id: str) -> ccxt.Exchange:
+    default_type = "future" if exchange_id == "binanceusdm" else "swap"
+    ex_class = getattr(ccxt, exchange_id)
+    return ex_class({
         "enableRateLimit": True,
-        "options": {"defaultType": "future"},
+        "options": {"defaultType": default_type},
     })
 
-    markets = exchange.load_markets()
 
+def load_usdtm_symbols(exchange: ccxt.Exchange) -> List[str]:
+    markets = exchange.load_markets()
     symbols: List[str] = []
+
     for sym, m in markets.items():
         try:
             if not m.get("contract"):
@@ -1006,46 +1033,107 @@ def scan_binance_usdtm() -> None:
                 continue
             if m.get("quote") != CONFIG["quote"]:
                 continue
+            if m.get("settle") not in (None, CONFIG["quote"]):
+                continue
             if m.get("active") is False:
                 continue
             symbols.append(sym)
         except Exception:
             continue
 
+    return symbols
+
+
+def _scan_symbol_chunk(exchange_id: str, symbols: List[str]) -> Tuple[List[str], List[Tuple[float, str]]]:
+    exchange = create_exchange(exchange_id)
+    chunk_msgs: List[str] = []
+    chunk_candidates: List[Tuple[float, str]] = []
+
+    for sym in symbols:
+        try:
+            msgs, is_cand, score = run_symbol(sym, exchange)
+            chunk_msgs.extend(msgs)
+            if CONFIG.get("print_candidates", True) and is_cand:
+                chunk_candidates.append((score, sym))
+        except Exception:
+            pass
+
+        if CONFIG.get("rate_limit_sleep", True):
+            exchange.sleep(exchange.rateLimit)
+
+    return chunk_msgs, chunk_candidates
+
+
+def scan_exchange_usdtm(exchange_id: str) -> None:
+    try:
+        exchange = create_exchange(exchange_id)
+    except Exception:
+        return
+
+    symbols = load_usdtm_symbols(exchange)
+
     if CONFIG.get("scan_limit_symbols", 0) and int(CONFIG["scan_limit_symbols"]) > 0:
         symbols = symbols[: int(CONFIG["scan_limit_symbols"])]
 
     symbols = sort_and_filter_symbols_high_first(exchange, symbols)
 
+    if not symbols:
+        return
+
+    print(f"\n=== {exchange_id.upper()} USDT-M scan | symbols={len(symbols)} ===")
+
     candidates: List[Tuple[float, str]] = []
+    parallel_enabled = bool(CONFIG.get("parallel_scan", False))
+    workers = max(1, int(CONFIG.get("parallel_workers", 3)))
 
-    for sym in symbols:
-        try:
-            msgs, is_cand, score = run_symbol(sym, exchange)
+    if parallel_enabled and workers > 1 and len(symbols) > 1:
+        workers = min(workers, len(symbols))
+        chunks: List[List[str]] = [symbols[i::workers] for i in range(workers)]
 
-            # prints only selected events
-            for m in msgs:
-                print(m)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_scan_symbol_chunk, exchange_id, chunk) for chunk in chunks if chunk]
+            for fut in as_completed(futures):
+                try:
+                    chunk_msgs, chunk_candidates = fut.result()
+                except Exception:
+                    continue
 
-            if CONFIG.get("print_candidates", True) and is_cand:
-                candidates.append((score, sym))
+                for m in chunk_msgs:
+                    print(m)
+                candidates.extend(chunk_candidates)
+    else:
+        for sym in symbols:
+            try:
+                msgs, is_cand, score = run_symbol(sym, exchange)
+                for m in msgs:
+                    print(m)
 
-        except Exception:
-            pass
+                if CONFIG.get("print_candidates", True) and is_cand:
+                    candidates.append((score, sym))
+            except Exception:
+                pass
 
-        if CONFIG["rate_limit_sleep"]:
-            exchange.sleep(exchange.rateLimit)
+            if CONFIG.get("rate_limit_sleep", True):
+                exchange.sleep(exchange.rateLimit)
 
-    # print candidates at end of cycle
     if CONFIG.get("print_candidates", True) and candidates:
         candidates.sort(key=lambda x: x[0], reverse=True)
         top_n = int(CONFIG.get("candidates_top_n", 20))
         top = candidates[:top_n] if top_n > 0 else candidates
 
-        print("\n=== BULLISH CANDIDATES (SETUPS, NOT GUARANTEED) ===")
+        print(f"\n=== BULLISH CANDIDATES | {exchange_id.upper()} ===")
         for score, sym in top:
             print(f"⭐ {sym} | score(bullPct)={score}")
         print("===============================================\n")
+
+
+def scan_all_configured_exchanges() -> None:
+    exchanges = CONFIG.get("scan_exchanges") or [CONFIG.get("exchange_id", "binanceusdm")]
+    for ex_id in exchanges:
+        try:
+            scan_exchange_usdtm(str(ex_id))
+        except Exception:
+            continue
 
 
 # ============================================================
@@ -1056,7 +1144,7 @@ if __name__ == "__main__":
     if CONFIG.get("live_loop", False):
         loop_minutes = max(1, int(CONFIG.get("loop_minutes", 5)))
         while True:
-            scan_binance_usdtm()
+            scan_all_configured_exchanges()
             pytime.sleep(loop_minutes * 60)
     else:
-        scan_binance_usdtm()
+        scan_all_configured_exchanges()
