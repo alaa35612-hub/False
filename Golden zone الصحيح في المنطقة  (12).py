@@ -1674,6 +1674,9 @@ class SmartMoneyAlgoProE5:
         metrics["current_price"] = self.series.get("close")
         metrics["latest_bar_time"] = self.series.get_time()
         metrics["latest_events"] = self._collect_latest_console_events()
+        metrics["golden_zone_direction"] = self.bxty
+        metrics["golden_zone_created_time"] = self.bxf_created_time
+        metrics["golden_zone_first_touch_time"] = self.bxf_first_touch_time
         return metrics
 
     def _register_label_event(self, label: Label) -> None:
@@ -2542,6 +2545,8 @@ class SmartMoneyAlgoProE5:
         self.bxty = 0
         self.prev_oi1: float = NA
         self.bxf_touched: bool = False
+        self.bxf_created_time: Optional[int] = None
+        self.bxf_first_touch_time: Optional[int] = None
 
         self.motherHigh_history: List[float] = [self.motherHigh]
         self.motherLow_history: List[float] = [self.motherLow]
@@ -6292,6 +6297,8 @@ class SmartMoneyAlgoProE5:
         self.bxf = None
         self.bxty = 0
         self.bxf_touched = False
+        self.bxf_created_time = None
+        self.bxf_first_touch_time = None
 
     def _golden_zone_bounds(self) -> Optional[Tuple[float, float]]:
         if not isinstance(self.bxf, Box):
@@ -6331,7 +6338,10 @@ class SmartMoneyAlgoProE5:
         if hasattr(self.bxf, "set_text_size"):
             self.bxf.set_text_size(self.inputs.structure_util.sizGd)
         self.bxf_touched = False
+        self.bxf_created_time = left_coord
+        self.bxf_first_touch_time = None
         self.bxty = 1 if dir_up else -1
+        self._register_box_event(self.bxf, status="new", event_time=left_coord)
 
     def _check_golden_zone_first_touch(
         self,
@@ -6346,7 +6356,12 @@ class SmartMoneyAlgoProE5:
             return
         if low <= zone_max and high >= zone_min:
             self.bxf_touched = True
-            self._register_box_event(self.bxf, status="touched", event_time=self.series.get_time(0))
+            touch_time = self.series.get_time(0)
+            if isinstance(touch_time, (int, float)):
+                self.bxf_first_touch_time = int(touch_time)
+            else:
+                self.bxf_first_touch_time = None
+            self._register_box_event(self.bxf, status="touched", event_time=touch_time)
             if getattr(self.inputs.structure_util, "enable_alert_ote_touch", True):
                 price_range = f"{format_price(zone_min)} → {format_price(zone_max)}"
                 close_text = format_price(self.series.get("close"))
@@ -8767,24 +8782,39 @@ def render_report(
 
     scanner_section = ""
     if scanner_rows:
-        rows = "\n".join(
-            f"| {row['symbol']} | {row['timeframe']} | {row.get('candles', '')} | "
-            f"{row.get('alerts', 0)} | {row.get('boxes', 0)} | "
-            f"{row.get('metrics', {}).get('demand_zones', 0)} | {row.get('metrics', {}).get('supply_zones', 0)} | "
-            f"{row.get('metrics', {}).get('bullish_fvg', 0)} | {row.get('metrics', {}).get('bearish_fvg', 0)} | "
-            f"{row.get('metrics', {}).get('order_flow_boxes', 0)} | {row.get('metrics', {}).get('scob_colored_bars', 0)} |"
-            for row in scanner_rows
-        )
-        scanner_section = textwrap.dedent(
-            f"""
-## ماسح Binance USDT-M
+        first_touch_rows: List[Tuple[str, str, str]] = []
+        for row in scanner_rows:
+            metrics = row.get("metrics", {}) if isinstance(row, dict) else {}
+            eligible, zone_type = _golden_zone_first_touch_filter(metrics)
+            if not eligible or not zone_type:
+                continue
+            first_touch_rows.append((str(row.get("symbol", "")), str(row.get("timeframe", "")), zone_type))
 
-| الرمز | الإطار الزمني | الشموع | التنبيهات | الصناديق | مناطق الطلب | مناطق العرض | FVG صاعدة | FVG هابطة | Order Flow | SCOB |
-|-------|---------------|--------|-----------|-----------|-------------|--------------|-----------|-----------|------------|------|
+        if first_touch_rows:
+            rows = "\n".join(
+                f"| {symbol} | {timeframe} | {zone_type} |"
+                for symbol, timeframe, zone_type in first_touch_rows
+            )
+            scanner_section = textwrap.dedent(
+                f"""
+## تقرير اختبار أول ملامسة لمنطقة Golden Zone
+
+| الرمز | الإطار الزمني | نوع المنطقة |
+|-------|---------------|-------------|
 {rows}
 
 """
-        )
+            )
+        else:
+            scanner_section = textwrap.dedent(
+                """
+## تقرير اختبار أول ملامسة لمنطقة Golden Zone
+
+لا توجد عملات تطابق فلتر **First Touch Only** حالياً.
+
+"""
+            )
+
 
     content = textwrap.dedent(
         f"""
@@ -9057,6 +9087,44 @@ def _is_price_inside_golden_zone(metrics: Dict[str, Any]) -> bool:
     return lower <= price <= upper
 
 
+def _golden_zone_first_touch_filter(metrics: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    """Return strict first-touch eligibility and zone side (Buy/Sell)."""
+
+    if not _is_price_inside_golden_zone(metrics):
+        return False, None
+
+    latest_events = metrics.get("latest_events") or {}
+    if not isinstance(latest_events, dict):
+        return False, None
+
+    gz_event = latest_events.get("GOLDEN_ZONE")
+    if not isinstance(gz_event, dict):
+        return False, None
+    if gz_event.get("status") != "touched":
+        return False, None
+
+    latest_bar_time = metrics.get("latest_bar_time")
+    first_touch_time = metrics.get("golden_zone_first_touch_time")
+    created_time = metrics.get("golden_zone_created_time")
+
+    if not isinstance(latest_bar_time, (int, float)):
+        return False, None
+    if not isinstance(first_touch_time, (int, float)):
+        return False, None
+    if int(first_touch_time) != int(latest_bar_time):
+        return False, None
+
+    if isinstance(created_time, (int, float)) and int(created_time) > int(first_touch_time):
+        return False, None
+
+    direction = metrics.get("golden_zone_direction")
+    zone_type = "Buy Zone" if direction == 1 else "Sell Zone" if direction == -1 else None
+    if zone_type is None:
+        return False, None
+
+    return True, zone_type
+
+
 def _collect_recent_event_hits(
     series: Any,
     latest_events: Any,
@@ -9149,6 +9217,7 @@ def scan_binance(
     window = max(1, int(window))
 
     max_workers = 1 if (tracer and tracer.enabled) else max(1, int(concurrency))
+    effective_limit = int(limit) if isinstance(limit, int) and limit > 0 else int(EDITOR_AUTORUN_DEFAULTS.candle_limit)
 
     def _process_symbol(idx: int, symbol: str) -> Optional[Tuple[SmartMoneyAlgoProE5, Dict[str, Any]]]:
         local_exchange = exchange if max_workers == 1 else ccxt.binanceusdm({"enableRateLimit": True})
@@ -9179,7 +9248,7 @@ def scan_binance(
                     threshold=min_daily_change,
                 )
             return None
-        candles = fetch_ohlcv(local_exchange, symbol, timeframe, limit)
+        candles = fetch_ohlcv(local_exchange, symbol, timeframe, effective_limit)
         runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
         runtime.console_max_age_bars = max(runtime.console_max_age_bars, window)
         runtime.process(candles)
@@ -9256,8 +9325,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--lookback",
         type=int,
-        default=0,
-        help="Number of candles to request per symbol when scanning (0 = full history)",
+        default=int(EDITOR_AUTORUN_DEFAULTS.candle_limit),
+        help="Number of candles to request per symbol when scanning each timeframe/symbol",
     )
     parser.add_argument("--bars", type=int, default=0, help="Limit number of candles to analyse from --data source")
     parser.add_argument("--symbols", type=str, default="")
