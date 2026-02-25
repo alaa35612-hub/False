@@ -22,6 +22,9 @@ import time as pytime
 import math
 import json
 import os
+import random
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import ccxt
 
 
@@ -59,6 +62,11 @@ CONFIG = {
     "max_stored_obs": 50,
     "poc_bins": 40,
 
+    # OB Volume Delta filter
+    "ob_delta_filter_enabled": True,
+    "ob_min_bull_delta_pct": 70,       # show bullish OB only if bull_pct >= this
+    "ob_min_bear_delta_pct": 70,       # show bearish OB only if bear_pct >= this
+
     # ==================== TOUCH ALERTS ====================
     "alert_touch_zone": False,
     "touch_age_bars": 1,            # ✅ 0 = only current candle (prevents printing old touches)
@@ -75,6 +83,18 @@ CONFIG = {
     "candidate_requires_retest": True,    # recommended (stronger)
     "candidate_requires_touch": False,    # optional
     "candidate_min_bull_pct": 51,         # delta filter when available
+
+    # Nearby OB zones (important + possible bounce)
+    "alert_nearby_ob": True,
+    "nearby_ob_max_distance_pct": 0.35,   # max distance from close to nearest zone edge
+    "nearby_ob_max_results": 3,
+    "nearby_ob_requires_delta": True,
+
+    # Scanner acceleration (parallel + anti-burst)
+    "scan_parallel": True,
+    "scan_concurrency": 4,
+    "scan_worker_spacing_ms": 120,
+    "scan_worker_jitter_ms": 80,
 
     # Live loop
     "live_loop": False,
@@ -123,6 +143,7 @@ FIRST_RETEST_SEEN: set[str] = _load_cache(RETEST_CACHE_FILE)
 
 # Prevent duplicate prints on same candle time across loops
 LAST_ALERT_BAR_TIME: Dict[Tuple[str, str], int] = {}
+ALERT_LOCK = threading.Lock()
 
 
 # ============================================================
@@ -188,11 +209,39 @@ def touches_zone(z_top: float, z_bot: float, c_high: float, c_low: float) -> boo
 
 def should_emit_alert(symbol: str, event_type: str, bar_time_ms: int) -> bool:
     key = (symbol, event_type)
-    last = LAST_ALERT_BAR_TIME.get(key)
-    if last is not None and last == bar_time_ms:
+    with ALERT_LOCK:
+        last = LAST_ALERT_BAR_TIME.get(key)
+        if last is not None and last == bar_time_ms:
+            return False
+        LAST_ALERT_BAR_TIME[key] = bar_time_ms
+        return True
+
+
+def ob_passes_delta_filter(ob: ObRec) -> bool:
+    if not CONFIG.get("ob_delta_filter_enabled", False):
+        return True
+    if not ob.has_delta:
         return False
-    LAST_ALERT_BAR_TIME[key] = bar_time_ms
-    return True
+    if ob.is_bull:
+        return ob.bull_pct >= int(CONFIG.get("ob_min_bull_delta_pct", 70))
+    return ob.bear_pct >= int(CONFIG.get("ob_min_bear_delta_pct", 70))
+
+
+def ob_distance_pct(close_px: float, ob: ObRec) -> float:
+    top = max(ob.top, ob.bottom)
+    bottom = min(ob.top, ob.bottom)
+    if bottom <= close_px <= top:
+        return 0.0
+    edge = bottom if close_px < bottom else top
+    return abs((edge - close_px) / close_px) * 100.0 if close_px != 0 else float("inf")
+
+
+def format_nearby_ob(symbol: str, close_px: float, ob: ObRec, distance_pct: float) -> str:
+    side = "BULL" if ob.is_bull else "BEAR"
+    return (
+        f"[NEAR OB] {symbol} close={close_px} | {side} OB top={ob.top} bottom={ob.bottom} "
+        f"| dist={distance_pct:.3f}% | delta(B/S)={ob.bull_pct}/{ob.bear_pct}"
+    )
 
 
 def round_to_tick(price: float, tick: float) -> float:
@@ -697,7 +746,7 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, f
         side = "BULL" if ob.is_bull else "BEAR"
         return (
             f"[NEW OB] {symbol} | {side} | top={ob.top} bottom={ob.bottom} "
-            f"| created_time={ob.created_time}"
+            f"| created_time={ob.created_time} | delta(B/S)={ob.bull_pct}/{ob.bear_pct}"
         )
 
     # --- Retest formatting already exists: format_triangle(...) ---
@@ -905,28 +954,59 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, f
                 # Print ONE per bar like Pine alert
                 # pick the newest bull OB for message
                 for ob in obs:
-                    if ob.is_bull and ob.created_index == bos_idx_bull:
+                    if ob.is_bull and ob.created_index == bos_idx_bull and ob_passes_delta_filter(ob):
                         out_msgs.append(format_new_ob(ob))
                         break
 
             if CONFIG.get("alert_new_ob", True) and ev_new_bear_ob and should_emit_alert(symbol, "NEW_BEAR_OB", bar_time_ms):
                 for ob in obs:
-                    if (not ob.is_bull) and ob.created_index == bos_idx_bear:
+                    if (not ob.is_bull) and ob.created_index == bos_idx_bear and ob_passes_delta_filter(ob):
                         out_msgs.append(format_new_ob(ob))
                         break
 
             if CONFIG.get("alert_retest", True) and ev_bull_retest and should_emit_alert(symbol, "BULL_RETEST", bar_time_ms):
                 # Find most recent bull retest OB
                 for ob in obs:
-                    if ob.is_bull and ob.retest_time is not None and ob.retest_time == ts[bi - 1]:
+                    if (
+                        ob.is_bull
+                        and ob.retest_time is not None
+                        and ob.retest_time == ts[bi - 1]
+                        and ob_passes_delta_filter(ob)
+                    ):
                         out_msgs.append(format_triangle(symbol, ob, ts[bi - 1]))
                         break
 
             if CONFIG.get("alert_retest", True) and ev_bear_retest and should_emit_alert(symbol, "BEAR_RETEST", bar_time_ms):
                 for ob in obs:
-                    if (not ob.is_bull) and ob.retest_time is not None and ob.retest_time == ts[bi - 1]:
+                    if (
+                        (not ob.is_bull)
+                        and ob.retest_time is not None
+                        and ob.retest_time == ts[bi - 1]
+                        and ob_passes_delta_filter(ob)
+                    ):
                         out_msgs.append(format_triangle(symbol, ob, ts[bi - 1]))
                         break
+
+            if CONFIG.get("alert_nearby_ob", True) and c[bi] > 0:
+                max_dist_pct = safe_float(CONFIG.get("nearby_ob_max_distance_pct", 0.35), 0.35)
+                max_results = max(1, int(CONFIG.get("nearby_ob_max_results", 3)))
+                req_delta = bool(CONFIG.get("nearby_ob_requires_delta", True))
+
+                nearby: List[Tuple[float, ObRec]] = []
+                for ob in obs:
+                    if not ob.active:
+                        continue
+                    if req_delta and not ob_passes_delta_filter(ob):
+                        continue
+                    d = ob_distance_pct(c[bi], ob)
+                    if d <= max_dist_pct:
+                        nearby.append((d, ob))
+
+                nearby.sort(key=lambda x: x[0])
+                for d, ob in nearby[:max_results]:
+                    event_key = f"NEAR_{'B' if ob.is_bull else 'S'}_{ob.created_time}"
+                    if should_emit_alert(symbol, event_key, bar_time_ms):
+                        out_msgs.append(format_nearby_ob(symbol, c[bi], ob, d))
 
     return out_msgs, bullish_candidate, candidate_score
 
@@ -1019,22 +1099,51 @@ def scan_binance_usdtm() -> None:
 
     candidates: List[Tuple[float, str]] = []
 
-    for sym in symbols:
-        try:
-            msgs, is_cand, score = run_symbol(sym, exchange)
+    def worker(sym: str, slot: int) -> Tuple[str, List[str], bool, float]:
+        base_sleep = max(0, int(CONFIG.get("scan_worker_spacing_ms", 120)))
+        jitter = max(0, int(CONFIG.get("scan_worker_jitter_ms", 80)))
+        delay_ms = (slot * base_sleep) + (random.randint(0, jitter) if jitter > 0 else 0)
+        if delay_ms > 0:
+            pytime.sleep(delay_ms / 1000.0)
 
-            # prints only selected events
+        ex = getattr(ccxt, CONFIG["exchange_id"])({
+            "enableRateLimit": True,
+            "options": {"defaultType": "future"},
+        })
+        ex.markets = exchange.markets
+        ex.markets_by_id = exchange.markets_by_id
+        ex.symbols = exchange.symbols
+        ex.currencies = exchange.currencies
+        ex.currencies_by_id = exchange.currencies_by_id
+
+        try:
+            msgs, is_cand, score = run_symbol(sym, ex)
+            return sym, msgs, is_cand, score
+        except Exception:
+            return sym, [], False, 0.0
+
+    parallel = bool(CONFIG.get("scan_parallel", True))
+    concurrency = max(1, int(CONFIG.get("scan_concurrency", 4)))
+
+    if parallel and concurrency > 1 and len(symbols) > 1:
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            future_map = {
+                pool.submit(worker, sym, i % concurrency): sym
+                for i, sym in enumerate(symbols)
+            }
+            for fut in as_completed(future_map):
+                sym, msgs, is_cand, score = fut.result()
+                for m in msgs:
+                    print(m)
+                if CONFIG.get("print_candidates", True) and is_cand:
+                    candidates.append((score, sym))
+    else:
+        for sym in symbols:
+            sym, msgs, is_cand, score = worker(sym, 0)
             for m in msgs:
                 print(m)
-
             if CONFIG.get("print_candidates", True) and is_cand:
                 candidates.append((score, sym))
-
-        except Exception:
-            pass
-
-        if CONFIG["rate_limit_sleep"]:
-            exchange.sleep(exchange.rateLimit)
 
     # print candidates at end of cycle
     if CONFIG.get("print_candidates", True) and candidates:
