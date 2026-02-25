@@ -48,6 +48,7 @@ CONFIG = {
 
     # Timeframes / bars
     "timeframe": "1m",
+    "timeframes": ["1m", "5m", "1h", "4h", "1d"],
     "vd_timeframe": "",             # "" to use chart TF volume (no LTF)
     "bars_back": 5000,
     "fetch_batch_limit": 1500,
@@ -100,6 +101,15 @@ CONFIG = {
     "live_loop": False,
     "loop_minutes": 5,
 }
+
+
+def normalize_timeframes() -> List[str]:
+    raw = CONFIG.get("timeframes")
+    if isinstance(raw, list):
+        values = [str(x).strip() for x in raw if str(x).strip()]
+        if values:
+            return values
+    return [str(CONFIG.get("timeframe", "1m"))]
 
 
 # ============================================================
@@ -173,6 +183,17 @@ class ObRec:
     has_delta: bool = False
 
 
+@dataclass
+class FirstTouchResult:
+    symbol: str
+    timeframe: str
+    zone_type: str
+    current_price: float
+    top: float
+    bottom: float
+    created_time: int
+
+
 # ============================================================
 # ========================= UTILITIES =========================
 # ============================================================
@@ -205,6 +226,22 @@ def tf_seconds(exchange: ccxt.Exchange, tf: str) -> Optional[int]:
 
 def touches_zone(z_top: float, z_bot: float, c_high: float, c_low: float) -> bool:
     return (c_high >= z_bot) and (c_low <= z_top)
+
+
+def is_first_touch_since_creation(
+    ob: ObRec,
+    h: List[float],
+    l: List[float],
+    current_idx: int,
+) -> bool:
+    """True if current candle is the first touch for this zone after creation."""
+    if current_idx <= ob.created_index:
+        return False
+
+    for idx in range(ob.created_index + 1, current_idx):
+        if touches_zone(ob.top, ob.bottom, h[idx], l[idx]):
+            return False
+    return True
 
 
 def should_emit_alert(symbol: str, event_type: str, bar_time_ms: int) -> bool:
@@ -685,7 +722,7 @@ def add_ob_from_poc(
 # ============================================================
 
 
-def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, float]:
+def run_symbol(symbol: str, exchange: ccxt.Exchange, timeframe: str) -> List[FirstTouchResult]:
     """
     Pine-match engine for:
     - ta.pivothigh/ta.pivotlow (left=swing_len, right=swing_len)
@@ -694,10 +731,9 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, f
     - POC + volume-at-POC aggregation identical in spirit to the Pine script
     - Invalidation + Retest logic matches Pine (uses [1] candle for retest, min-gap=4)
     Returns:
-      messages_to_print, bullish_candidate_flag, candidate_score
-    NOTE: Touch / candidate logic remains configurable, but defaults can be disabled in CONFIG.
+      strict first-touch matches in the selected timeframe.
     """
-    tf = CONFIG["timeframe"]
+    tf = timeframe
     vd_tf = CONFIG.get("vd_timeframe", "")
     bars_back = int(CONFIG["bars_back"])
     batch_limit = int(CONFIG["fetch_batch_limit"])
@@ -710,7 +746,7 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, f
 
     htf = fetch_ohlcv_paged_backwards(exchange, symbol, tf, bars_back, batch_limit)
     if len(htf) < (swing_len * 2 + 10):
-        return [], False, 0.0
+        return []
 
     ts = [int(x[0]) for x in htf]
     o = [float(x[1]) for x in htf]
@@ -725,9 +761,6 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, f
 
     last_idx = len(htf) - 1
 
-    # These are for optional candidate output (kept for compatibility)
-    bullish_candidate = False
-    candidate_score = 0.0
 
     # --- Pivot helpers ---
     # IMPORTANT: ta.pivothigh/low accept ties; they test center == highest/lowest of the window.
@@ -751,7 +784,7 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, f
 
     # --- Retest formatting already exists: format_triangle(...) ---
 
-    out_msgs: List[str] = []
+    first_touch_hits: List[FirstTouchResult] = []
 
     # Pine state variables
     sh_price: Optional[float] = None
@@ -946,69 +979,37 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, f
                             ev_bear_retest = True
                             last_bear_retest_bar = retest_bar
 
-        # Emit alerts ONLY on last candle (scanner behavior), and only once per candle time.
+        # Strict filter: current price is inside active zone + first ever touch since creation.
         if bi == last_idx:
-            bar_time_ms = ts[bi]
+            current_price = c[bi]
+            for ob in obs:
+                if not ob.active:
+                    continue
+                if not ob_passes_delta_filter(ob):
+                    continue
 
-            if CONFIG.get("alert_new_ob", True) and ev_new_bull_ob and should_emit_alert(symbol, "NEW_BULL_OB", bar_time_ms):
-                # Print ONE per bar like Pine alert
-                # pick the newest bull OB for message
-                for ob in obs:
-                    if ob.is_bull and ob.created_index == bos_idx_bull and ob_passes_delta_filter(ob):
-                        out_msgs.append(format_new_ob(ob))
-                        break
+                in_zone_now = ob.bottom <= current_price <= ob.top
+                touched_now = touches_zone(ob.top, ob.bottom, h[bi], l[bi])
+                if not (in_zone_now and touched_now):
+                    continue
 
-            if CONFIG.get("alert_new_ob", True) and ev_new_bear_ob and should_emit_alert(symbol, "NEW_BEAR_OB", bar_time_ms):
-                for ob in obs:
-                    if (not ob.is_bull) and ob.created_index == bos_idx_bear and ob_passes_delta_filter(ob):
-                        out_msgs.append(format_new_ob(ob))
-                        break
+                if not is_first_touch_since_creation(ob, h, l, bi):
+                    continue
 
-            if CONFIG.get("alert_retest", True) and ev_bull_retest and should_emit_alert(symbol, "BULL_RETEST", bar_time_ms):
-                # Find most recent bull retest OB
-                for ob in obs:
-                    if (
-                        ob.is_bull
-                        and ob.retest_time is not None
-                        and ob.retest_time == ts[bi - 1]
-                        and ob_passes_delta_filter(ob)
-                    ):
-                        out_msgs.append(format_triangle(symbol, ob, ts[bi - 1]))
-                        break
+                first_touch_hits.append(
+                    FirstTouchResult(
+                        symbol=symbol,
+                        timeframe=tf,
+                        zone_type="Buy Zone" if ob.is_bull else "Sell Zone",
+                        current_price=current_price,
+                        top=ob.top,
+                        bottom=ob.bottom,
+                        created_time=ob.created_time,
+                    )
+                )
+                break
 
-            if CONFIG.get("alert_retest", True) and ev_bear_retest and should_emit_alert(symbol, "BEAR_RETEST", bar_time_ms):
-                for ob in obs:
-                    if (
-                        (not ob.is_bull)
-                        and ob.retest_time is not None
-                        and ob.retest_time == ts[bi - 1]
-                        and ob_passes_delta_filter(ob)
-                    ):
-                        out_msgs.append(format_triangle(symbol, ob, ts[bi - 1]))
-                        break
-
-            if CONFIG.get("alert_nearby_ob", True) and c[bi] > 0:
-                max_dist_pct = safe_float(CONFIG.get("nearby_ob_max_distance_pct", 0.35), 0.35)
-                max_results = max(1, int(CONFIG.get("nearby_ob_max_results", 3)))
-                req_delta = bool(CONFIG.get("nearby_ob_requires_delta", True))
-
-                nearby: List[Tuple[float, ObRec]] = []
-                for ob in obs:
-                    if not ob.active:
-                        continue
-                    if req_delta and not ob_passes_delta_filter(ob):
-                        continue
-                    d = ob_distance_pct(c[bi], ob)
-                    if d <= max_dist_pct:
-                        nearby.append((d, ob))
-
-                nearby.sort(key=lambda x: x[0])
-                for d, ob in nearby[:max_results]:
-                    event_key = f"NEAR_{'B' if ob.is_bull else 'S'}_{ob.created_time}"
-                    if should_emit_alert(symbol, event_key, bar_time_ms):
-                        out_msgs.append(format_nearby_ob(symbol, c[bi], ob, d))
-
-    return out_msgs, bullish_candidate, candidate_score
+    return first_touch_hits
 
 
 def sort_and_filter_symbols_high_first(exchange: ccxt.Exchange, symbols: List[str]) -> List[str]:
@@ -1096,10 +1097,11 @@ def scan_binance_usdtm() -> None:
         symbols = symbols[: int(CONFIG["scan_limit_symbols"])]
 
     symbols = sort_and_filter_symbols_high_first(exchange, symbols)
+    timeframes = normalize_timeframes()
 
-    candidates: List[Tuple[float, str]] = []
+    first_touch_results: List[FirstTouchResult] = []
 
-    def worker(sym: str, slot: int) -> Tuple[str, List[str], bool, float]:
+    def worker(sym: str, timeframe: str, slot: int) -> List[FirstTouchResult]:
         base_sleep = max(0, int(CONFIG.get("scan_worker_spacing_ms", 120)))
         jitter = max(0, int(CONFIG.get("scan_worker_jitter_ms", 80)))
         delay_ms = (slot * base_sleep) + (random.randint(0, jitter) if jitter > 0 else 0)
@@ -1117,44 +1119,34 @@ def scan_binance_usdtm() -> None:
         ex.currencies_by_id = exchange.currencies_by_id
 
         try:
-            msgs, is_cand, score = run_symbol(sym, ex)
-            return sym, msgs, is_cand, score
+            return run_symbol(sym, ex, timeframe)
         except Exception:
-            return sym, [], False, 0.0
+            return []
 
+    tasks: List[Tuple[str, str]] = [(sym, tf) for tf in timeframes for sym in symbols]
     parallel = bool(CONFIG.get("scan_parallel", True))
     concurrency = max(1, int(CONFIG.get("scan_concurrency", 4)))
 
-    if parallel and concurrency > 1 and len(symbols) > 1:
+    if parallel and concurrency > 1 and len(tasks) > 1:
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            future_map = {
-                pool.submit(worker, sym, i % concurrency): sym
-                for i, sym in enumerate(symbols)
-            }
-            for fut in as_completed(future_map):
-                sym, msgs, is_cand, score = fut.result()
-                for m in msgs:
-                    print(m)
-                if CONFIG.get("print_candidates", True) and is_cand:
-                    candidates.append((score, sym))
+            futures = [pool.submit(worker, sym, tf, i % concurrency) for i, (sym, tf) in enumerate(tasks)]
+            for fut in as_completed(futures):
+                first_touch_results.extend(fut.result())
     else:
-        for sym in symbols:
-            sym, msgs, is_cand, score = worker(sym, 0)
-            for m in msgs:
-                print(m)
-            if CONFIG.get("print_candidates", True) and is_cand:
-                candidates.append((score, sym))
+        for i, (sym, tf) in enumerate(tasks):
+            first_touch_results.extend(worker(sym, tf, i % max(1, concurrency)))
 
-    # print candidates at end of cycle
-    if CONFIG.get("print_candidates", True) and candidates:
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        top_n = int(CONFIG.get("candidates_top_n", 20))
-        top = candidates[:top_n] if top_n > 0 else candidates
 
-        print("\n=== BULLISH CANDIDATES (SETUPS, NOT GUARANTEED) ===")
-        for score, sym in top:
-            print(f"⭐ {sym} | score(bullPct)={score}")
-        print("===============================================\n")
+    print("\n=== FIRST TOUCH GOLDEN ZONE REPORT (STRICT) ===")
+    if not first_touch_results:
+        print("No symbols passed the strict first-touch Golden Zone filter.")
+        print("================================================\n")
+        return
+
+    first_touch_results.sort(key=lambda x: (x.timeframe, x.symbol))
+    for res in first_touch_results:
+        print(f"{res.symbol} | {res.timeframe} | {res.zone_type}")
+    print("================================================\n")
 
 
 # ============================================================
