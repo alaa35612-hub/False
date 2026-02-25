@@ -22,7 +22,17 @@ import time as pytime
 import math
 import json
 import os
+import random
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import ccxt
+
+
+ANSI_RESET = "\033[0m"
+ANSI_GREEN = "\033[92m"
+ANSI_YELLOW = "\033[93m"
+ANSI_RED = "\033[91m"
+ANSI_CYAN = "\033[96m"
 
 
 # ============================================================
@@ -59,6 +69,11 @@ CONFIG = {
     "max_stored_obs": 50,
     "poc_bins": 40,
 
+    # OB Volume Delta filter
+    "ob_delta_filter_enabled": True,
+    "ob_min_bull_delta_pct": 70,       # show bullish OB only if bull_pct >= this
+    "ob_min_bear_delta_pct": 70,       # show bearish OB only if bear_pct >= this
+
     # ==================== TOUCH ALERTS ====================
     "alert_touch_zone": False,
     "touch_age_bars": 1,            # ✅ 0 = only current candle (prevents printing old touches)
@@ -75,6 +90,18 @@ CONFIG = {
     "candidate_requires_retest": True,    # recommended (stronger)
     "candidate_requires_touch": False,    # optional
     "candidate_min_bull_pct": 51,         # delta filter when available
+
+    # Nearby OB zones (important + possible bounce)
+    "alert_nearby_ob": True,
+    "nearby_ob_max_distance_pct": 0.35,   # max distance from close to nearest zone edge
+    "nearby_ob_max_results": 3,
+    "nearby_ob_requires_delta": True,
+
+    # Scanner acceleration (parallel + anti-burst)
+    "scan_parallel": True,
+    "scan_concurrency": 4,
+    "scan_worker_spacing_ms": 120,
+    "scan_worker_jitter_ms": 80,
 
     # Live loop
     "live_loop": False,
@@ -123,6 +150,7 @@ FIRST_RETEST_SEEN: set[str] = _load_cache(RETEST_CACHE_FILE)
 
 # Prevent duplicate prints on same candle time across loops
 LAST_ALERT_BAR_TIME: Dict[Tuple[str, str], int] = {}
+ALERT_LOCK = threading.Lock()
 
 
 # ============================================================
@@ -188,11 +216,39 @@ def touches_zone(z_top: float, z_bot: float, c_high: float, c_low: float) -> boo
 
 def should_emit_alert(symbol: str, event_type: str, bar_time_ms: int) -> bool:
     key = (symbol, event_type)
-    last = LAST_ALERT_BAR_TIME.get(key)
-    if last is not None and last == bar_time_ms:
+    with ALERT_LOCK:
+        last = LAST_ALERT_BAR_TIME.get(key)
+        if last is not None and last == bar_time_ms:
+            return False
+        LAST_ALERT_BAR_TIME[key] = bar_time_ms
+        return True
+
+
+def ob_passes_delta_filter(ob: ObRec) -> bool:
+    if not CONFIG.get("ob_delta_filter_enabled", False):
+        return True
+    if not ob.has_delta:
         return False
-    LAST_ALERT_BAR_TIME[key] = bar_time_ms
-    return True
+    if ob.is_bull:
+        return ob.bull_pct >= int(CONFIG.get("ob_min_bull_delta_pct", 70))
+    return ob.bear_pct >= int(CONFIG.get("ob_min_bear_delta_pct", 70))
+
+
+def ob_distance_pct(close_px: float, ob: ObRec) -> float:
+    top = max(ob.top, ob.bottom)
+    bottom = min(ob.top, ob.bottom)
+    if bottom <= close_px <= top:
+        return 0.0
+    edge = bottom if close_px < bottom else top
+    return abs((edge - close_px) / close_px) * 100.0 if close_px != 0 else float("inf")
+
+
+def format_nearby_ob(symbol: str, close_px: float, ob: ObRec, distance_pct: float) -> str:
+    side = "BULL" if ob.is_bull else "BEAR"
+    return (
+        f"[NEAR OB] {symbol} close={close_px} | {side} OB top={ob.top} bottom={ob.bottom} "
+        f"| dist={distance_pct:.3f}% | delta(B/S)={ob.bull_pct}/{ob.bear_pct}"
+    )
 
 
 def round_to_tick(price: float, tick: float) -> float:
@@ -223,6 +279,33 @@ def format_triangle(symbol: str, ob: ObRec, retest_time_ms: int) -> str:
         f"{tri} {symbol} | {side} OB RETEST | top={ob.top} bottom={ob.bottom} "
         f"| created_time={ob.created_time} | retest_time={retest_time_ms}"
     )
+
+
+def format_broken_ob(symbol: str, ob: ObRec, invalid_time_ms: int) -> str:
+    side = "BULL" if ob.is_bull else "BEAR"
+    return (
+        f"[BROKEN OB] {symbol} | {side} | top={ob.top} bottom={ob.bottom} "
+        f"| created_time={ob.created_time} | invalid_time={invalid_time_ms} | delta(B/S)={ob.bull_pct}/{ob.bear_pct}"
+    )
+
+
+def colorize(text: str, color: str) -> str:
+    return f"{color}{text}{ANSI_RESET}"
+
+
+def print_boxed_section(title: str, rows: List[str], color: str) -> None:
+    if not rows:
+        return
+    width = max(len(title), *(len(r) for r in rows)) + 2
+    top = f"┌{'─' * width}┐"
+    mid = f"├{'─' * width}┤"
+    bot = f"└{'─' * width}┘"
+    print(colorize(top, color))
+    print(colorize(f"│ {title.ljust(width - 1)}│", color))
+    print(colorize(mid, color))
+    for r in rows:
+        print(colorize(f"│ {r.ljust(width - 1)}│", color))
+    print(colorize(bot, color))
 
 
 # ============================================================
@@ -636,7 +719,7 @@ def add_ob_from_poc(
 # ============================================================
 
 
-def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, float]:
+def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[Dict[str, Any]], bool, float]:
     """
     Pine-match engine for:
     - ta.pivothigh/ta.pivotlow (left=swing_len, right=swing_len)
@@ -697,12 +780,20 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, f
         side = "BULL" if ob.is_bull else "BEAR"
         return (
             f"[NEW OB] {symbol} | {side} | top={ob.top} bottom={ob.bottom} "
-            f"| created_time={ob.created_time}"
+            f"| created_time={ob.created_time} | delta(B/S)={ob.bull_pct}/{ob.bear_pct}"
         )
 
     # --- Retest formatting already exists: format_triangle(...) ---
 
-    out_msgs: List[str] = []
+    out_events: List[Dict[str, Any]] = []
+
+    def add_event(kind: str, message: str, color: str, priority: float) -> None:
+        out_events.append({
+            "kind": kind,
+            "message": message,
+            "color": color,
+            "priority": float(priority),
+        })
 
     # Pine state variables
     sh_price: Optional[float] = None
@@ -865,6 +956,16 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, f
                     ob.active = False
                     ob.invalid_index = inv_idx
                     ob.invalid_time = inv_time
+                    if bi == last_idx and ob_passes_delta_filter(ob):
+                        ev_key = f"BROKEN_{'B' if ob.is_bull else 'S'}_{ob.created_time}"
+                        if should_emit_alert(symbol, ev_key, ts[bi]):
+                            delta_strength = max(ob.bull_pct, ob.bear_pct)
+                            add_event(
+                                "broken",
+                                format_broken_ob(symbol, ob, inv_time),
+                                ANSI_YELLOW,
+                                400.0 + delta_strength,
+                            )
                     continue
 
                 # RetestPrev uses candle [1]
@@ -905,30 +1006,71 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[str], bool, f
                 # Print ONE per bar like Pine alert
                 # pick the newest bull OB for message
                 for ob in obs:
-                    if ob.is_bull and ob.created_index == bos_idx_bull:
-                        out_msgs.append(format_new_ob(ob))
+                    if ob.is_bull and ob.created_index == bos_idx_bull and ob_passes_delta_filter(ob):
+                        delta_strength = max(ob.bull_pct, ob.bear_pct)
+                        add_event("new", format_new_ob(ob), ANSI_GREEN, 500.0 + delta_strength)
                         break
 
             if CONFIG.get("alert_new_ob", True) and ev_new_bear_ob and should_emit_alert(symbol, "NEW_BEAR_OB", bar_time_ms):
                 for ob in obs:
-                    if (not ob.is_bull) and ob.created_index == bos_idx_bear:
-                        out_msgs.append(format_new_ob(ob))
+                    if (not ob.is_bull) and ob.created_index == bos_idx_bear and ob_passes_delta_filter(ob):
+                        delta_strength = max(ob.bull_pct, ob.bear_pct)
+                        add_event("new", format_new_ob(ob), ANSI_GREEN, 500.0 + delta_strength)
                         break
 
             if CONFIG.get("alert_retest", True) and ev_bull_retest and should_emit_alert(symbol, "BULL_RETEST", bar_time_ms):
                 # Find most recent bull retest OB
                 for ob in obs:
-                    if ob.is_bull and ob.retest_time is not None and ob.retest_time == ts[bi - 1]:
-                        out_msgs.append(format_triangle(symbol, ob, ts[bi - 1]))
+                    if (
+                        ob.is_bull
+                        and ob.retest_time is not None
+                        and ob.retest_time == ts[bi - 1]
+                        and ob_passes_delta_filter(ob)
+                    ):
+                        delta_strength = max(ob.bull_pct, ob.bear_pct)
+                        add_event("retest", format_triangle(symbol, ob, ts[bi - 1]), ANSI_CYAN, 700.0 + delta_strength)
                         break
 
             if CONFIG.get("alert_retest", True) and ev_bear_retest and should_emit_alert(symbol, "BEAR_RETEST", bar_time_ms):
                 for ob in obs:
-                    if (not ob.is_bull) and ob.retest_time is not None and ob.retest_time == ts[bi - 1]:
-                        out_msgs.append(format_triangle(symbol, ob, ts[bi - 1]))
+                    if (
+                        (not ob.is_bull)
+                        and ob.retest_time is not None
+                        and ob.retest_time == ts[bi - 1]
+                        and ob_passes_delta_filter(ob)
+                    ):
+                        delta_strength = max(ob.bull_pct, ob.bear_pct)
+                        add_event("retest", format_triangle(symbol, ob, ts[bi - 1]), ANSI_CYAN, 700.0 + delta_strength)
                         break
 
-    return out_msgs, bullish_candidate, candidate_score
+            if CONFIG.get("alert_nearby_ob", True) and c[bi] > 0:
+                max_dist_pct = safe_float(CONFIG.get("nearby_ob_max_distance_pct", 0.35), 0.35)
+                max_results = max(1, int(CONFIG.get("nearby_ob_max_results", 3)))
+                req_delta = bool(CONFIG.get("nearby_ob_requires_delta", True))
+
+                nearby: List[Tuple[float, ObRec]] = []
+                for ob in obs:
+                    if not ob.active:
+                        continue
+                    if req_delta and not ob_passes_delta_filter(ob):
+                        continue
+                    d = ob_distance_pct(c[bi], ob)
+                    if d <= max_dist_pct:
+                        nearby.append((d, ob))
+
+                nearby.sort(key=lambda x: x[0])
+                for d, ob in nearby[:max_results]:
+                    event_key = f"NEAR_{'B' if ob.is_bull else 'S'}_{ob.created_time}"
+                    if should_emit_alert(symbol, event_key, bar_time_ms):
+                        delta_strength = max(ob.bull_pct, ob.bear_pct)
+                        add_event(
+                            "near",
+                            format_nearby_ob(symbol, c[bi], ob, d),
+                            ANSI_RED,
+                            1000.0 - (d * 100.0) + delta_strength,
+                        )
+
+    return out_events, bullish_candidate, candidate_score
 
 
 def sort_and_filter_symbols_high_first(exchange: ccxt.Exchange, symbols: List[str]) -> List[str]:
@@ -1018,23 +1160,67 @@ def scan_binance_usdtm() -> None:
     symbols = sort_and_filter_symbols_high_first(exchange, symbols)
 
     candidates: List[Tuple[float, str]] = []
+    all_events: List[Dict[str, Any]] = []
 
-    for sym in symbols:
+    def worker(sym: str, slot: int) -> Tuple[str, List[Dict[str, Any]], bool, float]:
+        base_sleep = max(0, int(CONFIG.get("scan_worker_spacing_ms", 120)))
+        jitter = max(0, int(CONFIG.get("scan_worker_jitter_ms", 80)))
+        delay_ms = (slot * base_sleep) + (random.randint(0, jitter) if jitter > 0 else 0)
+        if delay_ms > 0:
+            pytime.sleep(delay_ms / 1000.0)
+
+        ex = getattr(ccxt, CONFIG["exchange_id"])({
+            "enableRateLimit": True,
+            "options": {"defaultType": "future"},
+        })
+        ex.markets = exchange.markets
+        ex.markets_by_id = exchange.markets_by_id
+        ex.symbols = exchange.symbols
+        ex.currencies = exchange.currencies
+        ex.currencies_by_id = exchange.currencies_by_id
+
         try:
-            msgs, is_cand, score = run_symbol(sym, exchange)
+            msgs, is_cand, score = run_symbol(sym, ex)
+            return sym, msgs, is_cand, score
+        except Exception:
+            return sym, [], False, 0.0
 
-            # prints only selected events
-            for m in msgs:
-                print(m)
+    parallel = bool(CONFIG.get("scan_parallel", True))
+    concurrency = max(1, int(CONFIG.get("scan_concurrency", 4)))
 
+    if parallel and concurrency > 1 and len(symbols) > 1:
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            future_map = {
+                pool.submit(worker, sym, i % concurrency): sym
+                for i, sym in enumerate(symbols)
+            }
+            for fut in as_completed(future_map):
+                sym, msgs, is_cand, score = fut.result()
+                all_events.extend(msgs)
+                if CONFIG.get("print_candidates", True) and is_cand:
+                    candidates.append((score, sym))
+    else:
+        for sym in symbols:
+            sym, msgs, is_cand, score = worker(sym, 0)
+            all_events.extend(msgs)
             if CONFIG.get("print_candidates", True) and is_cand:
                 candidates.append((score, sym))
 
-        except Exception:
-            pass
+    # Organized Arabic output after collecting all symbols
+    near_rows = [e["message"] for e in all_events if e.get("kind") == "near"]
+    new_rows = [e["message"] for e in all_events if e.get("kind") == "new"]
+    broken_rows = [e["message"] for e in all_events if e.get("kind") == "broken"]
+    retest_rows = [e["message"] for e in all_events if e.get("kind") == "retest"]
 
-        if CONFIG["rate_limit_sleep"]:
-            exchange.sleep(exchange.rateLimit)
+    print_boxed_section("مناطق OB القريبة من السعر", near_rows, ANSI_RED)
+    print_boxed_section("مناطق OB الجديدة", new_rows, ANSI_GREEN)
+    print_boxed_section("مناطق OB المكسورة", broken_rows, ANSI_YELLOW)
+    print_boxed_section("إشارات إعادة الاختبار", retest_rows, ANSI_CYAN)
+
+    if all_events:
+        ranked = sorted(all_events, key=lambda x: x.get("priority", 0.0), reverse=True)
+        ranked_rows = [f"{i + 1}) {ev['message']}" for i, ev in enumerate(ranked[:30])]
+        print_boxed_section("ترتيب أهم مناطق OB بنهاية المسح", ranked_rows, ANSI_CYAN)
 
     # print candidates at end of cycle
     if CONFIG.get("print_candidates", True) and candidates:
