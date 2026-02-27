@@ -1,0 +1,859 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © nbbnlmbm43
+
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// Base Indicator: Order Blocks Volume Delta 3D | Flux Charts
+// Logic Integrated: True SMC Structure (IDM) from Smart Money Algo Pro E5
+
+//@version=6
+indicator("True SMC Order Blocks 3D [Volume Delta & IDM]", overlay = true,
+     max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500, max_polylines_count = 100, max_bars_back = 5000)
+
+//#region CONSTANTS
+const int MAX_STORED_OBS = 50
+const int retestSize = 4
+//#endregion
+
+//#region INPUTS
+grpSMC = "TRUE SMC STRUCTURE (E5 LOGIC)"
+showSMC = input.bool(true, "Show SMC BOS/CHoCH Lines", group = grpSMC)
+lengSMC = input.int(10, "Structure Length (Swing Size)", minval=2, group = grpSMC, tooltip="طول القمم والقيعان لتحديد الهيكل والتحفيز")
+
+grpOB = "ORDER BLOCKS"
+bullObColor = input.color(color.new(color.teal, 55), "Bullish OB", group = grpOB, inline = "sw")
+bearObColor = input.color(color.new(color.red, 55), "Bearish OB", group = grpOB, inline = "sw")
+invMethod = input.string("Wick", "Invalidation", options = ["Wick", "Close"], group = grpOB, display = display.none)
+showNearestX = input.int(3, "Show Nearest", minval = 1, maxval = 20, group = grpOB, display = display.none)
+extendZones = input.int(10, "Extend Zones", minval = 0, group = grpOB, display = display.none)
+showRetestLbl = input.bool(true, "Retest Labels", group = grpOB, inline = "tog")
+hideInvalid = input.bool(true, "Hide Invalidated Zones", group = grpOB, inline = "tog")
+
+grpVD = "VOLUME DELTA"
+vdEnable = input.bool(true, "Enable", group = grpVD, inline = "vd")
+vdBullColor = input.color(color.new(color.teal, 65), "", group = grpVD, inline = "vd")
+vdBearColor = input.color(color.new(color.red, 65), "", group = grpVD, inline = "vd")
+vd3D = input.bool(true, "3D", group = grpVD, inline = "3d") and vdEnable
+vd3DDepth = input.int(5, "", group = grpVD, inline = "3d", minval = 1, maxval = 5, display = display.none)
+displayStyle = input.string("Vertical", "Display Style", options = ["Vertical", "Horizontal"], group = grpVD, display = display.none)
+vdTfIn = input.timeframe("", "Volume Delta Timeframe", group = grpVD)
+showTotalVol = input.bool(true, "Display Total Volume", group = grpVD, inline = "vd2") and vdEnable
+showDeltaPct = input.bool(true, "Show Delta %", group = grpVD, inline = "vd2") and vdEnable
+vdTextColor = input.color(color.white, "", group = grpVD, inline = "vd2")
+
+grpAL = "ALERTS"
+alBullOB = input.bool(true, "Bullish Order Block", group = grpAL, inline = "oba")
+alBearOB = input.bool(true, "Bearish Order Block", group = grpAL, inline = "oba")
+alBullRetest = input.bool(true, "Bullish OB Retest", group = grpAL, inline = "obr")
+alBearRetest = input.bool(true, "Bearish OB Retest", group = grpAL, inline = "obr")
+//#endregion
+
+//#region TYPES
+type PolyParams
+    array<chart.point> points
+    color lineColor
+    color fillColor
+    int lineWidth
+
+type ObRec
+    int leftIndex
+    int leftTime
+    int createdIndex
+    int createdTime
+    float top
+    float bottom
+    bool isBull
+    bool active
+    bool retested
+    int retestIndex
+    int retestTime
+    int invalidIndex
+    int invalidTime
+    float bullVol
+    float bearVol
+    float totalVol
+    float bullPct
+    float bearPct
+    bool hasDelta
+
+type RetestRec
+    int barIndex
+    bool isBull
+    int obLeftIndex
+    int obCreatedIndex
+//#endregion
+
+//#region GENERIC HELPERS
+method clearAll(array<box> bx, array<polyline> pl, array<label> lb) =>
+    if bx.size() > 0
+        for i = 0 to bx.size() - 1
+            bx.get(i).delete()
+    bx.clear()
+    if pl.size() > 0
+        for i = 0 to pl.size() - 1
+            pl.get(i).delete()
+    pl.clear()
+    if lb.size() > 0
+        for i = 0 to lb.size() - 1
+            lb.get(i).delete()
+    lb.clear()
+
+method sideBox(array<chart.point> pts, int x, float btm, float top, float depthY, int widthX) =>
+    pts.unshift(chart.point.from_index(x, btm))
+    pts.unshift(chart.point.from_index(x + widthX, btm + depthY))
+    pts.unshift(chart.point.from_index(x + widthX, top + depthY))
+    pts.unshift(chart.point.from_index(x, top))
+    pts.unshift(chart.point.from_index(x, btm))
+
+zoneDistance(float px, float zTop, float zBot) =>
+    px > zTop ? px - zTop : px < zBot ? zBot - px : 0.0
+
+method insertBest(array<float> dists, array<int> idxs, float dist, int idx, int kMax) =>
+    if dists.size() == 0
+        dists.push(dist)
+        idxs.push(idx)
+    else
+        int pos = dists.size()
+        if dists.size() > 0
+            for j = 0 to dists.size() - 1
+                if dist < dists.get(j)
+                    pos := j
+                    break
+        dists.insert(pos, dist)
+        idxs.insert(pos, idx)
+    while dists.size() > kMax
+        dists.pop()
+        idxs.pop()
+
+pickNearest(array<ObRec> store, bool wantBull, int kMax, bool includeInvalid) =>
+    array<float> dists = array.new_float()
+    array<int> idxs = array.new_int()
+    if store.size() > 0
+        for i = 0 to store.size() - 1
+            ObRec ob = store.get(i)
+            if ob.isBull == wantBull
+                bool ok = includeInvalid ? true : ob.active
+                if ok
+                    float dist = zoneDistance(close, ob.top, ob.bottom)
+                    dists.insertBest(idxs, dist, i, kMax)
+    idxs
+
+formatVol(float v) => str.tostring(v, format.volume)
+//#endregion
+
+//#region VOLUME ENGINE
+tfSec(string tf) => timeframe.in_seconds(tf)
+int chartSec = tfSec(timeframe.period)
+int srcSec = tfSec(vdTfIn)
+bool useLtf = not na(chartSec) and not na(srcSec) and srcSec < chartSec
+
+getBarVols() =>
+    float tot = na
+    float bull = na
+    float bear = na
+    if not useLtf or vdTfIn == ""
+        float v = volume
+        bool up = close > open
+        bool dn = close < open
+        tot := v
+        bull := up ? v : 0.0
+        bear := dn ? v : 0.0
+    else
+        array<float> oArr = request.security_lower_tf(syminfo.tickerid, vdTfIn, open)
+        array<float> cArr = request.security_lower_tf(syminfo.tickerid, vdTfIn, close)
+        array<float> vArr = request.security_lower_tf(syminfo.tickerid, vdTfIn, volume)
+        float tSum = 0.0
+        float bSum = 0.0
+        float sSum = 0.0
+        int n = array.size(vArr)
+        if n > 0
+            for i = 0 to n - 1
+                float v2 = array.get(vArr, i)
+                float o2 = array.get(oArr, i)
+                float c2 = array.get(cArr, i)
+                tSum += v2
+                if c2 > o2
+                    bSum += v2
+                else if c2 < o2
+                    sSum += v2
+        tot := tSum
+        bull := bSum
+        bear := sSum
+    [tot, bull, bear]
+
+[barTotVol, barBullVol, barBearVol] = getBarVols()
+//#endregion
+
+//#region POC ENGINE
+findMostTouchedPrice(int fromIdx, int toIdx, int nBins) =>
+    int span = toIdx - fromIdx
+    if span <= 0 or na(fromIdx) or na(toIdx)
+        [na, 0]
+    else
+        float minP = 1e10
+        float maxP = -1e10
+        for idx = fromIdx to toIdx
+            int rel = bar_index - idx
+            if rel >= 0
+                float lo = low[rel]
+                float hi = high[rel]
+                if not na(lo) and not na(hi)
+                    if lo < minP
+                        minP := lo
+                    if hi > maxP
+                        maxP := hi
+        if not (minP < maxP)
+            [na, 0]
+        else
+            float step = (maxP - minP) / nBins
+            step := step <= 0 ? syminfo.mintick : step
+            array<float> diffCnt = array.new_float(nBins, 0.0)
+            for idx = fromIdx to toIdx
+                int rel2 = bar_index - idx
+                if rel2 >= 0
+                    float lo2 = low[rel2]
+                    float hi2 = high[rel2]
+                    if not na(lo2) and not na(hi2)
+                        int sBin = int(math.floor((lo2 - minP) / step))
+                        int eBin = int(math.floor((hi2 - minP) / step))
+                        sBin := sBin < 0 ? 0 : sBin > nBins - 1 ? nBins - 1 : sBin
+                        eBin := eBin < 0 ? 0 : eBin > nBins - 1 ? nBins - 1 : eBin
+                        float cStart = diffCnt.get(sBin)
+                        diffCnt.set(sBin, cStart + 1.0)
+                        if eBin + 1 < nBins
+                            float cEnd = diffCnt.get(eBin + 1)
+                            diffCnt.set(eBin + 1, cEnd - 1.0)
+            int   bestBin = 0
+            float bestCnt = 0.0
+            float runCnt = 0.0
+            for i = 0 to nBins - 1
+                runCnt += diffCnt.get(i)
+                if runCnt > bestCnt
+                    bestCnt := runCnt
+                    bestBin := i
+            float poc = minP + (bestBin + 0.5) * step
+            [poc, int(bestCnt)]
+
+volumeAtPrice(int fromIdx, int toIdx, float poc) =>
+    int   touches = 0
+    float totVol = 0.0
+    float bullVol = 0.0
+    float bearVol = 0.0
+    int span = toIdx - fromIdx
+    if not na(poc) and span >= 0
+        for step = 0 to span
+            int idx = toIdx - step
+            int rel = bar_index - idx
+            if rel >= 0
+                float lo = low[rel]
+                float hi = high[rel]
+                if not na(lo) and not na(hi) and lo <= poc and hi >= poc
+                    touches += 1
+                    float vTot = barTotVol[rel]
+                    float vBull = barBullVol[rel]
+                    float vBear = barBearVol[rel]
+                    if not na(vTot)
+                        totVol += vTot
+                    if not na(vBull)
+                        bullVol += vBull
+                    if not na(vBear)
+                        bearVol += vBear
+    [touches, totVol, bullVol, bearVol]
+
+calcMostTouchedPriceVol(int fromIdx, int toIdx, int nBins) =>
+    [poc, _approxTouches] = findMostTouchedPrice(fromIdx, toIdx, nBins)
+    [touches, totVol, bullVol, bearVol] = volumeAtPrice(fromIdx, toIdx, poc)
+    [poc, touches, totVol, bullVol, bearVol]
+//#endregion
+
+//#region TRUE SMC LOGIC (Integrated from Smart Money Algo Pro E5)
+// 1. Detect Standard Swings (Unconfirmed)
+float ph = ta.pivothigh(high, lengSMC, lengSMC)
+float pl = ta.pivotlow(low, lengSMC, lengSMC)
+
+// 2. Detect Minor Swings for Inducement (IDM)
+float minor_ph = ta.pivothigh(high, 1, 1)
+float minor_pl = ta.pivotlow(low, 1, 1)
+
+// 3. SMC State Variables
+var float unconfirmed_H = na, var int unconfirmed_H_idx = na
+var float unconfirmed_L = na, var int unconfirmed_L_idx = na
+
+var float confirmed_H = na, var int confirmed_H_idx = na, var float confirmed_H_price = na
+var float confirmed_L = na, var int confirmed_L_idx = na, var float confirmed_L_price = na
+
+var float current_IDM_L = na
+var float current_IDM_H = na
+
+bool bosBullNow = false
+bool bosBearNow = false
+int originBullIdx = na
+int originBearIdx = na
+
+// 4. Register Swings
+if not na(ph)
+    unconfirmed_H := ph
+    unconfirmed_H_idx := bar_index - lengSMC
+    current_IDM_L := na // Reset IDM when new high forms
+
+if not na(pl)
+    unconfirmed_L := pl
+    unconfirmed_L_idx := bar_index - lengSMC
+    current_IDM_H := na // Reset IDM when new low forms
+
+// 5. Track Inducement (Minor pullback)
+if not na(minor_pl) and not na(unconfirmed_H) and bar_index > unconfirmed_H_idx + 1
+    if na(current_IDM_L) or minor_pl > current_IDM_L
+        current_IDM_L := minor_pl
+
+if not na(minor_ph) and not na(unconfirmed_L) and bar_index > unconfirmed_L_idx + 1
+    if na(current_IDM_H) or minor_ph < current_IDM_H
+        current_IDM_H := minor_ph
+
+// 6. Confirm Structure (Taking IDM)
+if not na(unconfirmed_H) and not na(current_IDM_L) and low < current_IDM_L
+    confirmed_H := unconfirmed_H
+    confirmed_H_idx := unconfirmed_H_idx
+    confirmed_H_price := unconfirmed_H
+    unconfirmed_H := na // Stop checking this high
+
+if not na(unconfirmed_L) and not na(current_IDM_H) and high > current_IDM_H
+    confirmed_L := unconfirmed_L
+    confirmed_L_idx := unconfirmed_L_idx
+    confirmed_L_price := unconfirmed_L
+    unconfirmed_L := na // Stop checking this low
+
+// 7. Detect Break of Structure (Close beyond Confirmed Level)
+if not na(confirmed_H) and close > confirmed_H and close[1] <= confirmed_H
+    bosBullNow := true
+    originBullIdx := confirmed_H_idx
+    
+    if showSMC
+        line.new(confirmed_H_idx, confirmed_H_price, bar_index, confirmed_H_price, color=color.green, style=line.style_dashed)
+        label.new(int(math.avg(confirmed_H_idx, bar_index)), confirmed_H_price, "True BOS+", textcolor=color.green, color=color.new(color.white,100), style=label.style_label_down, size=size.small)
+    
+    confirmed_H := na // Consume the level
+
+if not na(confirmed_L) and close < confirmed_L and close[1] >= confirmed_L
+    bosBearNow := true
+    originBearIdx := confirmed_L_idx
+
+    if showSMC
+        line.new(confirmed_L_idx, confirmed_L_price, bar_index, confirmed_L_price, color=color.red, style=line.style_dashed)
+        label.new(int(math.avg(confirmed_L_idx, bar_index)), confirmed_L_price, "True BOS+", textcolor=color.red, color=color.new(color.white,100), style=label.style_label_up, size=size.small)
+    
+    confirmed_L := na // Consume the level
+//#endregion
+
+//#region OB ENGINE (Linked to True SMC)
+var array<ObRec> obs = array.new<ObRec>()
+var array<RetestRec> obRetests = array.new<RetestRec>()
+
+var int lastBullRetestBar = na
+var int lastBearRetestBar = na
+
+bool evNewBullOB = false
+bool evNewBearOB = false
+bool evBullRetest = false
+bool evBearRetest = false
+
+// Use historical booleans to trigger calculations at the bar close
+bool bosBear = bosBearNow[1]
+bool bosBull = bosBullNow[1]
+
+int bosIdxBear = bar_index - 1
+int fromIdxBear = originBearIdx[1]
+int toIdxBear = bosIdxBear
+[pocB, touchesB, totVolB, bullVolB, bearVolB] = calcMostTouchedPriceVol(fromIdxBear, toIdxBear, 40)
+
+int bosIdxBull = bar_index - 1
+int fromIdxBull = originBullIdx[1]
+int toIdxBull = bosIdxBull
+[pocH, touchesH, totVolH, bullVolH, bearVolH] = calcMostTouchedPriceVol(fromIdxBull, toIdxBull, 40)
+
+pruneObs() =>
+    int minLeft = math.max(0, bar_index - 4999)
+    if obs.size() > 0
+        for i = obs.size() - 1 to 0
+            ObRec ob = obs.get(i)
+            if ob.leftIndex < minLeft
+                obs.remove(i)
+    while obs.size() > MAX_STORED_OBS
+        bool removed = false
+        if obs.size() > 0
+            for j = obs.size() - 1 to 0
+                ObRec ob2 = obs.get(j)
+                if not ob2.active
+                    obs.remove(j)
+                    removed := true
+                    break
+        if not removed and obs.size() > 0
+            obs.pop()
+
+addObFromPoc(int baseIdx, float top, float bottom, bool isBull, float totSeed, float bullSeed, float bearSeed, int createdIdx) =>
+    int offLeft = bar_index - baseIdx
+    int offCreated = bar_index - createdIdx
+    int leftTime = time[offLeft]
+    int createdTm = time[offCreated]
+    float tot = totSeed
+    float bVol = bullSeed
+    float sVol = bearSeed
+    bool hasDelta = tot > 0.0
+    float bullPct = hasDelta ? math.round((bVol / tot) * 100.0) : 50.0
+    float bearPct = hasDelta ? 100.0 - bullPct : 50.0
+    obs.unshift(ObRec.new(baseIdx, leftTime, createdIdx, createdTm, top, bottom, isBull, 
+     true, false, na, na, na, na, bVol, sVol, tot, bullPct, bearPct, hasDelta))
+    pruneObs()
+
+obOverlapsActive(float zoneTop, float zoneBottom) =>
+    float zTop = math.max(zoneTop, zoneBottom)
+    float zBot = math.min(zoneTop, zoneBottom)
+    bool overlaps = false
+    if obs.size() > 0
+        for i = 0 to obs.size() - 1
+            ObRec ob = obs.get(i)
+            if ob.active
+                float oTop = math.max(ob.top, ob.bottom)
+                float oBot = math.min(ob.top, ob.bottom)
+                bool rangeOverlap = zTop >= oBot and zBot <= oTop
+                if rangeOverlap
+                    overlaps := true
+                    break
+    overlaps
+
+hasGapBetween(int anchorIdx, int bosIdx, bool isBull) =>
+    bool gap = false
+    int fromIdx = math.min(anchorIdx, bosIdx)
+    int toIdx = math.max(anchorIdx, bosIdx)
+    if toIdx - fromIdx >= 1
+        for absIdx = fromIdx + 1 to toIdx
+            int relNow = bar_index - absIdx
+            int relPrev = relNow + 1  
+            if relNow >= 0 and relPrev >= 0
+                float hiPrev = high[relPrev]
+                float loPrev = low[relPrev]
+                float hiNow = high[relNow]
+                float loNow = low[relNow]
+                if not na(hiPrev) and not na(loPrev) and not na(hiNow) and not na(loNow)
+                    if isBull
+                        if loNow > hiPrev
+                            gap := true
+                            break
+                    else
+                        if hiNow < loPrev
+                            gap := true
+                            break
+    gap
+
+// Bearish True BOS -> Bearish OB
+if bosBear
+    int bosIdx = bosIdxBear
+    int fromIdx = fromIdxBear
+    int toIdx = toIdxBear
+    if not na(pocB) and touchesB > 0 and not na(fromIdx) and not na(toIdx)
+        int spanB = toIdx - fromIdx
+        int bestIdx = na
+        float runMaxHigh = na
+        if spanB >= 0
+            for step = 0 to spanB
+                int idx = toIdx - step
+                int rel = bar_index - idx
+                if rel >= 0
+                    float lo = low[rel]
+                    float hi = high[rel]
+                    if not na(lo) and not na(hi)
+                        runMaxHigh := na(runMaxHigh) ? hi : math.max(runMaxHigh, hi)
+                        bool touches = lo <= pocB and hi >= pocB
+                        if touches and hi == runMaxHigh
+                            bestIdx := idx
+        bool gapLeg = not na(bestIdx) ? hasGapBetween(bestIdx, bosIdx, false) : false
+        if not na(bestIdx) and not gapLeg
+            int relBest = bar_index - bestIdx
+            float top = high[relBest]
+            float bottom = low[relBest]
+            if not obOverlapsActive(top, bottom)
+                addObFromPoc(bestIdx, top, bottom, false, totVolB, bullVolB, bearVolB, bosIdx)
+                evNewBearOB := true
+
+// Bullish True BOS -> Bullish OB
+if bosBull
+    int bosIdx2 = bosIdxBull
+    int fromIdx2 = fromIdxBull
+    int toIdx2 = toIdxBull
+    if not na(pocH) and touchesH > 0 and not na(fromIdx2) and not na(toIdx2)
+        int spanH = toIdx2 - fromIdx2
+        int bestIdx2 = na
+        float runMinLow = na
+        if spanH >= 0
+            for step = 0 to spanH
+                int idx2 = toIdx2 - step
+                int rel2 = bar_index - idx2
+                if rel2 >= 0
+                    float lo2 = low[rel2]
+                    float hi2 = high[rel2]
+                    if not na(lo2) and not na(hi2)
+                        runMinLow := na(runMinLow) ? lo2 : math.min(runMinLow, lo2)
+                        bool touches = lo2 <= pocH and hi2 >= pocH
+                        if touches and lo2 == runMinLow
+                            bestIdx2 := idx2
+        bool gapLeg2 = not na(bestIdx2) ? hasGapBetween(bestIdx2, bosIdx2, true) : false
+        if not na(bestIdx2) and not gapLeg2
+            int relBest2 = bar_index - bestIdx2
+            float top2 = high[relBest2]
+            float bottom2 = low[relBest2]
+            if not obOverlapsActive(top2, bottom2)
+                addObFromPoc(bestIdx2, top2, bottom2, true, totVolH, bullVolH, bearVolH, bosIdx2)
+                evNewBullOB := true
+
+if obs.size() > 0
+    for i = 0 to obs.size() - 1
+        ObRec ob = obs.get(i)
+        if ob.active
+            bool invalid = false
+            int invIdx = na
+            int invTime = na
+
+            if ob.isBull
+                if invMethod == "Wick"
+                    invalid := low < ob.bottom
+                    invIdx := bar_index
+                    invTime := time
+                else
+                    if bar_index > 0
+                        invalid := close[1] < ob.bottom
+                        invIdx := bar_index - 1
+                        invTime := time[1]
+            else
+                if invMethod == "Wick"
+                    invalid := high > ob.top
+                    invIdx := bar_index
+                    invTime := time
+                else
+                    if bar_index > 0
+                        invalid := close[1] > ob.top
+                        invIdx := bar_index - 1
+                        invTime := time[1]
+
+            if invalid
+                ob.active := false
+                ob.invalidIndex := invIdx
+                ob.invalidTime := invTime
+
+            bool retestPrev = false
+            int retestBar = na
+            int retestTm = na
+
+            if bar_index > 0
+                if ob.isBull
+                    bool opensAbovePrev = open[1] > ob.top
+                    bool closesAbovePrev = close[1] > ob.top
+                    bool wickTouchesPrev = low[1] <= ob.top and low[1] >= ob.bottom
+                    retestPrev := opensAbovePrev and closesAbovePrev and wickTouchesPrev
+                else
+                    bool opensBelowPrev = open[1] < ob.bottom
+                    bool closesBelowPrev = close[1] < ob.bottom
+                    bool wickTouchesPrev = high[1] >= ob.bottom and high[1] <= ob.top
+                    retestPrev := opensBelowPrev and closesBelowPrev and wickTouchesPrev
+
+                if retestPrev
+                    retestBar := bar_index - 1  
+                    retestTm := time[1]
+
+            if retestPrev and not na(retestBar) and retestBar > ob.createdIndex
+                ob.retested := true
+                ob.retestIndex := retestBar
+                ob.retestTime := retestTm
+
+                int lastSideBar = ob.isBull ? lastBullRetestBar : lastBearRetestBar
+                bool canLog = na(lastSideBar) or retestBar - lastSideBar >= 4 
+
+                if canLog
+                    obRetests.unshift(RetestRec.new(retestBar, ob.isBull, ob.leftIndex, ob.createdIndex))
+                    if ob.isBull
+                        evBullRetest := true
+                        lastBullRetestBar := retestBar
+                    else
+                        evBearRetest := true
+                        lastBearRetestBar := retestBar
+
+        obs.set(i, ob)
+//#endregion
+
+//#region DRAW ENGINE
+bool showVD = vdEnable
+bool isVert = displayStyle == "Vertical"
+bool isHorz = not isVert
+float dayAtr = ta.atr(14) 
+
+var array<box> allBoxes = array.new<box>()
+var array<polyline> allPolys = array.new<polyline>()
+var array<label> allLabels = array.new<label>()
+
+drawPoly(PolyParams pp) =>
+    if not na(pp) and not na(pp.points) and pp.points.size() > 0
+        allPolys.unshift(polyline.new(points = pp.points, line_color = pp.lineColor, fill_color = pp.fillColor))
+
+method pushBox(array<box> store, box b) => store.unshift(b)
+method pushLabel(array<label> store, label l) => store.unshift(l)
+
+obColors(ObRec ob) =>
+    color bullCol = vdEnable ? vdBullColor : bullObColor
+    color bearCol = vdEnable ? vdBearColor : bearObColor
+    color baseCol = ob.isBull ? bullCol : bearCol
+    color faded = ob.active ? baseCol : color.new(baseCol, 85)
+    [baseCol, faded]
+
+obRightIndex(ObRec ob) =>
+    int activeRight = bar_index + extendZones
+    if ob.active
+        activeRight
+    else
+        na(ob.invalidIndex) ? activeRight : ob.invalidIndex
+
+drawObZoneBox(ObRec ob, color faded) =>
+    int xR = obRightIndex(ob)
+    int xL = ob.leftIndex
+    int minBar = bar_index - 4999
+    if xL < minBar
+        xL := minBar
+    xR := math.max(xR, xL)
+    box bx = box.new(left = xL, right = xR, top = ob.top, bottom = ob.bottom, xloc = xloc.bar_index, bgcolor = faded, border_color = na, border_width = 0)
+    allBoxes.pushBox(bx)
+
+drawRetestLabels(array<int> bullAct, array<int> bearAct, array<int> bullInv, array<int> bearInv) =>
+    int ret = 0
+    if showRetestLbl and obRetests.size() > 0
+        int minBar = bar_index - 4999
+        int lastBullLbl = na
+        int lastBearLbl = na
+
+        for i = obRetests.size() - 1 to 0
+            RetestRec r = obRetests.get(i)
+            if r.barIndex < minBar or r.barIndex > bar_index
+                RetestRec _trash = obRetests.remove(i)
+            else
+                bool hasDisplayedParent = false
+                if r.isBull
+                    if bullAct.size() > 0
+                        for j = 0 to bullAct.size() - 1
+                            ObRec ob = obs.get(bullAct.get(j))
+                            if ob.leftIndex == r.obLeftIndex and ob.createdIndex == r.obCreatedIndex
+                                hasDisplayedParent := true
+                                break
+                    if not hasDisplayedParent and not hideInvalid and bullInv.size() > 0
+                        for j = 0 to bullInv.size() - 1
+                            ObRec ob = obs.get(bullInv.get(j))
+                            if ob.leftIndex == r.obLeftIndex and ob.createdIndex == r.obCreatedIndex
+                                hasDisplayedParent := true
+                                break
+                else
+                    if bearAct.size() > 0
+                        for j = 0 to bearAct.size() - 1
+                            ObRec ob = obs.get(bearAct.get(j))
+                            if ob.leftIndex == r.obLeftIndex and ob.createdIndex == r.obCreatedIndex
+                                hasDisplayedParent := true
+                                break
+                    if not hasDisplayedParent and not hideInvalid and bearInv.size() > 0
+                        for j = 0 to bearInv.size() - 1
+                            ObRec ob = obs.get(bearInv.get(j))
+                            if ob.leftIndex == r.obLeftIndex and ob.createdIndex == r.obCreatedIndex
+                                hasDisplayedParent := true
+                                break
+
+                if not hasDisplayedParent
+                    continue
+
+                int age = bar_index - r.barIndex
+                if age >= 0 and age <= 4999
+                    if r.isBull
+                        if not na(lastBullLbl) and r.barIndex - lastBullLbl < 3
+                            continue
+                        lastBullLbl := r.barIndex
+                    else
+                        if not na(lastBearLbl) and r.barIndex - lastBearLbl < 3
+                            continue
+                        lastBearLbl := r.barIndex
+
+                    float yPrice = close[age]
+                    color baseCol = r.isBull ? bullObColor : bearObColor
+                    st = r.isBull ? label.style_triangleup : label.style_triangledown
+                    yl = r.isBull ? yloc.belowbar : yloc.abovebar
+
+                    label newLbl = label.new(r.barIndex, yPrice, "", xloc = xloc.bar_index, yloc = yl, style = st,
+                         color = color.new(baseCol, 0), textcolor = color.new(baseCol, 0), size = retestSize, force_overlay = true)
+                    allLabels.pushLabel(newLbl)
+    ret
+
+obGeom(ObRec ob) =>
+    int rawL = ob.leftIndex
+    int rawR = obRightIndex(ob)
+    int minBar = bar_index - 4999
+    int xL = math.max(rawL, minBar)
+    int xR = math.max(rawR, xL)
+    int widthX = vd3DDepth
+    int xR2 = xR + widthX
+    float yT = ob.top
+    float yB = ob.bottom
+    float h = yT - yB
+    [xL, xR, widthX, xR2, yT, yB, h]
+
+deltaTexts(float bullPct, float bearPct) =>
+    string bullTxt = showDeltaPct ? str.tostring(bullPct) + "%" : ""
+    string bearTxt = showDeltaPct ? str.tostring(bearPct) + "%" : ""
+    [bullTxt, bearTxt]
+
+drawTotalVolLabel(int xL, int xR, float yT, float yB, float h, float total) =>
+    if showTotalVol
+        int cx = xR - 1
+        if cx < xL
+            cx := xL
+        float cy = yB + h * 0.25
+        string txt = formatVol(total)
+        label lb = label.new(cx, cy, txt, xloc = xloc.bar_index, style = label.style_label_right, 
+         textcolor = vdTextColor, color = #ffffff00, size = size.small, force_overlay = true)
+        allLabels.pushLabel(lb)
+
+drawDeltaFills(int xL, int xR, float yT, float yB, float h, float bullPct, string bullTxt, string bearTxt) =>
+    color bullCol = vdEnable ? vdBullColor : bullObColor
+    color bearCol = vdEnable ? vdBearColor : bearObColor
+    if isVert
+        int splitX = xL + int((xR - xL) * (bullPct / 100.0))
+        splitX := xR - xL >= 2 ? math.max(xL + 1, math.min(xR - 1, splitX)) : xL
+        box bBull = box.new(xL, yT, splitX, yB, xloc = xloc.bar_index, bgcolor = bullCol, border_width = 0, text = bullTxt, text_color = vdTextColor, text_size = size.small)
+        box bBear = box.new(splitX, yT, xR, yB, xloc = xloc.bar_index, bgcolor = bearCol, border_width = 0, text = bearTxt, text_color = vdTextColor, text_size = size.small)
+        allBoxes.pushBox(bBull)
+        allBoxes.pushBox(bBear)
+    else
+        float midY = yB + h * (bullPct / 100.0)
+        box bBull = box.new(xL, midY, xR, yB, xloc = xloc.bar_index, bgcolor = bullCol, border_width = 0, text = bullTxt, text_color = vdTextColor, text_size = size.small)
+        box bBear = box.new(xL, yT, xR, midY, xloc = xloc.bar_index, bgcolor = bearCol, border_width = 0, text = bearTxt, text_color = vdTextColor, text_size = size.small)
+        allBoxes.pushBox(bBull)
+        allBoxes.pushBox(bBear)
+
+var int leftVisIdx = na
+if na(leftVisIdx) and time >= chart.left_visible_bar_time
+    leftVisIdx := bar_index
+
+drawDelta3D(int xL, int xR, int widthX, int xR2, float yT, float yB, float h, float bullPct) =>
+    color bullCol = vdEnable ? vdBullColor : bullObColor
+    color bearCol = vdEnable ? vdBearColor : bearObColor
+    float depthY = dayAtr * (0.1 * vd3DDepth)
+    int visibleLeft = na(leftVisIdx) ? xL : math.max(xL, leftVisIdx)
+    int visibleRight = xR
+    if isHorz
+        float midY = yB + h * (bullPct / 100.0)
+        if bullPct > 0
+            array<chart.point> ptsFrontBull = array.new<chart.point>()
+            ptsFrontBull.sideBox(xR, yB, midY, depthY, widthX)
+            drawPoly(PolyParams.new(ptsFrontBull, color.new(chart.fg_color, 90), color.new(bullCol, 70), 1))
+        if bullPct < 100
+            array<chart.point> ptsFrontBear = array.new<chart.point>()
+            ptsFrontBear.sideBox(xR, midY, yT, depthY, widthX)
+            drawPoly(PolyParams.new(ptsFrontBear, color.new(chart.fg_color, 90), color.new(bearCol, 70), 1))
+        if visibleRight > visibleLeft
+            array<chart.point> ptsTop = array.new<chart.point>()
+            ptsTop.unshift(chart.point.from_index(visibleRight + widthX, yT + depthY))
+            ptsTop.unshift(chart.point.from_index(visibleLeft + widthX, yT + depthY))
+            ptsTop.unshift(chart.point.from_index(visibleLeft, yT))
+            ptsTop.unshift(chart.point.from_index(visibleRight, yT))
+            ptsTop.unshift(chart.point.from_index(visibleRight + widthX, yT + depthY))
+            drawPoly(PolyParams.new(ptsTop, color.new(chart.fg_color, 90), color.new(bearCol, 70), 1))
+    else
+        array<chart.point> ptsFront = array.new<chart.point>()
+        ptsFront.sideBox(xR, yB, yT, depthY, widthX)
+        drawPoly(PolyParams.new(ptsFront, color.new(chart.fg_color, 90), color.new(bearCol, 70), 1))
+        if visibleRight > visibleLeft
+            float frac = bullPct / 100.0
+            int bullRight = visibleLeft + int((visibleRight - visibleLeft) * frac)
+            bullRight := math.max(visibleLeft, math.min(visibleRight, bullRight))
+            if bullPct > 0 and bullRight > visibleLeft
+                array<chart.point> ptsTopBull = array.new<chart.point>()
+                ptsTopBull.unshift(chart.point.from_index(bullRight + widthX, yT + depthY))
+                ptsTopBull.unshift(chart.point.from_index(visibleLeft + widthX, yT + depthY))
+                ptsTopBull.unshift(chart.point.from_index(visibleLeft, yT))
+                ptsTopBull.unshift(chart.point.from_index(bullRight, yT))
+                ptsTopBull.unshift(chart.point.from_index(bullRight + widthX, yT + depthY))
+                drawPoly(PolyParams.new(ptsTopBull, color.new(chart.fg_color, 90), color.new(bullCol, 70), 1))
+            if bullPct < 100 and visibleRight > bullRight
+                array<chart.point> ptsTopBear = array.new<chart.point>()
+                ptsTopBear.unshift(chart.point.from_index(visibleRight + widthX, yT + depthY))
+                ptsTopBear.unshift(chart.point.from_index(bullRight + widthX, yT + depthY))
+                ptsTopBear.unshift(chart.point.from_index(bullRight, yT))
+                ptsTopBear.unshift(chart.point.from_index(visibleRight, yT))
+                ptsTopBear.unshift(chart.point.from_index(visibleRight + widthX, yT + depthY))
+                drawPoly(PolyParams.new(ptsTopBear, color.new(chart.fg_color, 90), color.new(bearCol, 70), 1))
+
+drawZoneAndVolume(ObRec ob) =>
+    [baseCol, faded] = obColors(ob)
+    drawObZoneBox(ob, faded)
+    if showVD and ob.hasDelta
+        [xL, xR, widthX, xR2, yT, yB, h] = obGeom(ob)
+        [bullTxt, bearTxt] = deltaTexts(ob.bullPct, ob.bearPct)
+        drawTotalVolLabel(xL, xR, yT, yB, h, ob.totalVol)
+        drawDeltaFills(xL, xR, yT, yB, h, ob.bullPct, bullTxt, bearTxt)
+        if vd3D
+            drawDelta3D(xL, xR, widthX, xR2, yT, yB, h, ob.bullPct)
+    true
+
+allBoxes.clearAll(allPolys, allLabels)
+
+array<int> bullActive = array.new_int()
+array<int> bearActive = array.new_int()
+array<int> bullInvalid = array.new_int()
+array<int> bearInvalid = array.new_int()
+
+if hideInvalid
+    bullActive := pickNearest(obs, true, showNearestX, false)
+    bearActive := pickNearest(obs, false, showNearestX, false)
+else
+    bullActive := pickNearest(obs, true, showNearestX, false)
+    bearActive := pickNearest(obs, false, showNearestX, false)
+    if obs.size() > 0
+        for i = 0 to obs.size() - 1
+            ObRec o = obs.get(i)
+            if not o.active
+                if o.isBull
+                    bullInvalid.push(i)
+                else
+                    bearInvalid.push(i)
+
+if bearInvalid.size() > 0 and not hideInvalid
+    for i = 0 to bearInvalid.size() - 1
+        ObRec ob = obs.get(bearInvalid.get(i))
+        drawZoneAndVolume(ob)
+
+if bearActive.size() > 0
+    for i = 0 to bearActive.size() - 1
+        ObRec ob = obs.get(bearActive.get(i))
+        drawZoneAndVolume(ob)
+
+if bullInvalid.size() > 0 and not hideInvalid
+    for i = 0 to bullInvalid.size() - 1
+        ObRec ob = obs.get(bullInvalid.get(i))
+        drawZoneAndVolume(ob)
+
+if bullActive.size() > 0
+    for i = 0 to bullActive.size() - 1
+        ObRec ob = obs.get(bullActive.get(i))
+        drawZoneAndVolume(ob)
+
+drawRetestLabels(bullActive, bearActive, bullInvalid, bearInvalid)
+//#endregion
+
+//#region ALERTS
+alertcondition(alBullOB and evNewBullOB, "Bullish Order Block", "New Bullish Order Block detected.")
+alertcondition(alBearOB and evNewBearOB, "Bearish Order Block", "Bearish Order Block detected.")
+alertcondition(alBullRetest and evBullRetest, "Bullish OB Retest", "Bullish Order Block retest.")
+alertcondition(alBearRetest and evBearRetest, "Bearish OB Retest", "Bearish Order Block retest.")
+
+if alBullOB and evNewBullOB
+    alert("Bullish Order Block detected.", alert.freq_once_per_bar)
+
+if alBearOB and evNewBearOB
+    alert("Bearish Order Block detected.", alert.freq_once_per_bar)
+
+if alBullRetest and evBullRetest
+    alert("Bullish Order Block retest.", alert.freq_once_per_bar)
+
+if alBearRetest and evBearRetest
+    alert("Bearish Order Block retest.", alert.freq_once_per_bar)
+//#endregion
