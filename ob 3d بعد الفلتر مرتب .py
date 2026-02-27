@@ -63,7 +63,7 @@ CONFIG = {
     "LTF_EXTRA_BUFFER_CANDLES": 2000,
 
     # Indicator params (match Pine defaults)
-    "swing_len": 5,
+    "swing_len": 10,
     "STRICT_PIVOT": True,
     "invalidation": "Wick",           # "Wick" or "Close"
     "max_stored_obs": 50,
@@ -795,14 +795,24 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[Dict[str, Any
             "priority": float(priority),
         })
 
-    # Pine state variables
-    sh_price: Optional[float] = None
-    sh_idx: Optional[int] = None
-    sl_price: Optional[float] = None
-    sl_idx: Optional[int] = None
+    # True SMC state variables (mirrors Pine logic in 3d.txt)
+    unconfirmed_h: Optional[float] = None
+    unconfirmed_h_idx: Optional[int] = None
+    unconfirmed_l: Optional[float] = None
+    unconfirmed_l_idx: Optional[int] = None
+
+    confirmed_h: Optional[float] = None
+    confirmed_h_idx: Optional[int] = None
+    confirmed_l: Optional[float] = None
+    confirmed_l_idx: Optional[int] = None
+
+    current_idm_l: Optional[float] = None
+    current_idm_h: Optional[float] = None
 
     bos_bear_now_prev = False
     bos_bull_now_prev = False
+    origin_bear_idx_prev: Optional[int] = None
+    origin_bull_idx_prev: Optional[int] = None
 
     last_bull_retest_bar: Optional[int] = None
     last_bear_retest_bar: Optional[int] = None
@@ -822,30 +832,77 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[Dict[str, Any
         ev_bull_retest = False
         ev_bear_retest = False
 
-        # Save previous sh/sl indices (equivalent to shIdx[1]/slIdx[1] when used with bosBear=bosBearNow[1])
-        sh_idx_prev = sh_idx
-        sl_idx_prev = sl_idx
+        # Keep previous origins for Pine-style [1] behavior.
+        from_idx_bear = origin_bear_idx_prev
+        from_idx_bull = origin_bull_idx_prev
 
-        # Pivot confirmation happens swing_len bars after the pivot bar, like ta.pivothigh/low
+        # 1) Register standard swings (ta.pivothigh/low with left/right = swing_len)
         if bi >= swing_len:
             pivot_idx = bi - swing_len
             if pivot_idx - swing_len >= 0 and pivot_idx + swing_len < len(htf):
                 if pivot_high_at(pivot_idx):
-                    sh_price = h[pivot_idx]
-                    sh_idx = pivot_idx
+                    unconfirmed_h = h[pivot_idx]
+                    unconfirmed_h_idx = pivot_idx
+                    current_idm_l = None
                 if pivot_low_at(pivot_idx):
-                    sl_price = l[pivot_idx]
-                    sl_idx = pivot_idx
+                    unconfirmed_l = l[pivot_idx]
+                    unconfirmed_l_idx = pivot_idx
+                    current_idm_h = None
 
-        # BOS now (Pine: uses current bar close and close[1])
-        bos_bear_now = (
-            sl_price is not None and sl_idx is not None and bi > sl_idx
-            and c[bi] < sl_price and (c[bi - 1] >= sl_price if bi > 0 else False)
-        )
-        bos_bull_now = (
-            sh_price is not None and sh_idx is not None and bi > sh_idx
-            and c[bi] > sh_price and (c[bi - 1] <= sh_price if bi > 0 else False)
-        )
+        # 2) Register minor swings for IDM (ta.pivothigh/low with left/right = 1)
+        if bi >= 2:
+            minor_idx = bi - 1
+            minor_pl = l[minor_idx] if l[minor_idx] <= l[minor_idx - 1] and l[minor_idx] <= l[minor_idx + 1] else None
+            minor_ph = h[minor_idx] if h[minor_idx] >= h[minor_idx - 1] and h[minor_idx] >= h[minor_idx + 1] else None
+
+            if minor_pl is not None and unconfirmed_h_idx is not None and bi > (unconfirmed_h_idx + 1):
+                if current_idm_l is None or minor_pl > current_idm_l:
+                    current_idm_l = minor_pl
+
+            if minor_ph is not None and unconfirmed_l_idx is not None and bi > (unconfirmed_l_idx + 1):
+                if current_idm_h is None or minor_ph < current_idm_h:
+                    current_idm_h = minor_ph
+
+        # 3) Confirm structure once IDM is taken.
+        if unconfirmed_h is not None and current_idm_l is not None and l[bi] < current_idm_l:
+            confirmed_h = unconfirmed_h
+            confirmed_h_idx = unconfirmed_h_idx
+            unconfirmed_h = None
+
+        if unconfirmed_l is not None and current_idm_h is not None and h[bi] > current_idm_h:
+            confirmed_l = unconfirmed_l
+            confirmed_l_idx = unconfirmed_l_idx
+            unconfirmed_l = None
+
+        # 4) Detect BOS now on confirmed levels.
+        bos_bear_now = False
+        bos_bull_now = False
+        origin_bear_idx_now: Optional[int] = None
+        origin_bull_idx_now: Optional[int] = None
+
+        if (
+            confirmed_h is not None
+            and confirmed_h_idx is not None
+            and bi > 0
+            and c[bi] > confirmed_h
+            and c[bi - 1] <= confirmed_h
+        ):
+            bos_bull_now = True
+            origin_bull_idx_now = confirmed_h_idx
+            confirmed_h = None
+            confirmed_h_idx = None
+
+        if (
+            confirmed_l is not None
+            and confirmed_l_idx is not None
+            and bi > 0
+            and c[bi] < confirmed_l
+            and c[bi - 1] >= confirmed_l
+        ):
+            bos_bear_now = True
+            origin_bear_idx_now = confirmed_l_idx
+            confirmed_l = None
+            confirmed_l_idx = None
 
         # Pine: bosBear = bosBearNow[1], bosBull = bosBullNow[1]
         bos_bear = bos_bear_now_prev
@@ -854,10 +911,6 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[Dict[str, Any
         # Precompute BOS indices like Pine (bosIdxBear = bar_index - 1)
         bos_idx_bear = bi - 1
         bos_idx_bull = bi - 1
-
-        # fromIdxBear = slIdx[1], fromIdxBull = shIdx[1]
-        from_idx_bear = sl_idx_prev
-        from_idx_bull = sh_idx_prev
 
         # Bearish BOS → Bearish OB
         if bos_bear:
@@ -887,9 +940,6 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[Dict[str, Any
                         if not ob_overlaps_active(obs, top, bottom):
                             ob = add_ob_from_poc(obs, best_idx, ts[best_idx], top, bottom, False, tot_vol, bull_vol, bear_vol, bos_idx_bear, ts[bos_idx_bear], max_stored)
                             ev_new_bear_ob = True
-            # Pine resets swing low state after processing
-            sl_price, sl_idx = None, None
-
         # Bullish BOS → Bullish OB
         if bos_bull:
             from_idx = from_idx_bull
@@ -918,12 +968,11 @@ def run_symbol(symbol: str, exchange: ccxt.Exchange) -> Tuple[List[Dict[str, Any
                         if not ob_overlaps_active(obs, top2, bottom2):
                             ob = add_ob_from_poc(obs, best_idx2, ts[best_idx2], top2, bottom2, True, tot_vol, bull_vol, bear_vol, bos_idx_bull, ts[bos_idx_bull], max_stored)
                             ev_new_bull_ob = True
-            # Pine resets swing high state after processing
-            sh_price, sh_idx = None, None
-
-        # Update prev BOS states for next bar
+        # Update prev BOS/origin states for next bar (Pine [1] semantics).
         bos_bear_now_prev = bos_bear_now
         bos_bull_now_prev = bos_bull_now
+        origin_bear_idx_prev = origin_bear_idx_now
+        origin_bull_idx_prev = origin_bull_idx_now
 
         # Invalidation + retest detection for existing OBs (matches Pine)
         if obs and bi > 0:
