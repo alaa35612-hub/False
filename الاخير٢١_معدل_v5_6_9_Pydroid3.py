@@ -429,86 +429,208 @@ def tier_from_score(score: float) -> str:
 
 
 class MultiTimeframeClassifier:
-    """4 fingerprints للاتجاه الصاعد + نفس المنطق معكوسًا للاتجاه الهابط."""
+    """Dynamic, adaptive classifier: lower rigidity, preserve direction hierarchy."""
 
-    def _mtf_gate(self, f: FeatureSnapshot, direction: str) -> Tuple[bool, List[str], str]:
+    @staticmethod
+    def _adaptive_profile(f: FeatureSnapshot) -> Dict[str, float]:
+        """Build per-symbol adaptive thresholds from volatility + OI activity."""
+        local_vol = (abs(f.m5_ctx.change_pct) + abs(f.m15_ctx.change_pct) + abs(f.h4_ctx.change_pct) / 2.0) / 3.0
+        oi_activity = max(0.0, f.oi_change_15m)
+
+        price_trigger_15m = clamp(0.35 + local_vol * 0.22, 0.35, 1.10)
+        price_trigger_5m = clamp(0.25 + local_vol * 0.18, 0.25, 0.95)
+        oi_trigger_15m = clamp(0.70 + local_vol * 0.45, 0.70, 2.20)
+        pattern_accept = clamp(0.95 + local_vol * 0.12 - min(0.30, oi_activity * 0.03), 0.72, 1.20)
+
+        return {
+            "price_trigger_15m": price_trigger_15m,
+            "price_trigger_5m": price_trigger_5m,
+            "oi_trigger_15m": oi_trigger_15m,
+            "pattern_accept": pattern_accept,
+        }
+
+    def _mtf_gate(self, f: FeatureSnapshot, direction: str) -> Tuple[float, List[str], str]:
+        """Soft gate: no hard reject except extreme contradiction."""
         reasons: List[str] = []
+        mtf_score = 0.0
+
         if direction == "LONG":
-            if f.daily_ctx.trend != "UP" and f.daily_ctx.ema_bias != "BULLISH":
-                return False, ["اليومي لا يدعم الصعود"], "REJECTED"
-            reasons.append(f"1D اتجاه={f.daily_ctx.trend} bias={f.daily_ctx.ema_bias}")
-            if f.h4_ctx.trend == "DOWN" and f.h4_ctx.ema_bias == "BEARISH":
-                return False, reasons + ["4H عكسي قوي ضد الصعود"], "REJECTED"
-            reasons.append(f"4H تأكيد={f.h4_ctx.trend}/{f.h4_ctx.ema_bias}")
+            if f.daily_ctx.trend == "UP":
+                mtf_score += 0.45
+            elif f.daily_ctx.ema_bias == "BULLISH":
+                mtf_score += 0.32
+            elif f.daily_ctx.trend == "SIDEWAYS":
+                mtf_score += 0.14
+            else:
+                mtf_score -= 0.18
+            reasons.append(f"1D={f.daily_ctx.trend}/{f.daily_ctx.ema_bias} ({f.daily_ctx.change_pct:.2f}%)")
+
+            if f.h4_ctx.trend == "UP" or f.h4_ctx.ema_bias == "BULLISH":
+                mtf_score += 0.35
+            elif f.h4_ctx.trend == "SIDEWAYS":
+                mtf_score += 0.12
+            else:
+                mtf_score -= 0.12
+            reasons.append(f"4H={f.h4_ctx.trend}/{f.h4_ctx.ema_bias} ({f.h4_ctx.change_pct:.2f}%)")
         else:
-            if f.daily_ctx.trend != "DOWN" and f.daily_ctx.ema_bias != "BEARISH":
-                return False, ["اليومي لا يدعم الهبوط"], "REJECTED"
-            reasons.append(f"1D اتجاه={f.daily_ctx.trend} bias={f.daily_ctx.ema_bias}")
-            if f.h4_ctx.trend == "UP" and f.h4_ctx.ema_bias == "BULLISH":
-                return False, reasons + ["4H عكسي قوي ضد الهبوط"], "REJECTED"
-            reasons.append(f"4H تأكيد={f.h4_ctx.trend}/{f.h4_ctx.ema_bias}")
+            if f.daily_ctx.trend == "DOWN":
+                mtf_score += 0.45
+            elif f.daily_ctx.ema_bias == "BEARISH":
+                mtf_score += 0.32
+            elif f.daily_ctx.trend == "SIDEWAYS":
+                mtf_score += 0.14
+            else:
+                mtf_score -= 0.18
+            reasons.append(f"1D={f.daily_ctx.trend}/{f.daily_ctx.ema_bias} ({f.daily_ctx.change_pct:.2f}%)")
+
+            if f.h4_ctx.trend == "DOWN" or f.h4_ctx.ema_bias == "BEARISH":
+                mtf_score += 0.35
+            elif f.h4_ctx.trend == "SIDEWAYS":
+                mtf_score += 0.12
+            else:
+                mtf_score -= 0.12
+            reasons.append(f"4H={f.h4_ctx.trend}/{f.h4_ctx.ema_bias} ({f.h4_ctx.change_pct:.2f}%)")
 
         stage = "EARLY"
-        if abs(f.m5_ctx.change_pct) >= 1.0 or abs(f.m15_ctx.change_pct) >= 1.3:
+        if abs(f.m5_ctx.change_pct) >= 0.6 or abs(f.m15_ctx.change_pct) >= 0.8:
             stage = "ACTIVE"
-        if abs(f.m5_ctx.change_pct) > 2.8 or abs(f.m15_ctx.change_pct) > 4.5:
+        if abs(f.m5_ctx.change_pct) > 3.0 or abs(f.m15_ctx.change_pct) > 5.0:
             stage = "LATE"
 
-        reasons.append(f"15m منطقة اهتمام: trend={f.m15_ctx.trend}, change={f.m15_ctx.change_pct:.2f}%")
-        reasons.append(f"5m دخول: trend={f.m5_ctx.trend}, change={f.m5_ctx.change_pct:.2f}%")
-        return True, reasons, stage
+        reasons.append(f"15m zone={f.m15_ctx.trend} ({f.m15_ctx.change_pct:.2f}%)")
+        reasons.append(f"5m entry={f.m5_ctx.trend} ({f.m5_ctx.change_pct:.2f}%)")
+        return mtf_score, reasons, stage
 
-    def _bullish_patterns(self, f: FeatureSnapshot) -> List[str]:
-        matches: List[str] = []
-        if (
-            f.position_ratio_5m >= 1.20 and f.account_ratio_5m <= 1.05 and f.ls_ratio_5m <= 0.95
-            and f.divergence_pct >= 12 and f.oi_change_15m >= 2.0 and f.m15_ctx.change_pct >= 1.0 and abs(f.funding_current) <= 0.08
-        ):
-            matches.append("POSITION_LED_SQUEEZE_BUILDUP")
-        if (
-            f.account_ratio_5m >= 1.6 and f.account_long_pct_5m >= 60 and f.position_ratio_5m >= 0.90
-            and f.oi_change_15m >= 1.5 and f.m15_ctx.change_pct >= 1.0 and abs(f.basis) <= 0.20
-            and (f.funding_current < 0 or abs(f.funding_current) <= 0.03)
-        ):
-            matches.append("ACCOUNT_LED_ACCUMULATION")
-        if (
-            f.position_ratio_5m >= 1.8 and f.account_ratio_5m >= 1.2 and f.ls_ratio_5m >= 1.2
-            and f.oi_change_15m >= 1.5 and f.funding_current <= 0.02 and f.m15_ctx.change_pct >= 1.0
-        ):
-            matches.append("CONSENSUS_BULLISH_EXPANSION")
-        if (
-            abs(f.funding_current) <= 0.02 and f.m5_ctx.change_pct >= 1.2 and f.trade_count_zscore_5m >= 2.0
-            and f.taker_buy_sell_ratio_5m >= 0.60
-        ):
-            matches.append("FLOW_LIQUIDITY_VACUUM_BREAKOUT")
-        return matches
+    def _bullish_pattern_strength(self, f: FeatureSnapshot, a: Dict[str, float]) -> Tuple[float, List[str]]:
+        marks: List[str] = []
+        strength = 0.0
 
-    def _bearish_patterns(self, f: FeatureSnapshot) -> List[str]:
-        matches: List[str] = []
-        if (
-            f.position_ratio_5m <= 0.85 and f.account_ratio_5m >= 0.98 and f.ls_ratio_5m >= 1.05
-            and f.divergence_pct <= -12 and f.oi_change_15m >= 2.0 and f.m15_ctx.change_pct <= -1.0 and abs(f.funding_current) <= 0.08
-        ):
-            matches.append("POSITION_LED_DUMP_BUILDUP")
-        if (
-            f.account_ratio_5m <= 0.75 and f.account_long_pct_5m <= 40 and f.position_ratio_5m <= 1.05
-            and f.oi_change_15m >= 1.5 and f.m15_ctx.change_pct <= -1.0 and abs(f.basis) <= 0.20
-            and (f.funding_current > 0 or abs(f.funding_current) <= 0.03)
-        ):
-            matches.append("ACCOUNT_LED_DISTRIBUTION")
-        if (
-            f.position_ratio_5m <= 0.80 and f.account_ratio_5m <= 0.90 and f.ls_ratio_5m <= 0.90
-            and f.oi_change_15m >= 1.5 and f.funding_current >= -0.02 and f.m15_ctx.change_pct <= -1.0
-        ):
-            matches.append("CONSENSUS_BEARISH_EXPANSION")
-        if (
-            abs(f.funding_current) <= 0.02 and f.m5_ctx.change_pct <= -1.2 and f.trade_count_zscore_5m >= 2.0
-            and (1.0 / max(1e-9, f.taker_buy_sell_ratio_5m)) >= 0.60
-        ):
-            matches.append("FLOW_LIQUIDITY_VACUUM_BREAKDOWN")
-        return matches
+        p1 = 0.0
+        if f.position_ratio_5m >= 1.10:
+            p1 += 0.30
+        if f.account_ratio_5m <= 1.08:
+            p1 += 0.20
+        if f.divergence_pct >= 8:
+            p1 += 0.25
+        if f.oi_change_15m >= a["oi_trigger_15m"]:
+            p1 += 0.20
+        if f.m15_ctx.change_pct >= a["price_trigger_15m"]:
+            p1 += 0.15
+        if p1 >= 0.55:
+            marks.append("POSITION_LED_SQUEEZE_BUILDUP")
+            strength += p1
 
-    def _score(self, f: FeatureSnapshot, direction: str, matches: List[str], stage: str) -> Tuple[float, Dict[str, float]]:
+        p2 = 0.0
+        if f.account_ratio_5m >= 1.35:
+            p2 += 0.30
+        if f.account_long_pct_5m >= 55:
+            p2 += 0.20
+        if f.position_ratio_5m >= 0.88:
+            p2 += 0.15
+        if f.oi_change_15m >= max(0.9, a["oi_trigger_15m"] - 0.35):
+            p2 += 0.20
+        if abs(f.basis) <= 0.35:
+            p2 += 0.15
+        if p2 >= 0.55:
+            marks.append("ACCOUNT_LED_ACCUMULATION")
+            strength += p2
+
+        p3 = 0.0
+        if f.position_ratio_5m >= 1.45:
+            p3 += 0.30
+        if f.account_ratio_5m >= 1.08:
+            p3 += 0.20
+        if f.ls_ratio_5m >= 1.05:
+            p3 += 0.20
+        if f.oi_change_15m >= max(0.8, a["oi_trigger_15m"] - 0.40):
+            p3 += 0.15
+        if f.m15_ctx.change_pct >= a["price_trigger_15m"]:
+            p3 += 0.15
+        if p3 >= 0.55:
+            marks.append("CONSENSUS_BULLISH_EXPANSION")
+            strength += p3
+
+        p4 = 0.0
+        if abs(f.funding_current) <= 0.03:
+            p4 += 0.15
+        if f.m5_ctx.change_pct >= a["price_trigger_5m"]:
+            p4 += 0.30
+        if f.trade_count_zscore_5m >= 1.2:
+            p4 += 0.25
+        if f.taker_buy_sell_ratio_5m >= 1.20:
+            p4 += 0.30
+        if p4 >= 0.55:
+            marks.append("FLOW_LIQUIDITY_VACUUM_BREAKOUT")
+            strength += p4
+
+        return strength, marks
+
+    def _bearish_pattern_strength(self, f: FeatureSnapshot, a: Dict[str, float]) -> Tuple[float, List[str]]:
+        marks: List[str] = []
+        strength = 0.0
+
+        p1 = 0.0
+        if f.position_ratio_5m <= 0.92:
+            p1 += 0.30
+        if f.account_ratio_5m >= 0.95:
+            p1 += 0.20
+        if f.divergence_pct <= -8:
+            p1 += 0.25
+        if f.oi_change_15m >= a["oi_trigger_15m"]:
+            p1 += 0.20
+        if f.m15_ctx.change_pct <= -a["price_trigger_15m"]:
+            p1 += 0.15
+        if p1 >= 0.55:
+            marks.append("POSITION_LED_DUMP_BUILDUP")
+            strength += p1
+
+        p2 = 0.0
+        if f.account_ratio_5m <= 0.85:
+            p2 += 0.30
+        if f.account_long_pct_5m <= 45:
+            p2 += 0.20
+        if f.position_ratio_5m <= 1.10:
+            p2 += 0.15
+        if f.oi_change_15m >= max(0.9, a["oi_trigger_15m"] - 0.35):
+            p2 += 0.20
+        if abs(f.basis) <= 0.35:
+            p2 += 0.15
+        if p2 >= 0.55:
+            marks.append("ACCOUNT_LED_DISTRIBUTION")
+            strength += p2
+
+        p3 = 0.0
+        if f.position_ratio_5m <= 0.90:
+            p3 += 0.30
+        if f.account_ratio_5m <= 0.95:
+            p3 += 0.20
+        if f.ls_ratio_5m <= 0.95:
+            p3 += 0.20
+        if f.oi_change_15m >= max(0.8, a["oi_trigger_15m"] - 0.40):
+            p3 += 0.15
+        if f.m15_ctx.change_pct <= -a["price_trigger_15m"]:
+            p3 += 0.15
+        if p3 >= 0.55:
+            marks.append("CONSENSUS_BEARISH_EXPANSION")
+            strength += p3
+
+        p4 = 0.0
+        sell_ratio = 1.0 / max(1e-9, f.taker_buy_sell_ratio_5m)
+        if abs(f.funding_current) <= 0.03:
+            p4 += 0.15
+        if f.m5_ctx.change_pct <= -a["price_trigger_5m"]:
+            p4 += 0.30
+        if f.trade_count_zscore_5m >= 1.2:
+            p4 += 0.25
+        if sell_ratio >= 1.20:
+            p4 += 0.30
+        if p4 >= 0.55:
+            marks.append("FLOW_LIQUIDITY_VACUUM_BREAKDOWN")
+            strength += p4
+
+        return strength, marks
+
+    def _score(self, f: FeatureSnapshot, direction: str, marks: List[str], stage: str, mtf_score: float, pattern_strength: float) -> Tuple[float, Dict[str, float]]:
         flow = taker_flow_score(f.taker_buy_sell_ratio_5m, direction)
         fund = funding_regime_score(f.funding_current, f.funding_trend, direction)
         oi = oi_regime_score(f.oi_change_5m, f.oi_change_15m)
@@ -523,74 +645,75 @@ class MultiTimeframeClassifier:
             "oi_notional": round(oinv, 3),
             "basis_context": round(basis, 3),
             "four_h_bonus": round(ctx4, 3),
-            "pattern_density": round(min(1.0, len(matches) / 3), 3),
+            "mtf_alignment": round(clamp(mtf_score, 0.0, 1.0), 3),
+            "pattern_strength": round(clamp(pattern_strength / 2.2, 0.0, 1.0), 3),
         }
 
         base = 0.0
-        base += 0.18 * flow
-        base += 0.16 * fund
-        base += 0.22 * oi
-        base += 0.18 * oinv
-        base += 0.10 * basis
-        base += 0.08 * min(1.0, ctx4)
-        base += 0.08 * min(1.0, len(matches) / 3)
+        base += 0.14 * flow
+        base += 0.12 * fund
+        base += 0.17 * oi
+        base += 0.13 * oinv
+        base += 0.08 * basis
+        base += 0.07 * min(1.0, ctx4)
+        base += 0.15 * clamp(mtf_score, 0.0, 1.0)
+        base += 0.14 * clamp(pattern_strength / 2.2, 0.0, 1.0)
 
         if direction == "LONG":
             if f.divergence_pct >= 18:
-                base += 0.06
-            elif f.divergence_pct >= 12:
+                base += 0.05
+            elif f.divergence_pct >= 8:
                 base += 0.03
         else:
             if f.divergence_pct <= -18:
-                base += 0.06
-            elif f.divergence_pct <= -12:
+                base += 0.05
+            elif f.divergence_pct <= -8:
                 base += 0.03
 
         if stage == "LATE":
-            base -= 0.18
+            base -= 0.12
 
-        score = round(clamp(base * 100.0, 0.0, 100.0), 2)
-        return score, feat
+        return round(clamp(base * 100.0, 0.0, 100.0), 2), feat
 
     def classify_both(self, f: FeatureSnapshot) -> List[Signal]:
         results: List[Signal] = []
+        a = self._adaptive_profile(f)
 
         for direction in ("LONG", "SHORT"):
-            ok, reasons, stage = self._mtf_gate(f, direction)
-            if not ok:
+            mtf_score, reasons, stage = self._mtf_gate(f, direction)
+
+            if direction == "LONG":
+                pattern_strength, marks = self._bullish_pattern_strength(f, a)
+            else:
+                pattern_strength, marks = self._bearish_pattern_strength(f, a)
+
+            # dynamic accept instead of strict all-or-nothing
+            if pattern_strength < a["pattern_accept"]:
                 continue
 
-            matches = self._bullish_patterns(f) if direction == "LONG" else self._bearish_patterns(f)
-            if not matches:
+            score, feat = self._score(f, direction, marks, stage, mtf_score, pattern_strength)
+            if score < 26:  # lower floor to avoid over-rejection
                 continue
 
-            score, feat = self._score(f, direction, matches, stage)
-            if score < 35:
-                continue
-
-            reasons.append(f"patterns={','.join(matches)}")
+            reasons.append(f"patterns={','.join(marks) if marks else 'weak-multi-feature'}")
             reasons.append(
-                "السبب الحاسم: "
-                + (
-                    "Position/Account divergence"
-                    if abs(f.divergence_pct) >= 12
-                    else "flow+OI"
-                )
+                f"adaptive_thresholds: p15={a['price_trigger_15m']:.2f}, p5={a['price_trigger_5m']:.2f}, oi15={a['oi_trigger_15m']:.2f}, accept={a['pattern_accept']:.2f}"
             )
+            reasons.append("السبب: تصنيف ديناميكي متكيف مع خصائص الرمز بدل شروط جامدة")
 
             decisive = max(feat, key=feat.get)
             if direction == "LONG":
                 sl = round(f.price * 0.97, 8)
-                t = [round(f.price * 1.02, 8), round(f.price * 1.035, 8), round(f.price * 1.055, 8)]
+                t = [round(f.price * 1.018, 8), round(f.price * 1.032, 8), round(f.price * 1.050, 8)]
             else:
                 sl = round(f.price * 1.03, 8)
-                t = [round(f.price * 0.98, 8), round(f.price * 0.965, 8), round(f.price * 0.945, 8)]
+                t = [round(f.price * 0.982, 8), round(f.price * 0.968, 8), round(f.price * 0.950, 8)]
 
             results.append(
                 Signal(
                     symbol=f.symbol,
                     score=score,
-                    classification="+".join(matches),
+                    classification="+".join(marks) if marks else "DYNAMIC_MULTI_FEATURE",
                     signal_quality_tier=tier_from_score(score),
                     direction=direction,
                     signal_stage=stage,
