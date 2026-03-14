@@ -618,6 +618,30 @@ def get_binance_client():
 
 client = get_binance_client()
 
+failed_open_interest_symbols = {}
+failed_open_interest_lock = threading.Lock()
+OPEN_INTEREST_FAILURE_TTL_SECONDS = 900
+
+def _is_failed_open_interest_symbol(symbol):
+    now = time.time()
+    with failed_open_interest_lock:
+        exp = failed_open_interest_symbols.get(symbol)
+        if exp and exp > now:
+            return True
+        if exp and exp <= now:
+            failed_open_interest_symbols.pop(symbol, None)
+    return False
+
+def _mark_failed_open_interest_symbol(symbol, ttl=OPEN_INTEREST_FAILURE_TTL_SECONDS):
+    with failed_open_interest_lock:
+        failed_open_interest_symbols[symbol] = time.time() + max(60, int(ttl))
+
+def _is_valid_usdt_perp_symbol(symbol):
+    if not symbol:
+        return False
+    syms = get_all_usdt_perpetuals()
+    return symbol in set(syms)
+
 # =============================================================================
 # دوال جلب البيانات من Binance مع تحسينات الأداء والتخزين المؤقت
 # =============================================================================
@@ -654,6 +678,8 @@ def fetch_json(url, params=None, use_cache=True, weight=1, cache_ttl=None):
                 retry_delay *= 2  # exponential backoff
                 continue
             else:
+                if '/fapi/v1/openInterest' in url and resp.status_code == 400:
+                    return None
                 if DEBUG:
                     print(f"⚠️ HTTP {resp.status_code} لـ {url}")
                 return None
@@ -684,12 +710,26 @@ def get_ticker_24hr_one_symbol(symbol):
     return data
 
 def get_open_interest(symbol):
-    data = fetch_json(f"{BASE_URL}/fapi/v1/openInterest", {'symbol': symbol}, use_cache=False, weight=1)
-    if data is None:
-        # إذا فشل الطلب، نسجل الرمز كغير صالح لمنع المحاولات المتكررة
+    symbol = str(symbol or '').strip().upper()
+    if not symbol:
+        return None
+    if _is_failed_open_interest_symbol(symbol):
+        return None
+    if not _is_valid_usdt_perp_symbol(symbol):
+        _mark_failed_open_interest_symbol(symbol, ttl=3600)
         mark_symbol_invalid(symbol)
         return None
-    return float(data['openInterest']) if data else None
+
+    data = fetch_json(f"{BASE_URL}/fapi/v1/openInterest", {'symbol': symbol}, use_cache=False, weight=1)
+    if data is None:
+        _mark_failed_open_interest_symbol(symbol)
+        mark_symbol_invalid(symbol)
+        return None
+    try:
+        return float(data['openInterest']) if data else None
+    except Exception:
+        _mark_failed_open_interest_symbol(symbol)
+        return None
 
 def get_funding_rate(symbol):
     data = fetch_json(f"{BASE_URL}/fapi/v1/premiumIndex", {'symbol': symbol}, use_cache=True, weight=1, cache_ttl=5)  # 5 ثوانٍ
@@ -1832,92 +1872,87 @@ def detect_long_term_accumulation(symbol):
 # تقييم القوة مع دمج HMM وإدارة المخاطر
 # =============================================================================
 def assess_signal_power(symbol, base_score, pattern_data):
-    power_score = 0
-    power_reasons = []
-    power_level = "عادية"
-    reasons_set = set()  # لتتبع الأسباب المضافة
+    """تقييم حديث لجودة الإشارة بدل power_level القديم، مبني على البصمات المؤسسية المبكرة."""
+    quality_score = float(base_score or 0.0)
+    quality_reasons = []
 
     try:
-        _, tr_long, _ = get_top_long_short_ratio(symbol)
-        if tr_long and tr_long > STRONG_WHALE_RATIO:
-            power_score += 20
-            reason = f"🐋 هيمنة كبار {tr_long:.1f}%"
-            if reason not in reasons_set:
-                power_reasons.append(reason)
-                reasons_set.add(reason)
+        pattern_data = pattern_data or {}
+        classification = str(pattern_data.get('classification') or pattern_data.get('pattern') or '')
+        direction = str(pattern_data.get('direction') or 'UP')
+        stage = str(pattern_data.get('signal_stage') or 'SETUP')
+        decisive_feature = str(pattern_data.get('decisive_feature') or '')
+        feature_scores = pattern_data.get('feature_scores') or {}
+        reasons = pattern_data.get('reasons') or []
 
-        funding_rate, _ = get_funding_rate(symbol)
-        if funding_rate and funding_rate < EXTREME_FUNDING_SHORT:
-            power_score += 15
-            reason = f"🔥 تمويل سلبي شديد {funding_rate:+.3f}%"
-            if reason not in reasons_set:
-                power_reasons.append(reason)
-                reasons_set.add(reason)
+        class_bonus = {
+            'POSITION_LED_SQUEEZE_BUILDUP': 8,
+            'ACCOUNT_LED_ACCUMULATION': 8,
+            'CONSENSUS_BULLISH_EXPANSION': 10,
+            'FLOW_LIQUIDITY_VACUUM_BREAKOUT': 9,
+        }.get(classification, 0)
+        quality_score += class_bonus
 
-        oi_hist = get_oi_history(symbol, period='15m', limit=2)
-        if len(oi_hist) >= 2:
-            oi_change = pct_change(oi_hist[-2], oi_hist[-1])
-            if oi_change > OI_SURGE_THRESHOLD:
-                power_score += 15
-                reason = f"📈 OI قفز {oi_change:+.1f}%"
-                if reason not in reasons_set:
-                    power_reasons.append(reason)
-                    reasons_set.add(reason)
+        oi_score = float(feature_scores.get('oi_regime', 0.0) or 0.0)
+        oi_nv_score = float(feature_scores.get('oi_notional_score', feature_scores.get('oi_notional', 0.0)) or 0.0)
+        flow_score = float(feature_scores.get('taker_aggression', 0.0) or 0.0)
+        div_score = float(feature_scores.get('smart_money_divergence', 0.0) or 0.0)
+        acc_score = float(feature_scores.get('smart_money_accounts', 0.0) or 0.0)
+        funding_score = float(feature_scores.get('funding_regime', 0.0) or 0.0)
+        basis_score = float(feature_scores.get('basis_context', 0.0) or 0.0)
 
-        ticker = get_ticker_24hr_one_symbol(symbol)
-        if ticker:
-            current_volume = float(ticker['volume'])
-            avg_volume = get_historical_avg_volume(symbol, days=7)
-            if avg_volume and avg_volume > 0:
-                vol_ratio = current_volume / avg_volume
-                if vol_ratio > VOLUME_EXPLOSION:
-                    power_score += 15
-                    reason = f"💥 حجم {vol_ratio:.1f}x المتوسط"
-                    if reason not in reasons_set:
-                        power_reasons.append(reason)
-                        reasons_set.add(reason)
+        quality_score += oi_score * 12 + oi_nv_score * 10 + flow_score * 12
+        quality_score += div_score * 8 + acc_score * 7
+        quality_score += funding_score * 4 + basis_score * 3
 
-        basis = get_basis(symbol)
-        if basis < BASIS_EXTREME_NEGATIVE:
-            power_score += 10
-            reason = f"📉 أساس سالب متطرف {basis:+.2f}%"
-            if reason not in reasons_set:
-                power_reasons.append(reason)
-                reasons_set.add(reason)
-        elif basis > BASIS_EXTREME_POSITIVE:
-            power_score += 10
-            reason = f"📈 أساس موجب متطرف {basis:+.2f}%"
-            if reason not in reasons_set:
-                power_reasons.append(reason)
-                reasons_set.add(reason)
+        if decisive_feature in {'position_led_divergence', 'account_led_divergence', 'oi_notional_change', 'taker_buy_sell_ratio'}:
+            quality_score += 4
 
-        # دمج مؤشرات الفريم اليومي
-        daily_ratios = get_daily_top_ratio(symbol, limit=DAILY_OI_TREND_DAYS)
-        if len(daily_ratios) >= DAILY_OI_TREND_DAYS:
-            avg_daily_ratio = mean(daily_ratios)
-            if avg_daily_ratio > DAILY_MIN_AVG_TOP_RATIO:
-                power_score += POWER_ADD_DAILY_BOOST
-                reason = f"📅 تراكم يومي {avg_daily_ratio:.1f}%"
-                if reason not in reasons_set:
-                    power_reasons.append(reason)
-                    reasons_set.add(reason)
+        if stage in {'SETUP', 'ARMED'}:
+            quality_score += 4
+        elif stage == 'TRIGGERED':
+            quality_score += 2
+        elif stage == 'LATE':
+            quality_score -= 18
 
-        # تطبيق مضاعف حالة السوق
-        regime_multiplier = hmm_detector.get_regime_multiplier() if ENABLE_HMM else 1.0
-        total_score = (base_score + power_score) * regime_multiplier
+        text_blob = ' | '.join([str(x) for x in reasons]).lower()
+        if 'late' in text_blob or 'crowded' in text_blob or 'متأخر' in text_blob or 'مزدحم' in text_blob:
+            quality_score -= 10
 
-        if total_score >= POWER_CRITICAL_THRESHOLD:
-            power_level = "حرجة 🔥"
-        elif total_score >= POWER_IMPORTANT_THRESHOLD:
-            power_level = "مهمة ⚡"
+        if pattern_data.get('multi_pattern_hint'):
+            quality_score += 8
+
+        # 4H supportive context bonus reflected indirectly in score via feature-based signal score; add small explicit bonus if available in reasons
+        if '4h' in text_blob or 'فريم 4' in text_blob:
+            quality_score += 3
+
+        quality_score = max(0.0, min(100.0, quality_score))
+
+        if quality_score >= 88:
+            quality_level = 'انفجار وشيك جدًا'
+        elif quality_score >= 75:
+            quality_level = 'انفجار وشيك'
+        elif quality_score >= 58:
+            quality_level = 'إشارة مؤسسية'
         else:
-            power_level = "عادية"
+            quality_level = 'مرشح مبكر'
+
+        if direction == 'DOWN' and quality_level in {'انفجار وشيك', 'انفجار وشيك جدًا'}:
+            quality_level = 'إشارة مؤسسية'
+
+        quality_reasons.extend([
+            f'classification={classification or "UNKNOWN"}',
+            f'stage={stage}',
+            f'oi={oi_score:.2f}/oinv={oi_nv_score:.2f}',
+            f'flow={flow_score:.2f}',
+        ])
 
     except Exception as e:
         if DEBUG:
-            print(f"⚠️ خطأ في تقييم القوة لـ {symbol}: {e}")
+            print(f"⚠️ خطأ في تقييم الجودة لـ {symbol}: {e}")
+        quality_level = 'مرشح مبكر'
 
-    return power_score, power_level, power_reasons
+    return int(round(quality_score)), quality_level, quality_reasons
 
 def calculate_risk_management(symbol, price, direction):
     """
@@ -4019,7 +4054,7 @@ class SignalDatabase:
                 float(signal_data.get('price', 0) or 0),
                 signal_data.get('direction', 'UP'),
                 json.dumps(signal_data.get('reasons', []), ensure_ascii=False),
-                signal_data.get('power_level', 'عادية'),
+                signal_data.get('power_level', 'مرشح مبكر'),
                 float(signal_data.get('stop_loss', 0) or 0),
                 float(signal_data.get('take_profit1', 0) or 0),
                 float(signal_data.get('take_profit2', 0) or 0),
@@ -4406,7 +4441,7 @@ def evaluate_symbol_patterns(sym):
             if not res:
                 return None
             _enforce_signal_consistency(res)
-            power_score, power_level, power_reasons = assess_signal_power(res['symbol'], res['score'], {})
+            power_score, power_level, power_reasons = assess_signal_power(res['symbol'], res['score'], res)
             res['power_level'] = power_level
             for reason in power_reasons:
                 if reason not in res['reasons']:
@@ -4458,7 +4493,7 @@ def send_individual_signal(signal_data):
 
     message = (
         f"🔔 *إشارة جديدة: {signal_data['symbol']}* {multi_pattern_hint}\n"
-        f"{primary_emoji} التصنيف: *{primary_name}* (`{primary_key}`) [{signal_data.get('power_level', 'عادية')}]\n"
+        f"{primary_emoji} التصنيف: *{primary_name}* (`{primary_key}`) [{signal_data.get('power_level', 'مرشح مبكر')}]\n"
         f"   الدرجة: {signal_data['score']}\n"
         f"   الاتجاه: {direction_ar}\n"
         f"   المرحلة: {signal_stage}\n"
@@ -4543,7 +4578,7 @@ def generate_report(results):
         internal_pattern = r.get('pattern', '')
 
         lines.append(
-            f"{primary_emoji} *{r['symbol']}*: {r['score']} | *{primary_name}* (`{primary_key}`) {multi_hint} [{r.get('power_level', 'عادية')}]\n"
+            f"{primary_emoji} *{r['symbol']}*: {r['score']} | *{primary_name}* (`{primary_key}`) {multi_hint} [{r.get('power_level', 'مرشح مبكر')}]\n"
             f"   الاتجاه: {direction_ar}\n"
             f"   المرحلة: {signal_stage}\n"
             f"   السعر: {r['price']:.6f}\n"
