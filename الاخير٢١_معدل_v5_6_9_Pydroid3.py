@@ -185,17 +185,11 @@ DEFAULT_CONFIG = {
 
     # أوزان الأنماط
     "PATTERN_WEIGHTS": {
-        "BEAR_SQUEEZE": 0.20,
-        "WHALE_MOMENTUM": 0.15,
-        "PRE_CLOSE_SQUEEZE": 0.25,
-        "RETAIL_TRAP": 0.10,
-        "PRE_PUMP": 0.30,
-        "WHALE_SETUP": 0.25,
-        "LONG_TERM_ACCUMULATION": 0.35,
-        "STRONG_UPTREND": 0.40,
-        "SKYROCKET": 0.50,
-        "SMART_MONEY_DIVERGENCE": 0.35,
-        "PRE_EXPLOSION_SETUP": 0.38
+        "POSITION_LED_SQUEEZE_BUILDUP": 0.28,
+        "ACCOUNT_LED_ACCUMULATION": 0.24,
+        "CONSENSUS_BULLISH_EXPANSION": 0.24,
+        "FLOW_LIQUIDITY_VACUUM_BREAKOUT": 0.19,
+        "EXHAUSTION_RISK": 0.05
     },
 
     # إعدادات إدارة المخاطر
@@ -217,6 +211,7 @@ DEFAULT_CONFIG = {
     "WRITE_REJECTION_LOGS": True,
     "PYDROID_MODE": True,
     "MAX_SYMBOLS_PER_CYCLE": 120,
+    "MAX_AVG_VOLUME_CHECKS": 20,
 
     # إعدادات المعايرة التكيفية للأنماط
     "ENABLE_AUTO_CALIBRATION": True,
@@ -227,7 +222,7 @@ DEFAULT_CONFIG = {
 
     # عتبات إضافية
     "MIN_APR_PRE_CLOSE": 60,             # أقل APR لقبول نمط PRE_CLOSE_SQUEEZE بعد التخفيف
-    "SIGNAL_MIN_SCORE": 65,              # أقل درجة لقبول الإشارة المبكرة
+    "SIGNAL_MIN_SCORE": 58,              # أقل درجة لقبول الإشارة المبكرة
 
     # باتش v5.4: تجميع تقوده الحسابات + خطر الإرهاق + دعم نافذة 03:00 UTC
     "ACCOUNT_LED_MIN_ACCOUNT_RATIO": 2.0,
@@ -390,6 +385,8 @@ MAX_DIAGNOSTIC_RECORDS = CONFIG.get("MAX_DIAGNOSTIC_RECORDS", 5000)
 WRITE_REJECTION_LOGS = CONFIG.get("WRITE_REJECTION_LOGS", True)
 PYDROID_MODE = CONFIG.get("PYDROID_MODE", True)
 MAX_SYMBOLS_PER_CYCLE = CONFIG.get("MAX_SYMBOLS_PER_CYCLE", 120)
+MAX_AVG_VOLUME_CHECKS = CONFIG.get("MAX_AVG_VOLUME_CHECKS", 20)
+TRADING_SYMBOLS_SET = set()
 MIN_APR_PRE_CLOSE = CONFIG.get("MIN_APR_PRE_CLOSE", 60)
 SIGNAL_MIN_SCORE = CONFIG.get("SIGNAL_MIN_SCORE", 65)
 ACCOUNT_LED_MIN_ACCOUNT_RATIO = CONFIG.get("ACCOUNT_LED_MIN_ACCOUNT_RATIO", 2.0)
@@ -496,6 +493,15 @@ class DiagnosticsLogger:
 
     def log_error(self, symbol, stage, error):
         self._append({'type': 'error', 'symbol': symbol, 'stage': stage, 'error': str(error)})
+
+    def log_event(self, event_type, symbol, pattern, data=None):
+        self._append({
+            'type': 'event',
+            'event_type': event_type,
+            'symbol': symbol,
+            'pattern': pattern,
+            'data': data or {}
+        })
 
 diagnostics = DiagnosticsLogger()
 
@@ -618,6 +624,33 @@ def get_binance_client():
 
 client = get_binance_client()
 
+failed_open_interest_symbols = {}
+failed_open_interest_lock = threading.Lock()
+OPEN_INTEREST_FAILURE_TTL_SECONDS = 900
+
+def _is_failed_open_interest_symbol(symbol):
+    now = time.time()
+    with failed_open_interest_lock:
+        exp = failed_open_interest_symbols.get(symbol)
+        if exp and exp > now:
+            return True
+        if exp and exp <= now:
+            failed_open_interest_symbols.pop(symbol, None)
+    return False
+
+def _mark_failed_open_interest_symbol(symbol, ttl=OPEN_INTEREST_FAILURE_TTL_SECONDS):
+    with failed_open_interest_lock:
+        failed_open_interest_symbols[symbol] = time.time() + max(60, int(ttl))
+
+def _is_valid_usdt_perp_symbol(symbol):
+    if not symbol:
+        return False
+    symbol = str(symbol).upper()
+    if TRADING_SYMBOLS_SET:
+        return symbol in TRADING_SYMBOLS_SET
+    syms = get_all_usdt_perpetuals()
+    return symbol in set(syms)
+
 # =============================================================================
 # دوال جلب البيانات من Binance مع تحسينات الأداء والتخزين المؤقت
 # =============================================================================
@@ -654,6 +687,8 @@ def fetch_json(url, params=None, use_cache=True, weight=1, cache_ttl=None):
                 retry_delay *= 2  # exponential backoff
                 continue
             else:
+                if '/fapi/v1/openInterest' in url and resp.status_code == 400:
+                    return None
                 if DEBUG:
                     print(f"⚠️ HTTP {resp.status_code} لـ {url}")
                 return None
@@ -684,12 +719,26 @@ def get_ticker_24hr_one_symbol(symbol):
     return data
 
 def get_open_interest(symbol):
-    data = fetch_json(f"{BASE_URL}/fapi/v1/openInterest", {'symbol': symbol}, use_cache=False, weight=1)
-    if data is None:
-        # إذا فشل الطلب، نسجل الرمز كغير صالح لمنع المحاولات المتكررة
+    symbol = str(symbol or '').strip().upper()
+    if not symbol:
+        return None
+    if _is_failed_open_interest_symbol(symbol):
+        return None
+    if not _is_valid_usdt_perp_symbol(symbol):
+        _mark_failed_open_interest_symbol(symbol, ttl=3600)
         mark_symbol_invalid(symbol)
         return None
-    return float(data['openInterest']) if data else None
+
+    data = fetch_json(f"{BASE_URL}/fapi/v1/openInterest", {'symbol': symbol}, use_cache=False, weight=1)
+    if data is None:
+        _mark_failed_open_interest_symbol(symbol)
+        mark_symbol_invalid(symbol)
+        return None
+    try:
+        return float(data['openInterest']) if data else None
+    except Exception:
+        _mark_failed_open_interest_symbol(symbol)
+        return None
 
 def get_funding_rate(symbol):
     data = fetch_json(f"{BASE_URL}/fapi/v1/premiumIndex", {'symbol': symbol}, use_cache=True, weight=1, cache_ttl=5)  # 5 ثوانٍ
@@ -935,16 +984,12 @@ def funding_regime_score(current_funding, funding_trend):
     score = 0.0
     if current_funding is None:
         return 0.0
-    # التمويل السلبي/المحايد غالبًا أفضل لمرحلة ما قبل السكيز
-    if -0.80 <= current_funding <= 0.01:
-        score += 0.35
-    if -0.30 <= current_funding <= 0.01:
-        score += 0.15
-    if funding_trend > 0:
-        score += 0.35
-    # باتش STEEM: تمويل سلبي يتحسن = وقود سكيز مبكر
+    if -0.25 <= current_funding <= 0.01:
+        score += 0.45
     if current_funding < 0 and funding_trend > 0:
-        score += POSITION_LED_SQUEEZE_NEG_FUNDING_IMPROVEMENT_BONUS
+        score += 0.40
+    if 0.01 < current_funding <= 0.03:
+        score += 0.10
     if current_funding > 0.03:
         score -= 0.20
     return max(0.0, min(score, 1.0))
@@ -971,22 +1016,133 @@ def get_funding_trend(symbol, limit=6):
         return 0.0
     return hist[-1] - hist[-2]
 
+def basis_context_score(basis, oi_change_15m=0.0, taker_score=0.0):
+    if basis is None:
+        return 0.5
+    b = float(basis)
+    if -0.20 <= b <= 0.20:
+        return 0.85
+    if -0.35 <= b < -0.20:
+        return 0.70
+    if 0.20 < b <= 0.45:
+        return 0.65
+    if b < -0.50 and oi_change_15m < 1.0 and taker_score < 0.35:
+        return 0.10
+    return 0.40
+
+def oi_regime_score(oi_change_5m, oi_change_15m):
+    score = 0.0
+    if oi_change_15m >= 3.0:
+        score += 0.70
+    elif oi_change_15m >= 1.5:
+        score += 0.45
+    if oi_change_5m >= 1.2:
+        score += 0.25
+    elif oi_change_5m >= 0.6:
+        score += 0.15
+    return max(0.0, min(score, 1.0))
+
+def oi_notional_score(oi_notional_change):
+    x = float(oi_notional_change or 0.0)
+    if x >= 2.5:
+        return 1.0
+    if x >= 1.6:
+        return 0.8
+    if x >= 0.8:
+        return 0.6
+    if x >= 0.4:
+        return 0.35
+    return 0.0
+
+FEATURE_WEIGHTS = {
+    "oi_regime": 0.20,
+    "compression": 0.16,
+    "taker_aggression": 0.18,
+    "cvd_flow": 0.10,
+    "liquidity_vacuum": 0.12,
+    "smart_money_accounts": 0.12,
+    "smart_money_divergence": 0.07,
+    "funding_regime": 0.03,
+    "basis_context": 0.02
+}
+
+def weighted_feature_score(feature_scores):
+    total = 0.0
+    for k, w in FEATURE_WEIGHTS.items():
+        total += float(feature_scores.get(k, 0.0)) * w
+    return max(0.0, min(total, 1.0))
+
+def compute_four_h_context_bonus(symbol):
+    bonus = 0.0
+    pos4 = get_top_position_snapshot(symbol, period='4h')
+    acc4 = get_top_account_snapshot(symbol, period='4h')
+    if not pos4 or not acc4:
+        return 0.0
+    four_h_position_ratio = float(pos4.get('ratio', 0.0) or 0.0)
+    four_h_account_ratio = float(acc4.get('ratio', 0.0) or 0.0)
+    if four_h_position_ratio > 1.15 and four_h_account_ratio < 0.95:
+        bonus += 0.25
+    if four_h_account_ratio > 1.4 and four_h_position_ratio < 1.05:
+        bonus += 0.25
+    if four_h_position_ratio > 1.3 and four_h_account_ratio > 1.2:
+        bonus += 0.35
+    return bonus
+
+def is_strong_position_led_case(features):
+    position_ratio = float(features.get('position_ratio', 0.0) or 0.0)
+    account_ratio = float(features.get('account_ratio', 9.0) or 9.0)
+    ls_ratio = float(features.get('ls_ratio', 9.0) or 9.0)
+    position_long_pct = float(features.get('top_position_long_pct', 50.0) or 50.0)
+    account_long_pct = float(features.get('top_account_long_pct', 50.0) or 50.0)
+    oi_change_15m = float(features.get('oi_change_15m', 0.0) or 0.0)
+    oi_notional_change = float(features.get('oi_notional_change', 0.0) or 0.0)
+    price_change_5m = float(features.get('price_change_5m', 0.0) or 0.0)
+    price_change_15m = float(features.get('price_change_15m', 0.0) or 0.0)
+    return (
+        position_ratio >= 1.50 and
+        account_ratio <= 0.70 and
+        ls_ratio <= 0.60 and
+        (position_long_pct - account_long_pct) >= 22 and
+        (oi_change_15m >= 2.0 or oi_notional_change >= 2.0) and
+        (price_change_5m >= 0.8 or price_change_15m >= 1.2)
+    )
+
+def fast_position_led_hint(snapshot):
+    return (
+        float(snapshot.get('position_ratio', 0.0) or 0.0) >= 1.30 and
+        float(snapshot.get('account_ratio', 9.0) or 9.0) <= 0.85 and
+        float(snapshot.get('ls_ratio', 9.0) or 9.0) <= 0.80
+    )
+
 def classify_bullish_signal(features):
-    funding = features.get('funding_rate')
-    account_score_val = features.get('account_score', 0.0)
-    divergence_score_val = features.get('divergence_score', 0.0)
-    taker_score_val = features.get('taker_score', 0.0)
-    position_ratio = features.get('position_ratio', 0.0)
-    account_ratio = features.get('account_ratio', 0.0)
-    oi_change_15m = features.get('oi_change_15m', 0.0)
-    ls_ratio = features.get('ls_ratio', account_ratio)
-    if ((funding is not None and funding <= 0.02) and divergence_score_val >= 0.35 and position_ratio >= POSITION_LED_SQUEEZE_MIN_POSITION_RATIO and account_ratio <= POSITION_LED_SQUEEZE_MAX_ACCOUNT_RATIO and ls_ratio <= POSITION_LED_SQUEEZE_MAX_LS_RATIO and oi_change_15m >= POSITION_LED_SQUEEZE_MIN_OI_15M):
-        return 'SHORT_SQUEEZE_BUILDUP', 'smart_money_divergence'
-    if account_score_val >= 0.55 and account_ratio >= 1.35 and position_ratio >= 1.00 and oi_change_15m >= 2.0:
-        return 'INSTITUTIONAL_ACCUMULATION', 'top_account_ratio'
-    if taker_score_val >= 0.8:
-        return 'LIQUIDITY_VACUUM_BREAKOUT', 'taker_buy_sell_ratio'
-    return 'INSTITUTIONAL_ACCUMULATION', 'oi_regime'
+    position_ratio = float(features.get('position_ratio', 0.0) or 0.0)
+    account_ratio = float(features.get('account_ratio', 0.0) or 0.0)
+    ls_ratio = float(features.get('ls_ratio', account_ratio) or 0.0)
+    top_position_long_pct = float(features.get('top_position_long_pct', 0.0) or 0.0)
+    top_account_long_pct = float(features.get('top_account_long_pct', 0.0) or 0.0)
+    position_led_divergence = top_position_long_pct - top_account_long_pct
+    account_led_divergence = top_account_long_pct - top_position_long_pct
+    oi_change_15m = float(features.get('oi_change_15m', 0.0) or 0.0)
+    price_change_15m = float(features.get('price_change_15m', 0.0) or 0.0)
+    price_change_5m = float(features.get('price_change_5m', 0.0) or 0.0)
+    taker_buy_ratio_recent = float(features.get('taker_buy_ratio_recent', 0.0) or 0.0)
+    trade_count_z = float(features.get('trade_count_zscore', 0.0) or 0.0)
+    funding_abs = abs(float(features.get('funding_rate', 0.0) or 0.0))
+    oi_notional_strong = bool(features.get('oi_notional_strong', False))
+
+    if (position_ratio >= 1.40 and account_ratio <= 0.90 and ls_ratio <= 0.90 and position_led_divergence >= 18 and oi_notional_strong and taker_buy_ratio_recent >= 0.55):
+        return 'POSITION_LED_SQUEEZE_BUILDUP', 'position_led_divergence'
+    if (position_ratio >= 1.20 and account_ratio <= 1.05 and ls_ratio <= 0.95 and position_led_divergence >= 12 and oi_change_15m >= 2.0 and price_change_15m >= 1.0 and funding_abs <= 0.08):
+        return 'POSITION_LED_SQUEEZE_BUILDUP', 'position_led_divergence'
+    if (account_ratio >= 1.8 and top_account_long_pct >= 62 and position_ratio <= 1.0 and features.get('oi_rising_strongly', False) and features.get('price_breakout_confirmed', False)):
+        return 'ACCOUNT_LED_ACCUMULATION', 'account_led_divergence'
+    if (account_ratio >= 1.6 and top_account_long_pct >= 60 and position_ratio >= 0.90 and oi_change_15m >= 1.5 and price_change_15m >= 1.0 and abs(float(features.get('basis', 0.0) or 0.0)) <= 0.20 and (float(features.get('funding_rate', 0.0) or 0.0) < 0 or funding_abs <= 0.03)):
+        return 'ACCOUNT_LED_ACCUMULATION', 'top_account_ratio'
+    if (position_ratio >= 1.8 and account_ratio >= 1.2 and ls_ratio >= 1.2 and oi_change_15m >= 1.5 and float(features.get('funding_rate', 0.0) or 0.0) <= 0.02 and price_change_15m >= 1.0):
+        return 'CONSENSUS_BULLISH_EXPANSION', 'oi_regime'
+    if funding_abs <= 0.02 and price_change_5m >= 1.2 and trade_count_z >= 2.0 and taker_buy_ratio_recent >= 0.60:
+        return 'FLOW_LIQUIDITY_VACUUM_BREAKOUT', 'taker_buy_sell_ratio'
+    return 'NO_CLEAR_BULLISH_FAMILY', 'insufficient_signature'
 
 def get_utc_hour_now():
     return datetime.utcnow().hour
@@ -1008,15 +1164,45 @@ def apply_time_window_boost(signal_data, utc_hour=None):
 
 def classify_signal_stage(price_5m=0.0, price_15m=0.0, oi_5m=0.0, oi_15m=0.0, funding_rate=None, buy_ratio=0.0, score=0.0):
     funding_abs = abs(funding_rate) if funding_rate is not None else 0.0
-    if price_5m >= 3.5 or price_15m >= 8.0 or score >= 90 or funding_abs >= 0.08:
+
+    if price_15m >= 6.5 or price_5m >= 3.2 or funding_abs >= 0.08:
         return 'LATE'
+
+    if (
+        price_15m <= 1.2 and
+        price_5m <= 0.8 and
+        oi_15m >= 1.0 and
+        funding_abs <= 0.12
+    ):
+        return 'EARLY'
+
     if price_5m >= 2.0 or price_15m >= 4.0 or oi_15m >= 6.0 or score >= 80:
         return 'CONFIRMED'
+
     if buy_ratio >= 0.58 and (oi_5m >= 1.5 or oi_15m >= 2.5) and price_15m >= 0.8:
         return 'TRIGGERED'
+
     if buy_ratio >= 0.55 and (oi_5m >= 1.0 or oi_15m >= 2.0):
         return 'ARMED'
+
     return 'SETUP'
+
+def pre_pump_early_filter(price_5m=0.0, price_15m=0.0, funding_rate=None, oi_15m=0.0):
+    funding_abs = abs(float(funding_rate or 0.0)) if funding_rate is not None else 0.0
+
+    if price_15m >= 8.5 or price_5m >= 4.0:
+        return False, 'late_price_extension'
+
+    if funding_rate is not None and float(funding_rate) > 0.05 and price_15m >= 3.5:
+        return False, 'crowded_positive_funding_after_move'
+
+    if oi_15m >= 10.0 and price_15m >= 5.0:
+        return False, 'late_oi_expansion_confirmation'
+
+    if funding_abs >= 0.20:
+        return False, 'extreme_funding_regime'
+
+    return True, None
 
 def attach_signal_stage(signal_data, price_5m=0.0, price_15m=0.0, oi_5m=0.0, oi_15m=0.0, funding_rate=None, buy_ratio=0.0):
     if not signal_data:
@@ -1095,7 +1281,7 @@ def directional_consistency_ok(signal_data, context):
             return False, 'up_direction_not_confirmed_by_recent_candles'
         if buy < 0.52 and context['buy_accel'] < 0.0:
             return False, 'up_signal_without_taker_buy_support'
-        if pattern in {'WHALE_MOMENTUM', 'WHALE_MOMENTUM_UP', 'FLOW_BREAKOUT', 'FLOW_BREAKOUT_NEUTRAL_FUNDING', 'SKYROCKET', 'STRONG_UPTREND', 'CONSENSUS_BULLISH_EXPANSION', 'ACCOUNT_LED_ACCUMULATION'} and p15 > 6.5:
+        if pattern in {'WHALE_MOMENTUM', 'WHALE_MOMENTUM_UP', 'FLOW_LIQUIDITY_VACUUM_BREAKOUT', 'SKYROCKET', 'STRONG_UPTREND', 'CONSENSUS_BULLISH_EXPANSION', 'ACCOUNT_LED_ACCUMULATION'} and p15 > 6.5:
             return False, 'up_signal_arrived_too_late'
         if pattern in {'PRE_SQUEEZE_UP', 'PRE_EXPLOSION_SETUP', 'SMART_DIVERGENCE_SQUEEZE', 'POSITION_LED_SQUEEZE_BUILDUP'} and p15 > 5.0:
             return False, 'setup_arrived_after_expansion'
@@ -1132,6 +1318,12 @@ def normalize_signal_pattern(signal_data):
 def validate_and_finalize_signal(signal_data):
     if not signal_data:
         return None
+    signal_data.setdefault('reasons', [])
+    signal_data.setdefault('feature_scores', {})
+    if 'classification' not in signal_data or not signal_data.get('classification'):
+        signal_data['classification'] = 'NO_CLEAR_BULLISH_FAMILY' if signal_data.get('direction', 'UP') == 'UP' else 'BEARISH_GENERIC'
+    if 'decisive_feature' not in signal_data or not signal_data.get('decisive_feature'):
+        signal_data['decisive_feature'] = 'score'
     context = get_short_term_context(signal_data['symbol'], '5m', 12)
     if not context:
         diagnostics.log_reject(signal_data.get('symbol', 'UNKNOWN'), signal_data.get('pattern', 'UNKNOWN'), 'missing_validation_context', {})
@@ -1178,7 +1370,7 @@ def validate_and_finalize_signal(signal_data):
         funding_rate=signal_data.get('funding'),
         buy_ratio=context['recent_buy_ratio']
     )
-    if signal_data.get('signal_stage') == 'LATE' and signal_data.get('pattern') in {'WHALE_MOMENTUM_UP', 'FLOW_BREAKOUT', 'FLOW_BREAKOUT_NEUTRAL_FUNDING', 'SKYROCKET', 'STRONG_UPTREND', 'CONSENSUS_BULLISH_EXPANSION'}:
+    if signal_data.get('signal_stage') == 'LATE' and signal_data.get('pattern') in {'WHALE_MOMENTUM_UP', 'FLOW_LIQUIDITY_VACUUM_BREAKOUT', 'SKYROCKET', 'STRONG_UPTREND', 'CONSENSUS_BULLISH_EXPANSION'}:
         diagnostics.log_reject(signal_data.get('symbol', 'UNKNOWN'), signal_data.get('pattern', 'UNKNOWN'), 'late_stage_after_validation', signal_data.get('validation_context', {}))
         return None
     diagnostics.log_accept(signal_data.get('symbol', 'UNKNOWN'), signal_data.get('pattern', 'UNKNOWN'), signal_data.get('score'), signal_data.get('price'), signal_data.get('reasons', []), signal_data.get('validation_context', {}))
@@ -1714,6 +1906,7 @@ def detect_long_term_accumulation(symbol):
             'reasons': reasons[:5],
             'timestamp': datetime.now().isoformat()
         }
+        return result
     except Exception as e:
         if DEBUG:
             print(f"⚠️ خطأ في detect_long_term_accumulation لـ {symbol}: {e}")
@@ -1722,315 +1915,126 @@ def detect_long_term_accumulation(symbol):
 # =============================================================================
 # تقييم القوة مع دمج HMM وإدارة المخاطر
 # =============================================================================
-def assess_signal_power(symbol, base_score, pattern_data):
-    power_score = 0
-    power_reasons = []
-    power_level = "عادية"
-    reasons_set = set()  # لتتبع الأسباب المضافة
+def assess_signal_quality(symbol, base_score, pattern_data):
+    """تقييم حديث لجودة الإشارة مبني على البصمات المؤسسية المبكرة."""
+    quality_score = float(base_score or 0.0)
+    quality_reasons = []
 
     try:
-        _, tr_long, _ = get_top_long_short_ratio(symbol)
-        if tr_long and tr_long > STRONG_WHALE_RATIO:
-            power_score += 20
-            reason = f"🐋 هيمنة كبار {tr_long:.1f}%"
-            if reason not in reasons_set:
-                power_reasons.append(reason)
-                reasons_set.add(reason)
+        pattern_data = pattern_data or {}
+        classification = str(pattern_data.get('classification') or pattern_data.get('pattern') or '')
+        direction = str(pattern_data.get('direction') or 'UP')
+        stage = str(pattern_data.get('signal_stage') or 'SETUP')
+        if stage == 'EARLY':
+            quality_score += 6
+        decisive_feature = str(pattern_data.get('decisive_feature') or '')
+        feature_scores = pattern_data.get('feature_scores') or {}
+        reasons = pattern_data.get('reasons') or []
 
-        funding_rate, _ = get_funding_rate(symbol)
-        if funding_rate and funding_rate < EXTREME_FUNDING_SHORT:
-            power_score += 15
-            reason = f"🔥 تمويل سلبي شديد {funding_rate:+.3f}%"
-            if reason not in reasons_set:
-                power_reasons.append(reason)
-                reasons_set.add(reason)
+        class_bonus = {
+            'POSITION_LED_SQUEEZE_BUILDUP': 8,
+            'ACCOUNT_LED_ACCUMULATION': 8,
+            'CONSENSUS_BULLISH_EXPANSION': 10,
+            'FLOW_LIQUIDITY_VACUUM_BREAKOUT': 9,
+        }.get(classification, 0)
+        quality_score += class_bonus
 
-        oi_hist = get_oi_history(symbol, period='15m', limit=2)
-        if len(oi_hist) >= 2:
-            oi_change = pct_change(oi_hist[-2], oi_hist[-1])
-            if oi_change > OI_SURGE_THRESHOLD:
-                power_score += 15
-                reason = f"📈 OI قفز {oi_change:+.1f}%"
-                if reason not in reasons_set:
-                    power_reasons.append(reason)
-                    reasons_set.add(reason)
+        oi_score = float(feature_scores.get('oi_regime', 0.0) or 0.0)
+        oi_nv_score = float(feature_scores.get('oi_notional_score', feature_scores.get('oi_notional', 0.0)) or 0.0)
+        flow_score = float(feature_scores.get('taker_aggression', 0.0) or 0.0)
+        div_score = float(feature_scores.get('smart_money_divergence', 0.0) or 0.0)
+        acc_score = float(feature_scores.get('smart_money_accounts', 0.0) or 0.0)
+        funding_score = float(feature_scores.get('funding_regime', 0.0) or 0.0)
+        basis_score = float(feature_scores.get('basis_context', 0.0) or 0.0)
 
-        ticker = get_ticker_24hr_one_symbol(symbol)
-        if ticker:
-            current_volume = float(ticker['volume'])
-            avg_volume = get_historical_avg_volume(symbol, days=7)
-            if avg_volume and avg_volume > 0:
-                vol_ratio = current_volume / avg_volume
-                if vol_ratio > VOLUME_EXPLOSION:
-                    power_score += 15
-                    reason = f"💥 حجم {vol_ratio:.1f}x المتوسط"
-                    if reason not in reasons_set:
-                        power_reasons.append(reason)
-                        reasons_set.add(reason)
+        quality_score += oi_score * 12 + oi_nv_score * 10 + flow_score * 12
+        quality_score += div_score * 8 + acc_score * 7
+        quality_score += funding_score * 4 + basis_score * 3
 
-        basis = get_basis(symbol)
-        if basis < BASIS_EXTREME_NEGATIVE:
-            power_score += 10
-            reason = f"📉 أساس سالب متطرف {basis:+.2f}%"
-            if reason not in reasons_set:
-                power_reasons.append(reason)
-                reasons_set.add(reason)
-        elif basis > BASIS_EXTREME_POSITIVE:
-            power_score += 10
-            reason = f"📈 أساس موجب متطرف {basis:+.2f}%"
-            if reason not in reasons_set:
-                power_reasons.append(reason)
-                reasons_set.add(reason)
+        if decisive_feature in {'position_led_divergence', 'account_led_divergence', 'oi_notional_change', 'taker_buy_sell_ratio'}:
+            quality_score += 4
 
-        # دمج مؤشرات الفريم اليومي
-        daily_ratios = get_daily_top_ratio(symbol, limit=DAILY_OI_TREND_DAYS)
-        if len(daily_ratios) >= DAILY_OI_TREND_DAYS:
-            avg_daily_ratio = mean(daily_ratios)
-            if avg_daily_ratio > DAILY_MIN_AVG_TOP_RATIO:
-                power_score += POWER_ADD_DAILY_BOOST
-                reason = f"📅 تراكم يومي {avg_daily_ratio:.1f}%"
-                if reason not in reasons_set:
-                    power_reasons.append(reason)
-                    reasons_set.add(reason)
+        if classification == 'POSITION_LED_SQUEEZE_BUILDUP':
+            position_ratio = float(pattern_data.get('position_ratio', 0.0) or 0.0)
+            account_ratio = float(pattern_data.get('account_ratio', 9.0) or 9.0)
+            ls_ratio = float(pattern_data.get('ls_ratio', 9.0) or 9.0)
+            pos_long = float(pattern_data.get('top_position_long_pct', 50.0) or 50.0)
+            acc_long = float(pattern_data.get('top_account_long_pct', 50.0) or 50.0)
+            position_led_bonus = 0.0
+            if position_ratio >= 1.50:
+                position_led_bonus += 12
+            if account_ratio <= 0.75:
+                position_led_bonus += 10
+            if ls_ratio <= 0.70:
+                position_led_bonus += 8
+            if (pos_long - acc_long) >= 18:
+                position_led_bonus += 12
+            quality_score += position_led_bonus
 
-        # تطبيق مضاعف حالة السوق
-        regime_multiplier = hmm_detector.get_regime_multiplier() if ENABLE_HMM else 1.0
-        total_score = (base_score + power_score) * regime_multiplier
+        if stage in {'SETUP', 'ARMED'}:
+            quality_score += 4
+        elif stage == 'TRIGGERED':
+            quality_score += 2
+        elif stage == 'LATE':
+            quality_score -= 18
 
-        if total_score >= POWER_CRITICAL_THRESHOLD:
-            power_level = "حرجة 🔥"
-        elif total_score >= POWER_IMPORTANT_THRESHOLD:
-            power_level = "مهمة ⚡"
+        text_blob = ' | '.join([str(x) for x in reasons]).lower()
+        if 'late' in text_blob or 'crowded' in text_blob or 'متأخر' in text_blob or 'مزدحم' in text_blob:
+            quality_score -= 10
+
+        if pattern_data.get('multi_pattern_hint'):
+            quality_score += 8
+
+        # 4H supportive context bonus reflected indirectly in score via feature-based signal score; add small explicit bonus if available in reasons
+        if '4h' in text_blob or 'فريم 4' in text_blob:
+            quality_score += 3
+
+        quality_score = max(0.0, min(100.0, quality_score))
+
+        strong_position_led = (
+            classification == 'POSITION_LED_SQUEEZE_BUILDUP' and
+            float(pattern_data.get('oi_change_15m', 0.0) or 0.0) >= 2.0 and
+            float(pattern_data.get('price_change_5m', 0.0) or 0.0) >= 0.8 and
+            abs(float(pattern_data.get('basis', 0.0) or 0.0)) <= 0.40 and
+            (float(pattern_data.get('taker_buy_ratio_recent', 0.0) or 0.0) >= 0.55 or float(pattern_data.get('four_h_context_bonus', 0.0) or 0.0) > 0)
+        )
+        extreme_position_led = is_strong_position_led_case(pattern_data)
+
+        if quality_score >= 88 or extreme_position_led:
+            quality_level = 'انفجار وشيك جدًا'
+        elif quality_score >= 75 or strong_position_led:
+            quality_level = 'انفجار وشيك'
+        elif quality_score >= 60:
+            quality_level = 'إشارة مؤسسية'
         else:
-            power_level = "عادية"
+            quality_level = 'مرشح مبكر'
+
+        if classification == 'POSITION_LED_SQUEEZE_BUILDUP' and stage == 'EARLY' and quality_score >= 58:
+            quality_level = 'إشارة مؤسسية'
+
+        if direction == 'DOWN' and quality_level in {'انفجار وشيك', 'انفجار وشيك جدًا'}:
+            quality_level = 'إشارة مؤسسية'
+
+        quality_reasons.extend([
+            f'classification={classification or "UNKNOWN"}',
+            f'stage={stage}',
+            f'oi={oi_score:.2f}/oinv={oi_nv_score:.2f}',
+            f'flow={flow_score:.2f}',
+        ])
 
     except Exception as e:
         if DEBUG:
-            print(f"⚠️ خطأ في تقييم القوة لـ {symbol}: {e}")
+            print(f"⚠️ خطأ في تقييم الجودة لـ {symbol}: {e}")
+        quality_level = 'مرشح مبكر'
 
-    return power_score, power_level, power_reasons
+    return int(round(quality_score)), quality_level, quality_reasons
 
-def calculate_risk_management(symbol, price, direction):
-    """
-    حساب وقف الخسارة وأهداف الربح بناءً على ATR.
-    تعيد أرقامًا صالحة (0 إذا فشلت) لتجنب أخطاء None.
-    """
-    atr = calculate_atr(symbol, ATR_PERIOD)
-    if atr is None or price is None:
-        return 0.0, 0.0, 0.0
-    if direction == 'UP':
-        stop_loss = price - atr * ATR_MULTIPLIER_STOP
-        take_profit1 = price + atr * ATR_MULTIPLIER_TAKE_PROFIT
-        take_profit2 = price + atr * ATR_MULTIPLIER_TAKE_PROFIT * 2
-    else:
-        stop_loss = price + atr * ATR_MULTIPLIER_STOP
-        take_profit1 = price - atr * ATR_MULTIPLIER_TAKE_PROFIT
-        take_profit2 = price - atr * ATR_MULTIPLIER_TAKE_PROFIT * 2
-    # التأكد من عدم وجود None
-    return stop_loss or 0.0, take_profit1 or 0.0, take_profit2 or 0.0
+
+
 
 # =============================================================================
-# محلل HMM
+# تم حذف أنظمة التدريب/التعلم/المعايرة/المخاطر القديمة من مسار التشغيل
 # =============================================================================
-class HMMMarketRegimeDetector:
-    def __init__(self):
-        self.model = None
-        self.scaler_mean = None
-        self.scaler_std = None
-        self.current_regime = -1
-        self.regime_names = {
-            0: "🟢 هادئ (Calm)",
-            1: "📈 صعودي (Bullish Trending)",
-            2: "📉 هبوطي (Bearish Trending)",
-            3: "⚡ متقلب (High Volatility)"
-        }
-        self.last_fit_time = 0
-
-    def _prepare_features(self):
-        klines = get_klines('BTCUSDT', '1h', HMM_LOOKBACK_DAYS * 24)
-        if not klines or len(klines['close']) < 100:
-            return None
-        prices = klines['close']
-        returns = [pct_change(prices[i], prices[i+1]) for i in range(len(prices)-1)]
-        volatilities = []
-        for i in range(24, len(returns)):
-            vol = np.std(returns[i-24:i])
-            volatilities.append(vol)
-        min_len = min(len(returns[24:]), len(volatilities))
-        if min_len < 50:
-            return None
-        X = np.column_stack((returns[24:24+min_len], volatilities[:min_len]))
-        return X
-
-    def fit_model(self):
-        if not ENABLE_HMM or not HMM_AVAILABLE:
-            return False
-        X = self._prepare_features()
-        if X is None or len(X) < 100:
-            return False
-        self.scaler_mean = np.mean(X, axis=0)
-        self.scaler_std = np.std(X, axis=0)
-        X_scaled = (X - self.scaler_mean) / (self.scaler_std + 1e-9)
-
-        self.model = hmm.GaussianHMM(
-            n_components=HMM_N_STATES,
-            covariance_type="full",
-            n_iter=1000,
-            random_state=42
-        )
-        self.model.fit(X_scaled)
-        states = self.model.predict(X_scaled)
-        self.current_regime = states[-1]
-        return True
-
-    def get_current_regime(self):
-        now = time.time()
-        if now - self.last_fit_time >= HMM_UPDATE_INTERVAL:
-            self.fit_model()
-            self.last_fit_time = now
-        return {
-            'regime_id': self.current_regime,
-            'regime_name': self.regime_names.get(self.current_regime, "غير معروف"),
-            'confidence': 0.8,
-        }
-
-    def get_regime_multiplier(self):
-        if not ENABLE_HMM or self.model is None:
-            return 1.0
-        regime = self.get_current_regime()
-        if regime['regime_id'] == 0:
-            return 1.0
-        elif regime['regime_id'] == 1:
-            return 1.2
-        elif regime['regime_id'] == 2:
-            return 0.6
-        elif regime['regime_id'] == 3:
-            return 0.8
-        else:
-            return 1.0
-
-hmm_detector = HMMMarketRegimeDetector()
-
-# =============================================================================
-# نظام التعلم الذاتي (مع تحسين تقييم الاتجاه الهابط)
-# =============================================================================
-class LearningSystem:
-    def __init__(self, db):
-        self.db = db
-        self.last_learning_time = datetime.now()
-        self.pattern_weights = PATTERN_WEIGHTS.copy()
-        self.pattern_performance = defaultdict(lambda: {'total': 0, 'success': 0, 'score_sum': 0})
-
-    def _evaluate_change_success(self, direction, change, horizon_minutes):
-        thresholds = {5: 1.0, 15: 2.0, 30: 3.0}
-        threshold = thresholds.get(horizon_minutes, 2.0)
-        if direction == 'UP':
-            return 1 if change >= threshold else 0
-        return 1 if change <= -threshold else 0
-
-    def evaluate_signals(self):
-        total_evaluated = 0
-        for horizon in EVAL_HORIZONS_MINUTES:
-            pending = self.db.get_pending_eval_signals(horizon, hours_ago=BACKTEST_LOOKBACK_HOURS)
-            if not pending:
-                continue
-            for sig in pending:
-                sig_id, symbol, pattern, price, direction, ts = sig
-                current_price = get_mark_price(symbol)
-                if current_price is None or price in (None, 0):
-                    continue
-                change = (current_price - price) / price * 100
-                success = self._evaluate_change_success(direction, change, int(horizon))
-                self.db.update_signal_evaluation(sig_id, int(horizon), current_price, success)
-                if int(horizon) == 15:
-                    # نبقي التعلم الأساسي معتمدًا على أفق 15 دقيقة لأنه أكثر توازنًا على الهاتف
-                    with sqlite3.connect(DB_PATH) as conn:
-                        conn.execute("UPDATE signals SET evaluated = 1, outcome = ?, price_after = ? WHERE id = ?",
-                                     (success, current_price, sig_id))
-                    self.pattern_performance[pattern]['total'] += 1
-                    self.pattern_performance[pattern]['success'] += success
-                    self.pattern_performance[pattern]['score_sum'] += abs(change)
-                total_evaluated += 1
-        return total_evaluated
-
-    def invalidate_signals(self):
-        invalidated_count = 0
-        active = self.db.get_active_signals_for_invalidation(lookback_hours=BACKTEST_LOOKBACK_HOURS)
-        for sig in active:
-            sig_id, symbol, pattern, price, direction, ts, trigger_high, trigger_low, signal_stage = sig
-            current_price = get_mark_price(symbol)
-            if current_price is None:
-                continue
-            context = get_short_term_context(symbol, '5m', 12)
-            if not context:
-                continue
-
-            reason = None
-            if direction == 'UP':
-                if trigger_low and current_price < trigger_low * 0.998:
-                    reason = 'broke_trigger_low_after_alert'
-                elif context['price_5m'] < -0.8 and context['recent_sell_ratio'] > 0.56:
-                    reason = 'bearish_reversal_after_alert'
-                elif context['below_ema'] and context['impulse_down'] and context['sell_accel'] > 0.02:
-                    reason = 'down_impulse_invalidated_up_signal'
-            else:
-                if trigger_high and current_price > trigger_high * 1.002:
-                    reason = 'broke_trigger_high_after_alert'
-                elif context['price_5m'] > 0.8 and context['recent_buy_ratio'] > 0.56:
-                    reason = 'bullish_reversal_after_alert'
-                elif context['above_ema'] and context['impulse_up'] and context['buy_accel'] > 0.02:
-                    reason = 'up_impulse_invalidated_down_signal'
-
-            if reason:
-                self.db.invalidate_signal(sig_id, current_price, reason)
-                diagnostics.log_reject(symbol, pattern, reason, {
-                    'direction': direction,
-                    'current_price': current_price,
-                    'trigger_high': trigger_high,
-                    'trigger_low': trigger_low,
-                    'signal_stage': signal_stage
-                })
-                invalidated_count += 1
-        return invalidated_count
-
-    def adjust_weights(self):
-        if not ENABLE_LEARNING:
-            return
-
-        self.evaluate_signals()
-
-        total_weight = 0
-        new_weights = {}
-        for pattern, stats in self.pattern_performance.items():
-            if stats['total'] < MIN_SIGNALS_FOR_LEARNING:
-                continue
-            accuracy = stats['success'] / stats['total']
-            if accuracy > PERFORMANCE_THRESHOLD:
-                old_weight = self.pattern_weights.get(pattern, 0.2)
-                new_weight = old_weight * (1 + WEIGHT_ADJUSTMENT_RATE * (accuracy - PERFORMANCE_THRESHOLD))
-                new_weight = min(new_weight, 1.0)
-            else:
-                old_weight = self.pattern_weights.get(pattern, 0.2)
-                new_weight = old_weight * (1 - WEIGHT_ADJUSTMENT_RATE * (PERFORMANCE_THRESHOLD - accuracy))
-                new_weight = max(new_weight, 0.05)
-            new_weights[pattern] = new_weight
-            total_weight += new_weight
-
-        if total_weight > 0:
-            for pattern in new_weights:
-                new_weights[pattern] /= total_weight
-            self.pattern_weights.update(new_weights)
-            self.save_weights()
-
-    def save_weights(self):
-        try:
-            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-            config['PATTERN_WEIGHTS'] = self.pattern_weights
-            with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
-                json.dump(config, f, indent=4, ensure_ascii=False)
-        except Exception as e:
-            print(f"⚠️ خطأ في حفظ الأوزان: {e}")
 
 # =============================================================================
 # الفلترة الأولية (سريعة) مع تحسين السيولة والارتفاعات المفاجئة
@@ -2042,40 +2046,51 @@ def quick_filter():
         print("❌ فشل جلب tickers")
         return []
 
-    candidates = []
-    # تعبير منتظم للتحقق من الرموز اللاتينية (أحرف وأرقام و _ فقط)
     valid_symbol_pattern = re.compile(r'^[A-Z0-9_]+$')
+    liquid_candidates = []
 
     for t in tickers:
-        symbol = t['symbol']
-
-        # استبعاد الرموز التي تحتوي على أحرف غير لاتينية
-        if not valid_symbol_pattern.match(symbol):
-            if DEBUG:
-                print(f"⚠️ استبعاد رمز غير لاتيني: {symbol}")
+        symbol = str(t.get('symbol', '')).strip().upper()
+        if not symbol or not valid_symbol_pattern.match(symbol):
+            continue
+        if TRADING_SYMBOLS_SET and symbol not in TRADING_SYMBOLS_SET:
+            continue
+        if is_symbol_invalid(symbol):
             continue
 
-        volume = float(t['quoteVolume'])
-        price_change_24h = float(t['priceChangePercent'])
-        avg_vol = get_historical_avg_volume(symbol, days=7)
-        vol_ok = (avg_vol is not None and volume / avg_vol >= VOLUME_TO_AVG_RATIO_MIN) if avg_vol else True
-
-        # التحقق من الحد الأدنى لحجم التداول بالدولار
+        volume = safe_float(t.get('quoteVolume', 0.0), 0.0)
         if volume < MIN_VOLUME_USD:
-            if DEBUG:
-                print(f"⚠️ استبعاد {symbol} بسبب حجم منخفض: {volume:.0f} < {MIN_VOLUME_USD}")
             continue
 
-        # إذا كان الارتفاع كبيرًا جدًا (أكثر من 8% في 24 ساعة)، نتجاوز شرط الحجم
-        if price_change_24h >= SKYROCKET_THRESHOLD:
-            candidates.append(symbol)
-            continue
+        price_change_24h = safe_float(t.get('priceChangePercent', 0.0), 0.0)
+        liquid_candidates.append((symbol, volume, price_change_24h))
 
-        if volume >= MIN_VOLUME_24H and price_change_24h >= MIN_PRICE_CHANGE_24H and vol_ok:
-            candidates.append(symbol)
+    liquid_candidates.sort(key=lambda x: x[1], reverse=True)
 
-    print(f"✅ {len(candidates)} عملة اجتازت الفلترة الأولية")
+    hinted = []
+    non_hinted = []
+    hint_checks = 0
+    for symbol, volume, price_change_24h in liquid_candidates:
+        if hint_checks < 40:
+            pos = get_top_position_snapshot(symbol, period='5m')
+            acc = get_top_account_snapshot(symbol, period='5m')
+            crowd = get_global_long_short_snapshot(symbol, period='5m')
+            if pos and acc:
+                snapshot = {
+                    'position_ratio': pos.get('ratio', 0.0),
+                    'account_ratio': acc.get('ratio', 0.0),
+                    'ls_ratio': crowd.get('ratio', acc.get('ratio', 0.0)) if crowd else acc.get('ratio', 0.0),
+                }
+                hint_checks += 1
+                if fast_position_led_hint(snapshot):
+                    hinted.append(symbol)
+                    continue
+        non_hinted.append(symbol)
+
+    candidates = hinted + non_hinted
+    print(f"✅ {len(candidates)} عملة سائلة اجتازت الفلترة (مسح شامل للسيولة)")
     return candidates
+
 
 # =============================================================================
 # الأنماط الخمسة (محدثة باستخدام z-score) + الأنماط الجديدة للارتفاع
@@ -2961,7 +2976,7 @@ def detect_smart_money_divergence(symbol):
             return log_rejection(symbol, 'PRE_EXPLOSION_SETUP', 'score_below_threshold', score=score)
 
         price = kl['close'][-1]
-        return {
+        result = {
             'symbol': symbol,
             'score': min(score, 100),
             'pattern': 'SMART_MONEY_DIVERGENCE',
@@ -2972,7 +2987,13 @@ def detect_smart_money_divergence(symbol):
             'reasons': reasons[:6],
             'timestamp': datetime.now().isoformat()
         }
-        log_acceptance(symbol, 'SMART_MONEY_DIVERGENCE', score=result['score'], price=result['price'], reasons=result['reasons'])
+        log_acceptance(
+            symbol,
+            'SMART_MONEY_DIVERGENCE',
+            score=result['score'],
+            price=result['price'],
+            reasons=result['reasons']
+        )
         return result
 
     except Exception as e:
@@ -3067,128 +3088,190 @@ def detect_position_led_squeeze_buildup(symbol):
         kl = get_klines(symbol, interval='5m', limit=12)
         if not kl or len(kl['close']) < 12:
             return log_rejection(symbol, 'POSITION_LED_SQUEEZE_BUILDUP', 'insufficient_klines')
-
         buy_ratios = compute_taker_buy_ratio(kl)
         if len(buy_ratios) < 6:
             return log_rejection(symbol, 'POSITION_LED_SQUEEZE_BUILDUP', 'insufficient_buy_ratio_points')
+        oi_5m_hist = get_oi_history(symbol, period='5m', limit=6)
+        oi_15m_hist = get_oi_history(symbol, period='15m', limit=4)
+        oi_notional_hist = get_oi_notional_history(symbol, period='5m', limit=6)
+        if len(oi_5m_hist) < 6 or len(oi_15m_hist) < 4:
+            return log_rejection(symbol, 'POSITION_LED_SQUEEZE_BUILDUP', 'insufficient_oi_history')
+        position_snapshot = get_top_position_snapshot(symbol, period='5m')
+        account_snapshot = get_top_account_snapshot(symbol, period='5m')
+        crowd_snapshot = get_global_long_short_snapshot(symbol, period='5m')
+        if not position_snapshot or not account_snapshot:
+            return log_rejection(symbol, 'POSITION_LED_SQUEEZE_BUILDUP', 'snapshot_unavailable')
 
         recent_buy = rolling_mean(buy_ratios[-3:])
         prev_buy = rolling_mean(buy_ratios[-6:-3])
         buy_accel = recent_buy - prev_buy
         taker_ratio = safe_buy_sell_ratio_from_buy_ratio(recent_buy)
         taker_score = taker_flow_score(taker_ratio)
-
-        oi_5m_hist = get_oi_history(symbol, period='5m', limit=6)
-        oi_15m_hist = get_oi_history(symbol, period='15m', limit=4)
-        if len(oi_5m_hist) < 6 or len(oi_15m_hist) < 4:
-            return log_rejection(symbol, 'POSITION_LED_SQUEEZE_BUILDUP', 'insufficient_oi_history')
-
         oi_change_5m = pct_change(oi_5m_hist[-3], oi_5m_hist[-1])
         oi_change_15m = pct_change(oi_15m_hist[-2], oi_15m_hist[-1])
+        oi_notional_change = pct_change(oi_notional_hist[-3], oi_notional_hist[-1]) if len(oi_notional_hist) >= 3 else 0.0
         price_change_5m = pct_change(kl['close'][-2], kl['close'][-1])
         price_change_15m = pct_change(kl['close'][-4], kl['close'][-1])
-
-        position_snapshot = get_top_position_snapshot(symbol, period='5m')
-        account_snapshot = get_top_account_snapshot(symbol, period='5m')
-        crowd_snapshot = get_global_long_short_snapshot(symbol, period='5m')
-        ratio_shift = analyze_ratio_shift(symbol, period='5m', limit=12)
-        if not position_snapshot or not account_snapshot:
-            return log_rejection(symbol, 'POSITION_LED_SQUEEZE_BUILDUP', 'snapshot_unavailable')
-
         ls_ratio = crowd_snapshot['ratio'] if crowd_snapshot else account_snapshot['ratio']
-        long_divergence = compute_smart_money_divergence(account_snapshot.get('long_pct', 0.0), position_snapshot.get('long_pct', 0.0))
-        divergence_score = smart_money_divergence_feature_score(long_divergence)
-        pos_delta = ratio_shift.get('pos_delta', 0.0) if ratio_shift else 0.0
-        pos_slope = ratio_shift.get('pos_slope', 0.0) if ratio_shift else 0.0
+        top_position_long_pct = float(position_snapshot.get('long_pct', 0.0) or 0.0)
+        top_account_long_pct = float(account_snapshot.get('long_pct', 0.0) or 0.0)
+        position_led_divergence = top_position_long_pct - top_account_long_pct
+        account_led_divergence = top_account_long_pct - top_position_long_pct
         funding_rate, _ = get_funding_rate(symbol)
-        funding_trend = get_funding_trend(symbol, limit=6)
-        funding_score_val = funding_regime_score(funding_rate, funding_trend)
         if funding_rate is None:
             return log_rejection(symbol, 'POSITION_LED_SQUEEZE_BUILDUP', 'funding_unavailable')
+        funding_trend = get_funding_trend(symbol, limit=6)
+        funding_score_val = funding_regime_score(funding_rate, funding_trend)
+        basis = get_basis(symbol)
 
-        if price_change_15m < POSITION_LED_SQUEEZE_MIN_PRICE_15M:
-            return log_rejection(symbol, 'POSITION_LED_SQUEEZE_BUILDUP', 'price_move_too_small', price_change_15m=price_change_15m)
-        if oi_change_15m < POSITION_LED_SQUEEZE_MIN_OI_15M:
-            return log_rejection(symbol, 'POSITION_LED_SQUEEZE_BUILDUP', 'oi_not_expanding_enough', oi_change_15m=oi_change_15m)
-        if position_snapshot['ratio'] < POSITION_LED_SQUEEZE_MIN_POSITION_RATIO:
-            return log_rejection(symbol, 'POSITION_LED_SQUEEZE_BUILDUP', 'position_ratio_too_low', position_ratio=position_snapshot['ratio'])
-        if account_snapshot['ratio'] > POSITION_LED_SQUEEZE_MAX_ACCOUNT_RATIO:
-            return log_rejection(symbol, 'POSITION_LED_SQUEEZE_BUILDUP', 'account_ratio_not_weak_enough', account_ratio=account_snapshot['ratio'])
-        if ls_ratio > POSITION_LED_SQUEEZE_MAX_LS_RATIO:
-            return log_rejection(symbol, 'POSITION_LED_SQUEEZE_BUILDUP', 'ls_ratio_not_bearish_enough', ls_ratio=ls_ratio)
-        if long_divergence < POSITION_LED_SQUEEZE_MIN_DIVERGENCE:
-            return log_rejection(symbol, 'POSITION_LED_SQUEEZE_BUILDUP', 'position_led_divergence_too_small', position_led_divergence=long_divergence)
-        if ratio_shift and pos_delta < POSITION_LED_SQUEEZE_MIN_POSITION_DELTA and pos_slope < POSITION_LED_SQUEEZE_MIN_POSITION_SLOPE:
-            return log_rejection(symbol, 'POSITION_LED_SQUEEZE_BUILDUP', 'position_ratio_not_improving', position_delta=pos_delta, position_slope=pos_slope)
+        early_core = (
+            position_snapshot['ratio'] >= 1.20 and
+            account_snapshot['ratio'] <= 1.05 and
+            ls_ratio <= 0.95 and
+            position_led_divergence >= 12
+        )
 
-        dynamic_buy_floor = POSITION_LED_SQUEEZE_MIN_BUY_RATIO
-        if funding_rate < -0.05 and long_divergence >= POSITION_LED_SQUEEZE_MIN_DIVERGENCE and oi_change_15m >= POSITION_LED_SQUEEZE_MIN_OI_15M:
-            dynamic_buy_floor = min(dynamic_buy_floor, 0.50)
-        if funding_rate < 0 and funding_trend > 0 and long_divergence >= POSITION_LED_SQUEEZE_MIN_DIVERGENCE:
-            dynamic_buy_floor = min(dynamic_buy_floor, 0.48)
-        if recent_buy < dynamic_buy_floor:
-            return log_rejection(symbol, 'POSITION_LED_SQUEEZE_BUILDUP', 'buy_pressure_too_weak', recent_buy=recent_buy, taker_buy_sell_ratio=taker_ratio, dynamic_buy_floor=dynamic_buy_floor)
+        confirmed_core = (
+            position_snapshot['ratio'] >= 1.35 and
+            account_snapshot['ratio'] <= 0.80 and
+            ls_ratio <= 0.75 and
+            position_led_divergence >= 18
+        )
 
-        score = 58
-        score += int(min(1.0, max(0.0, (position_snapshot['ratio'] - 1.0) / 1.4)) * 10)
-        score += int(divergence_score * 16)
-        score += int(taker_score * 12)
-        score += int(min(1.0, max(0.0, oi_change_15m / 6.0)) * 10)
-        score += int(funding_score_val * 8)
-        if pos_delta >= 0.10:
-            score += 5
-        elif pos_delta >= POSITION_LED_SQUEEZE_MIN_POSITION_DELTA:
-            score += 3
-        if funding_rate < 0 and funding_trend > 0:
-            score += 4
+        market_early_confirmation = (
+            (price_change_5m >= 0.25 or price_change_15m >= 0.45) and
+            (oi_change_5m >= 0.40 or oi_change_15m >= 1.00)
+        )
+
+        market_confirmed_confirmation = (
+            (price_change_5m >= 0.70 or price_change_15m >= 1.00) and
+            (oi_change_5m >= 0.80 or oi_change_15m >= 1.50)
+        )
+
+        context_ok = (
+            abs(basis) <= 0.55 and
+            abs(funding_rate) <= 0.12
+        )
+
+        flow_support = (
+            recent_buy >= 0.50 or
+            funding_trend > 0 or
+            buy_accel > 0.015
+        )
+
+        if not early_core:
+            return log_rejection(
+                symbol,
+                'POSITION_LED_SQUEEZE_BUILDUP',
+                'early_core_not_ready',
+                position_ratio=position_snapshot['ratio'],
+                account_ratio=account_snapshot['ratio'],
+                ls_ratio=ls_ratio,
+                position_led_divergence=position_led_divergence
+            )
+
+        if not market_early_confirmation:
+            return log_rejection(
+                symbol,
+                'POSITION_LED_SQUEEZE_BUILDUP',
+                'early_market_confirmation_missing',
+                price_change_5m=price_change_5m,
+                price_change_15m=price_change_15m,
+                oi_change_5m=oi_change_5m,
+                oi_change_15m=oi_change_15m
+            )
+
+        if not context_ok:
+            return log_rejection(
+                symbol,
+                'POSITION_LED_SQUEEZE_BUILDUP',
+                'context_not_supportive',
+                basis=basis,
+                funding_rate=funding_rate
+            )
+
+        if not flow_support:
+            return log_rejection(
+                symbol,
+                'POSITION_LED_SQUEEZE_BUILDUP',
+                'flow_support_missing',
+                recent_buy=recent_buy,
+                funding_trend=funding_trend,
+                buy_accel=buy_accel
+            )
+
+        setup_strength = 'EARLY'
+        if confirmed_core and market_confirmed_confirmation:
+            setup_strength = 'CONFIRMED'
+
+        oi_score = oi_regime_score(oi_change_5m, oi_change_15m)
+        oi_nv_score = oi_notional_score(oi_notional_change)
+        basis_score = basis_context_score(basis, oi_change_15m, taker_score)
+        compression_score = min(1.0, max(0.0, (1.0 - ls_ratio) * 2.2))
+        divergence_score = smart_money_divergence_feature_score(position_led_divergence)
+        account_score = top_account_score(account_snapshot['ratio'], top_account_long_pct)
+        feature_scores = {
+            'oi_regime': round(oi_score, 3),
+            'compression': round(compression_score, 3),
+            'taker_aggression': round(taker_score, 3),
+            'cvd_flow': round(max(0.0, min(1.0, (recent_buy - 0.5) * 2.5)), 3),
+            'liquidity_vacuum': round(max(0.0, min(1.0, (1.0 - ls_ratio) * 1.8)), 3),
+            'smart_money_accounts': round(account_score, 3),
+            'smart_money_divergence': round(divergence_score, 3),
+            'funding_regime': round(funding_score_val, 3),
+            'basis_context': round(basis_score, 3),
+            'oi_notional_score': round(oi_nv_score, 3)
+        }
+        base_score = 46 if setup_strength == 'EARLY' else 58
+        score = int(
+            base_score +
+            weighted_feature_score(feature_scores) * 34 +
+            oi_nv_score * 8 +
+            compute_four_h_context_bonus(symbol) * 10
+        )
+
+        if setup_strength == 'EARLY':
+            score = min(score, 82)
         reasons = [
             f"Position Ratio {position_snapshot['ratio']:.2f}",
-            f"Position Long {position_snapshot.get('long_pct', 0.0):.2f}%",
-            f"Account Ratio {account_snapshot['ratio']:.2f}",
-            f"Account Long {account_snapshot.get('long_pct', 0.0):.2f}%",
-            f"Position-led divergence {long_divergence:+.2f}pt",
-            f"Position trend Δ{pos_delta:+.2f} / slope {pos_slope:+.3f}",
-            f"L/S ratio bearish {ls_ratio:.2f}",
-            f"OI 15m +{oi_change_15m:.1f}%",
-            f"Funding regime {funding_rate:+.3f}% / trend {funding_trend:+.3f}",
+            f"Account Ratio {account_snapshot['ratio']:.2f} (انخفاض الحسابات جزء من البصمة)",
+            f"position_led_divergence {position_led_divergence:+.2f}pt",
+            f"account_led_divergence {account_led_divergence:+.2f}pt",
+            f"L/S ratio ضعيف {ls_ratio:.2f}",
+            f"OI 5m {oi_change_5m:+.1f}% | OI 15m {oi_change_15m:+.1f}%",
+            f"OI Notional {oi_notional_change:+.1f}%",
+            f"Taker buy/sell {taker_ratio:.2f}x | buy accel {buy_accel:+.2%}",
         ]
-        if buy_accel >= 0.03:
-            score += 4
-            reasons.append(f"تسارع شراء +{buy_accel:.1%}")
-        if crowd_snapshot and crowd_snapshot['ratio'] < 1.0:
-            score += 4
-            reasons.append(f"Crowd ratio {crowd_snapshot['ratio']:.2f}")
-        if funding_rate < 0 and funding_trend > 0:
-            reasons.append('التمويل السلبي يتحسن = وقود سكيز')
-        reasons.append('Position bullish / accounts short = squeeze fuel')
+        if setup_strength == 'EARLY':
+            reasons.insert(0, "بصمة مبكرة: Position-led squeeze buildup قبل اكتمال الاندفاع")
+        else:
+            reasons.insert(0, "بصمة مؤكدة: Position-led squeeze buildup مع تأكيد سعري وOI")
+        if basis is not None:
+            reasons.append(f"Basis سياقي {basis:+.3f}%")
+        classification, decisive_feature = classify_bullish_signal({
+            'position_ratio': position_snapshot['ratio'], 'account_ratio': account_snapshot['ratio'], 'ls_ratio': ls_ratio,
+            'top_position_long_pct': top_position_long_pct, 'top_account_long_pct': top_account_long_pct,
+            'oi_change_15m': oi_change_15m, 'price_change_15m': price_change_15m, 'price_change_5m': price_change_5m,
+            'funding_rate': funding_rate, 'basis': basis, 'taker_buy_ratio_recent': recent_buy,
+            'trade_count_zscore': trade_count_zscore(kl, lookback=min(10, len(kl['trades']))),
+            'oi_notional_strong': oi_nv_score >= 0.8
+        })
+        early_ok, early_reason = pre_pump_early_filter(price_5m=price_change_5m, price_15m=price_change_15m, funding_rate=funding_rate, oi_15m=oi_change_15m if 'oi_change_15m' in locals() else 0.0)
+        if not early_ok:
+            return log_rejection(symbol, 'POSITION_LED_SQUEEZE_BUILDUP', early_reason, price_change_5m=price_change_5m, price_change_15m=price_change_15m, funding_rate=funding_rate)
 
-        result = {
-            'symbol': symbol,
-            'score': min(score, 100),
-            'pattern': 'POSITION_LED_SQUEEZE_BUILDUP',
-            'classification': 'SHORT_SQUEEZE_BUILDUP',
-            'decisive_feature': 'position_led_divergence',
-            'direction': 'UP',
-            'price': kl['close'][-1],
-            'reasons': reasons[:8],
-            'funding': funding_rate,
-            'timestamp': datetime.now().isoformat(),
-            'feature_scores': {
-                'position_ratio': round(float(position_snapshot['ratio']), 3),
-                'position_trend': round(float(pos_delta), 3),
-                'position_led_divergence': round(divergence_score, 3),
-                'taker_aggression': round(taker_score, 3),
-                'funding_regime': round(funding_score_val, 3),
-            }
-        }
+        result = {'symbol': symbol, 'score': min(score, 100), 'pattern': 'POSITION_LED_SQUEEZE_BUILDUP', 'classification': classification, 'decisive_feature': 'فجوة صعود تقودها المراكز', 'direction': 'UP', 'price': kl['close'][-1], 'funding_rate': funding_rate, 'basis': basis, 'position_ratio': position_snapshot['ratio'], 'account_ratio': account_snapshot['ratio'], 'ls_ratio': ls_ratio, 'top_position_long_pct': top_position_long_pct, 'top_account_long_pct': top_account_long_pct, 'oi_change_5m': oi_change_5m, 'oi_change_15m': oi_change_15m, 'oi_notional_change': oi_notional_change, 'price_change_5m': price_change_5m, 'price_change_15m': price_change_15m, 'taker_buy_ratio_recent': recent_buy, 'four_h_context_bonus': compute_four_h_context_bonus(symbol), 'reasons': reasons[:8], 'funding': funding_rate, 'timestamp': datetime.now().isoformat(), 'feature_scores': feature_scores}
         attach_signal_stage(result, price_change_5m, price_change_15m, oi_change_5m, oi_change_15m, funding_rate, recent_buy)
+        if setup_strength == 'EARLY':
+            result['signal_stage'] = 'EARLY'
+        elif result.get('signal_stage') in (None, '', 'SETUP', 'ARMED'):
+            result['signal_stage'] = 'CONFIRMED'
         apply_time_window_boost(result)
-        log_acceptance(symbol, 'POSITION_LED_SQUEEZE_BUILDUP', score=result['score'], price=result['price'], reasons=result['reasons'], stage=result.get('signal_stage'), classification=result.get('classification'), decisive_feature=result.get('decisive_feature'), feature_scores=result['feature_scores'], position_led_divergence=long_divergence, taker_buy_sell_ratio=taker_ratio)
+        log_acceptance(symbol, 'POSITION_LED_SQUEEZE_BUILDUP', score=result['score'], price=result['price'], reasons=result['reasons'], stage=result.get('signal_stage'), classification=result.get('classification'), decisive_feature=result.get('decisive_feature'), feature_scores=result['feature_scores'], position_led_divergence=position_led_divergence, account_led_divergence=account_led_divergence, taker_buy_sell_ratio=taker_ratio, oi_notional_change=oi_notional_change)
         return result
     except Exception as e:
         diagnostics.log_error(symbol, 'POSITION_LED_SQUEEZE_BUILDUP', str(e))
         return None
-
 
 def detect_pre_squeeze_up(symbol):
     """التقاط نموذج Smart Divergence / Short Squeeze المبكر."""
@@ -3337,7 +3420,6 @@ def detect_consensus_bullish_expansion(symbol):
         crowd_snapshot = get_global_long_short_snapshot(symbol, period='5m')
         if not position_snapshot or not account_snapshot:
             return log_rejection(symbol, 'CONSENSUS_BULLISH_EXPANSION', 'snapshot_unavailable')
-
         buy_ratios = compute_taker_buy_ratio(kl)
         recent_buy = rolling_mean(buy_ratios[-3:]) if len(buy_ratios) >= 3 else 0.0
         taker_ratio = safe_buy_sell_ratio_from_buy_ratio(recent_buy)
@@ -3347,151 +3429,97 @@ def detect_consensus_bullish_expansion(symbol):
         price_change_5m = pct_change(kl['close'][-2], kl['close'][-1])
         price_change_15m = pct_change(kl['close'][-4], kl['close'][-1])
         ls_ratio = crowd_snapshot['ratio'] if crowd_snapshot else account_snapshot['ratio']
-        account_score_val = top_account_score(account_snapshot['ratio'], account_snapshot.get('long_pct', 0.0))
-        long_divergence = compute_smart_money_divergence(account_snapshot.get('long_pct', 0.0), position_snapshot.get('long_pct', 0.0))
-        divergence_score = smart_money_divergence_feature_score(abs(long_divergence))
         funding_rate, _ = get_funding_rate(symbol)
-        funding_trend = get_funding_trend(symbol, limit=6)
-        funding_score_val = funding_regime_score(funding_rate, funding_trend)
         if funding_rate is None:
             return log_rejection(symbol, 'CONSENSUS_BULLISH_EXPANSION', 'funding_unavailable')
-
-        if position_snapshot['ratio'] < CONSENSUS_BULL_MIN_POSITION_RATIO:
-            return log_rejection(symbol, 'CONSENSUS_BULLISH_EXPANSION', 'position_ratio_too_low', position_ratio=position_snapshot['ratio'])
-        if account_snapshot['ratio'] < CONSENSUS_BULL_MIN_ACCOUNT_RATIO:
-            return log_rejection(symbol, 'CONSENSUS_BULLISH_EXPANSION', 'account_ratio_too_low', account_ratio=account_snapshot['ratio'])
-        if ls_ratio < CONSENSUS_BULL_MIN_LS_RATIO:
-            return log_rejection(symbol, 'CONSENSUS_BULLISH_EXPANSION', 'ls_ratio_too_low', ls_ratio=ls_ratio)
-        if oi_change_15m < CONSENSUS_BULL_MIN_OI_15M:
-            return log_rejection(symbol, 'CONSENSUS_BULLISH_EXPANSION', 'oi_change_too_small', oi_change_15m=oi_change_15m)
-        if price_change_15m < CONSENSUS_BULL_MIN_PRICE_15M:
-            return log_rejection(symbol, 'CONSENSUS_BULLISH_EXPANSION', 'price_move_too_small', price_change_15m=price_change_15m)
-
-        score = 54
-        score += int(account_score_val * 14)
-        score += int(taker_score * 12)
-        score += int(min(1.0, max(0.0, oi_change_15m / 6.0)) * 10)
-        score += int(funding_score_val * 6)
-        reasons = [
-            f"Account Ratio {account_snapshot['ratio']:.2f}",
-            f"Position Ratio {position_snapshot['ratio']:.2f}",
-            f"L/S {ls_ratio:.2f}",
-            f"Account lead score {account_score_val:.2f}",
-            f"Taker buy/sell {taker_ratio:.2f}x",
-            f"OI 15m +{oi_change_15m:.1f}%",
-            f"سعر 15m +{price_change_15m:.1f}%",
-        ]
-        if recent_buy >= 0.57:
-            score += 4
-            reasons.append(f"ضغط شراء {recent_buy:.1%}")
-        if oi_change_5m >= 1.5:
-            score += 4
-            reasons.append(f"OI 5m +{oi_change_5m:.1f}%")
-        if abs(long_divergence) <= 6:
-            score += 3
-            reasons.append(f"توافق حسابات/مراكز {long_divergence:+.2f}pt")
-
-        classification, decisive_feature = classify_bullish_signal({
-            'funding_rate': funding_rate,
-            'account_score': account_score_val,
-            'divergence_score': divergence_score,
-            'taker_score': taker_score,
-            'position_ratio': position_snapshot['ratio'],
-            'account_ratio': account_snapshot['ratio'],
-            'ls_ratio': ls_ratio,
-            'oi_change_15m': oi_change_15m,
-        })
-        classification = 'INSTITUTIONAL_ACCUMULATION'
-        decisive_feature = 'top_account_ratio'
-
-        result = {
-            'symbol': symbol,
-            'score': min(score, 100),
-            'pattern': 'CONSENSUS_BULLISH_EXPANSION',
-            'classification': classification,
-            'decisive_feature': decisive_feature,
-            'direction': 'UP',
-            'price': kl['close'][-1],
-            'reasons': reasons[:8],
-            'funding': funding_rate,
-            'timestamp': datetime.now().isoformat(),
-            'feature_scores': {
-                'top_account_ratio': round(account_score_val, 3),
-                'taker_aggression': round(taker_score, 3),
-                'funding_regime': round(funding_score_val, 3),
-                'smart_money_divergence': round(divergence_score, 3),
-            }
+        if position_snapshot['ratio'] < 1.8 or account_snapshot['ratio'] < 1.2 or ls_ratio < 1.2:
+            return log_rejection(symbol, 'CONSENSUS_BULLISH_EXPANSION', 'ratios_below_consensus', position_ratio=position_snapshot['ratio'], account_ratio=account_snapshot['ratio'], ls_ratio=ls_ratio)
+        if oi_change_15m < 1.5 or price_change_15m < 1.0:
+            return log_rejection(symbol, 'CONSENSUS_BULLISH_EXPANSION', 'oi_or_price_too_small', oi_change_15m=oi_change_15m, price_change_15m=price_change_15m)
+        if funding_rate > 0.02:
+            return log_rejection(symbol, 'CONSENSUS_BULLISH_EXPANSION', 'funding_crowded', funding_rate=funding_rate)
+        funding_score_val = funding_regime_score(funding_rate, get_funding_trend(symbol, limit=6))
+        basis = get_basis(symbol)
+        account_score = top_account_score(account_snapshot['ratio'], account_snapshot.get('long_pct', 0.0))
+        feature_scores = {
+            'oi_regime': round(oi_regime_score(oi_change_5m, oi_change_15m), 3),
+            'compression': round(max(0.0, min(1.0, (ls_ratio - 1.0) / 0.7)), 3),
+            'taker_aggression': round(taker_score, 3),
+            'cvd_flow': round(max(0.0, min(1.0, (recent_buy - 0.5) * 2.0)), 3),
+            'liquidity_vacuum': round(max(0.0, min(1.0, trade_count_zscore(kl, lookback=min(10, len(kl['trades']))) / 3.0)), 3),
+            'smart_money_accounts': round(account_score, 3),
+            'smart_money_divergence': round(max(0.0, 1.0 - abs(position_snapshot.get('long_pct',0.0)-account_snapshot.get('long_pct',0.0))/30.0), 3),
+            'funding_regime': round(funding_score_val, 3),
+            'basis_context': round(basis_context_score(basis, oi_change_15m, taker_score), 3),
         }
+        score = int(52 + weighted_feature_score(feature_scores) * 42 + compute_four_h_context_bonus(symbol) * 10)
+        reasons = [f"Position Ratio {position_snapshot['ratio']:.2f}", f"Account Ratio {account_snapshot['ratio']:.2f}", f"L/S {ls_ratio:.2f}", f"OI 15m +{oi_change_15m:.1f}%", f"سعر 15m +{price_change_15m:.1f}%", f"Taker buy/sell {taker_ratio:.2f}x"]
+        classification, decisive_feature = classify_bullish_signal({'position_ratio': position_snapshot['ratio'], 'account_ratio': account_snapshot['ratio'], 'ls_ratio': ls_ratio, 'top_position_long_pct': position_snapshot.get('long_pct', 0.0), 'top_account_long_pct': account_snapshot.get('long_pct', 0.0), 'oi_change_15m': oi_change_15m, 'price_change_15m': price_change_15m, 'price_change_5m': price_change_5m, 'funding_rate': funding_rate, 'taker_buy_ratio_recent': recent_buy, 'trade_count_zscore': trade_count_zscore(kl, lookback=min(10, len(kl['trades']))), 'basis': basis})
+        early_ok, early_reason = pre_pump_early_filter(price_5m=price_change_5m, price_15m=price_change_15m, funding_rate=funding_rate, oi_15m=oi_change_15m if 'oi_change_15m' in locals() else 0.0)
+        if not early_ok:
+            return log_rejection(symbol, 'CONSENSUS_BULLISH_EXPANSION', early_reason, price_change_5m=price_change_5m, price_change_15m=price_change_15m, funding_rate=funding_rate)
+
+        result = {'symbol': symbol, 'score': min(score, 100), 'pattern': 'CONSENSUS_BULLISH_EXPANSION', 'classification': classification, 'decisive_feature': decisive_feature, 'direction': 'UP', 'price': kl['close'][-1], 'reasons': reasons[:8], 'funding': funding_rate, 'timestamp': datetime.now().isoformat(), 'feature_scores': feature_scores}
         attach_signal_stage(result, price_change_5m, price_change_15m, oi_change_5m, oi_change_15m, funding_rate, recent_buy)
         apply_time_window_boost(result)
-        log_acceptance(symbol, 'CONSENSUS_BULLISH_EXPANSION', score=result['score'], price=result['price'], reasons=result['reasons'], stage=result.get('signal_stage'), classification=classification, decisive_feature=decisive_feature, feature_scores=result['feature_scores'], taker_buy_sell_ratio=taker_ratio)
+        log_acceptance(symbol, 'CONSENSUS_BULLISH_EXPANSION', score=result['score'], price=result['price'], reasons=result['reasons'], stage=result.get('signal_stage'), classification=classification, decisive_feature=decisive_feature, feature_scores=result['feature_scores'])
         return result
     except Exception as e:
         diagnostics.log_error(symbol, 'CONSENSUS_BULLISH_EXPANSION', str(e))
         return None
 
 def detect_flow_breakout(symbol):
-    """اختراق تدفقي مع سيولة رقيقة وتمويل محايد."""
+    """اختراق تدفقي مع سيولة رقيقة وتمويل غير مزدحم."""
     try:
         kl = get_klines(symbol, interval='5m', limit=12)
         if not kl or len(kl['close']) < 12:
-            return log_rejection(symbol, 'FLOW_BREAKOUT_NEUTRAL_FUNDING', 'insufficient_klines')
+            return log_rejection(symbol, 'FLOW_LIQUIDITY_VACUUM_BREAKOUT', 'insufficient_klines')
         buy_ratios = compute_taker_buy_ratio(kl)
         if len(buy_ratios) < 6:
-            return log_rejection(symbol, 'FLOW_BREAKOUT_NEUTRAL_FUNDING', 'insufficient_buy_ratio_points')
+            return log_rejection(symbol, 'FLOW_LIQUIDITY_VACUUM_BREAKOUT', 'insufficient_buy_ratio_points')
         price_change_5m = pct_change(kl['close'][-2], kl['close'][-1])
         price_change_15m = pct_change(kl['close'][-4], kl['close'][-1])
         recent_high = max(kl['high'][-7:-1])
         local_high_break = kl['close'][-1] > recent_high
-        open_, high_, low_, close_ = kl['open'][-1], kl['high'][-1], kl['low'][-1], kl['close'][-1]
-        candle_range = max(high_ - low_, 1e-12)
-        candle_body_ratio = abs(close_ - open_) / candle_range
         recent_buy = rolling_mean(buy_ratios[-3:])
         taker_ratio = safe_buy_sell_ratio_from_buy_ratio(recent_buy)
         taker_score = taker_flow_score(taker_ratio)
         trade_z = trade_count_zscore(kl, lookback=min(10, len(kl['trades'])))
         funding_rate, _ = get_funding_rate(symbol)
-        funding_trend = get_funding_trend(symbol, limit=6)
-        funding_score_val = funding_regime_score(funding_rate, funding_trend)
         if funding_rate is None:
-            return log_rejection(symbol, 'FLOW_BREAKOUT_NEUTRAL_FUNDING', 'funding_unavailable')
+            return log_rejection(symbol, 'FLOW_LIQUIDITY_VACUUM_BREAKOUT', 'funding_unavailable')
+        if abs(funding_rate) > 0.02:
+            return log_rejection(symbol, 'FLOW_LIQUIDITY_VACUUM_BREAKOUT', 'funding_not_neutral', funding_rate=funding_rate)
+        if price_change_5m < 1.2 or not local_high_break:
+            return log_rejection(symbol, 'FLOW_LIQUIDITY_VACUUM_BREAKOUT', 'breakout_not_confirmed', price_change_5m=price_change_5m, local_high_break=local_high_break)
+        if trade_z < 2.0 or recent_buy < 0.60:
+            return log_rejection(symbol, 'FLOW_LIQUIDITY_VACUUM_BREAKOUT', 'flow_not_strong_enough', trade_count_zscore=trade_z, taker_buy_ratio_recent=recent_buy)
+        funding_score_val = funding_regime_score(funding_rate, get_funding_trend(symbol, limit=6))
+        feature_scores = {
+            'oi_regime': 0.0,
+            'compression': 0.0,
+            'taker_aggression': round(taker_score, 3),
+            'cvd_flow': round(max(0.0, min(1.0, (recent_buy - 0.5) * 2.8)), 3),
+            'liquidity_vacuum': round(max(0.0, min(1.0, trade_z / 3.0)), 3),
+            'smart_money_accounts': 0.0,
+            'smart_money_divergence': 0.0,
+            'funding_regime': round(funding_score_val, 3),
+            'basis_context': round(0.5, 3),
+        }
+        score = int(54 + weighted_feature_score(feature_scores) * 40 + compute_four_h_context_bonus(symbol) * 8)
+        reasons = [f"اختراق سعري واضح فوق {recent_high:.6f}", f"price_change_5m +{price_change_5m:.1f}%", f"trade_count_zscore {trade_z:.2f}", f"taker_buy_ratio_recent {recent_buy:.1%}", f"Taker buy/sell {taker_ratio:.2f}x", f"Funding non-crowded {funding_rate:+.3f}%"]
+        classification, decisive_feature = classify_bullish_signal({'price_change_5m': price_change_5m, 'trade_count_zscore': trade_z, 'taker_buy_ratio_recent': recent_buy, 'funding_rate': funding_rate})
+        early_ok, early_reason = pre_pump_early_filter(price_5m=price_change_5m, price_15m=price_change_15m, funding_rate=funding_rate, oi_15m=oi_change_15m if 'oi_change_15m' in locals() else 0.0)
+        if not early_ok:
+            return log_rejection(symbol, 'FLOW_LIQUIDITY_VACUUM_BREAKOUT', early_reason, price_change_5m=price_change_5m, price_change_15m=price_change_15m, funding_rate=funding_rate)
 
-        if price_change_5m < FLOW_BREAKOUT_MIN_PRICE_5M:
-            return log_rejection(symbol, 'FLOW_BREAKOUT_NEUTRAL_FUNDING', 'price_impulse_too_small', price_change_5m=price_change_5m)
-        if not local_high_break:
-            return log_rejection(symbol, 'FLOW_BREAKOUT_NEUTRAL_FUNDING', 'local_high_not_broken', recent_high=recent_high, close=kl['close'][-1])
-        if candle_body_ratio < 0.60:
-            return log_rejection(symbol, 'FLOW_BREAKOUT_NEUTRAL_FUNDING', 'candle_body_ratio_too_low', candle_body_ratio=candle_body_ratio)
-        if taker_score <= 0.0 or recent_buy < FLOW_BREAKOUT_MIN_BUY_RATIO:
-            return log_rejection(symbol, 'FLOW_BREAKOUT_NEUTRAL_FUNDING', 'buy_ratio_too_low', recent_buy=recent_buy, taker_buy_sell_ratio=taker_ratio)
-        if trade_z < FLOW_BREAKOUT_MIN_TRADE_ZSCORE:
-            return log_rejection(symbol, 'FLOW_BREAKOUT_NEUTRAL_FUNDING', 'trade_count_zscore_too_low', trade_zscore=trade_z)
-        if abs(funding_rate) > FLOW_BREAKOUT_MAX_FUNDING_ABS:
-            return log_rejection(symbol, 'FLOW_BREAKOUT_NEUTRAL_FUNDING', 'funding_not_neutral', funding_rate=funding_rate)
-
-        score = 54
-        score += int(taker_score * 18)
-        score += int(min(1.0, max(0.0, trade_z / 3.0)) * 10)
-        score += int(funding_score_val * 4)
-        reasons = [
-            f"اختراق قمة محلية {recent_high:.6f}",
-            f"شمعة تنفيذ قوية ({candle_body_ratio:.2f})",
-            f"Taker buy/sell {taker_ratio:.2f}x",
-            f"Trade z-score {trade_z:.2f}",
-            f"سعر 5m +{price_change_5m:.1f}%",
-            f"تمويل محايد {funding_rate:+.3f}%"
-        ]
-        if price_change_15m >= 2.0:
-            score += 4
-            reasons.append(f"سعر 15m +{price_change_15m:.1f}%")
-        classification, decisive_feature = 'LIQUIDITY_VACUUM_BREAKOUT', 'taker_buy_sell_ratio'
-        result = {'symbol': symbol, 'score': min(score, 100), 'pattern': 'FLOW_BREAKOUT_NEUTRAL_FUNDING', 'classification': classification, 'decisive_feature': decisive_feature, 'direction': 'UP', 'price': kl['close'][-1], 'reasons': reasons[:8], 'funding': funding_rate, 'timestamp': datetime.now().isoformat(), 'feature_scores': {'taker_aggression': round(taker_score, 3), 'funding_regime': round(funding_score_val, 3)}}
+        result = {'symbol': symbol, 'score': min(score, 100), 'pattern': 'FLOW_LIQUIDITY_VACUUM_BREAKOUT', 'classification': classification, 'decisive_feature': decisive_feature, 'direction': 'UP', 'price': kl['close'][-1], 'reasons': reasons[:8], 'funding': funding_rate, 'timestamp': datetime.now().isoformat(), 'feature_scores': feature_scores}
         attach_signal_stage(result, price_change_5m, price_change_15m, 0.0, 0.0, funding_rate, recent_buy)
         apply_time_window_boost(result)
-        log_acceptance(symbol, 'FLOW_BREAKOUT_NEUTRAL_FUNDING', score=result['score'], price=result['price'], reasons=result['reasons'], stage=result.get('signal_stage'), classification=classification, decisive_feature=decisive_feature, feature_scores=result['feature_scores'], taker_buy_sell_ratio=taker_ratio)
+        log_acceptance(symbol, 'FLOW_LIQUIDITY_VACUUM_BREAKOUT', score=result['score'], price=result['price'], reasons=result['reasons'], stage=result.get('signal_stage'), classification=classification, decisive_feature=decisive_feature, feature_scores=result['feature_scores'], taker_buy_sell_ratio=taker_ratio)
         return result
     except Exception as e:
-        diagnostics.log_error(symbol, 'FLOW_BREAKOUT_NEUTRAL_FUNDING', str(e))
+        diagnostics.log_error(symbol, 'FLOW_LIQUIDITY_VACUUM_BREAKOUT', str(e))
         return None
 
 def detect_oi_expansion_pump(symbol):
@@ -3570,7 +3598,7 @@ def detect_oi_expansion_pump(symbol):
         return None
 
 def detect_account_led_accumulation(symbol):
-    """تجميع تقوده الحسابات مع دعم تدفقي وباسس محايد."""
+    """تجميع تقوده الحسابات مع دعم السعر وOI دون رفض بسبب ضعف position ratio."""
     try:
         kl = get_klines(symbol, interval='5m', limit=12)
         if not kl or len(kl['close']) < 12:
@@ -3579,10 +3607,18 @@ def detect_account_led_accumulation(symbol):
         position_snapshot = get_top_position_snapshot(symbol, period='5m')
         if not account_snapshot or not position_snapshot:
             return log_rejection(symbol, 'ACCOUNT_LED_ACCUMULATION', 'snapshot_unavailable')
+        oi_5m_hist = get_oi_history(symbol, period='5m', limit=6)
+        oi_15m_hist = get_oi_history(symbol, period='15m', limit=4)
+        if len(oi_15m_hist) < 4:
+            return log_rejection(symbol, 'ACCOUNT_LED_ACCUMULATION', 'insufficient_oi_history')
         buy_ratios = compute_taker_buy_ratio(kl)
         if len(buy_ratios) < 6:
             return log_rejection(symbol, 'ACCOUNT_LED_ACCUMULATION', 'insufficient_buy_ratio_points')
         recent_buy = rolling_mean(buy_ratios[-3:])
+        taker_ratio = safe_buy_sell_ratio_from_buy_ratio(recent_buy)
+        taker_score = taker_flow_score(taker_ratio)
+        oi_change_5m = pct_change(oi_5m_hist[-3], oi_5m_hist[-1]) if len(oi_5m_hist) >= 3 else 0.0
+        oi_change_15m = pct_change(oi_15m_hist[-2], oi_15m_hist[-1])
         price_change_5m = pct_change(kl['close'][-2], kl['close'][-1])
         price_change_15m = pct_change(kl['close'][-4], kl['close'][-1])
         funding_rate, _ = get_funding_rate(symbol)
@@ -3590,45 +3626,62 @@ def detect_account_led_accumulation(symbol):
             return log_rejection(symbol, 'ACCOUNT_LED_ACCUMULATION', 'funding_unavailable')
         basis = get_basis(symbol)
         basis_abs = abs(basis) if basis is not None else 0.0
-        if account_snapshot['ratio'] < ACCOUNT_LED_MIN_ACCOUNT_RATIO:
-            return log_rejection(symbol, 'ACCOUNT_LED_ACCUMULATION', 'account_ratio_too_low', account_ratio=account_snapshot['ratio'])
-        if position_snapshot['ratio'] < ACCOUNT_LED_MIN_POSITION_RATIO:
-            return log_rejection(symbol, 'ACCOUNT_LED_ACCUMULATION', 'position_ratio_too_low', position_ratio=position_snapshot['ratio'])
-        if price_change_15m < ACCOUNT_LED_MIN_PRICE_15M:
-            return log_rejection(symbol, 'ACCOUNT_LED_ACCUMULATION', 'price_change_too_small', price_change_15m=price_change_15m)
-        if recent_buy < ACCOUNT_LED_MIN_BUY_RATIO:
-            return log_rejection(symbol, 'ACCOUNT_LED_ACCUMULATION', 'buy_ratio_too_low', recent_buy=recent_buy)
-        if abs(funding_rate) > ACCOUNT_LED_MAX_FUNDING_ABS:
-            return log_rejection(symbol, 'ACCOUNT_LED_ACCUMULATION', 'funding_not_neutral', funding_rate=funding_rate)
-        if basis_abs > ACCOUNT_LED_MAX_BASIS_ABS:
-            return log_rejection(symbol, 'ACCOUNT_LED_ACCUMULATION', 'basis_too_wide', basis=basis)
-        account_score_val = top_account_score(account_snapshot['ratio'], account_snapshot.get('long_pct', 0.0))
-        taker_ratio = safe_buy_sell_ratio_from_buy_ratio(recent_buy)
-        taker_score = taker_flow_score(taker_ratio)
-        funding_trend = get_funding_trend(symbol, limit=6)
-        funding_score_val = funding_regime_score(funding_rate, funding_trend)
-        score = 50 + int(account_score_val * 16) + int(taker_score * 12) + int(funding_score_val * 6)
+
+        account_ratio = float(account_snapshot['ratio'])
+        position_ratio = float(position_snapshot['ratio'])
+        top_account_long_pct = float(account_snapshot.get('long_pct', 0.0) or 0.0)
+        top_position_long_pct = float(position_snapshot.get('long_pct', 0.0) or 0.0)
+        account_led_divergence = top_account_long_pct - top_position_long_pct
+        position_led_divergence = top_position_long_pct - top_account_long_pct
+
+        if account_ratio < 1.6 or top_account_long_pct < 60.0:
+            return log_rejection(symbol, 'ACCOUNT_LED_ACCUMULATION', 'account_footprint_too_weak', account_ratio=account_ratio, account_long_pct=top_account_long_pct)
+        if position_ratio < 0.90:
+            return log_rejection(symbol, 'ACCOUNT_LED_ACCUMULATION', 'position_ratio_too_low_for_early_accumulation', position_ratio=position_ratio)
+        if oi_change_15m < 1.5 or price_change_15m < 1.0:
+            return log_rejection(symbol, 'ACCOUNT_LED_ACCUMULATION', 'oi_or_price_not_ready', oi_change_15m=oi_change_15m, price_change_15m=price_change_15m)
+        if basis_abs > 0.20 and (oi_change_15m < 2.0 or taker_score < 0.35):
+            return log_rejection(symbol, 'ACCOUNT_LED_ACCUMULATION', 'basis_conflict_with_weak_flow', basis=basis, oi_change_15m=oi_change_15m, taker_score=taker_score)
+        if not (funding_rate < 0 or abs(funding_rate) <= 0.03):
+            return log_rejection(symbol, 'ACCOUNT_LED_ACCUMULATION', 'funding_regime_not_supportive', funding_rate=funding_rate)
+
+        funding_score_val = funding_regime_score(funding_rate, get_funding_trend(symbol, limit=6))
+        account_score_val = top_account_score(account_ratio, top_account_long_pct)
+        feature_scores = {
+            'oi_regime': round(oi_regime_score(oi_change_5m, oi_change_15m), 3),
+            'compression': round(max(0.0, min(1.0, (1.1 - position_ratio) / 0.4)), 3),
+            'taker_aggression': round(taker_score, 3),
+            'cvd_flow': round(max(0.0, min(1.0, (recent_buy - 0.5) * 2.4)), 3),
+            'liquidity_vacuum': 0.0,
+            'smart_money_accounts': round(account_score_val, 3),
+            'smart_money_divergence': round(max(0.0, min(1.0, account_led_divergence / 18.0)), 3),
+            'funding_regime': round(funding_score_val, 3),
+            'basis_context': round(basis_context_score(basis, oi_change_15m, taker_score), 3),
+        }
+        score = int(50 + weighted_feature_score(feature_scores) * 42 + compute_four_h_context_bonus(symbol) * 10)
         reasons = [
-            f"Account Ratio {account_snapshot['ratio']:.2f}",
-            f"Account Long {account_snapshot.get('long_pct', 0.0):.2f}%",
-            f"Position Ratio {position_snapshot['ratio']:.2f}",
-            f"Taker buy/sell {taker_ratio:.2f}x",
+            f"Account Ratio {account_ratio:.2f}",
+            f"Account Long {top_account_long_pct:.2f}%",
+            f"Position Ratio {position_ratio:.2f} (الضعف المبكر مقبول)",
+            f"account_led_divergence {account_led_divergence:+.2f}pt",
+            f"position_led_divergence {position_led_divergence:+.2f}pt",
+            f"OI 15m +{oi_change_15m:.1f}%",
             f"سعر 15m +{price_change_15m:.1f}%",
-            f"Basis محايد {basis:+.3f}%" if basis is not None else 'Basis غير متاح',
-            f"تمويل محايد {funding_rate:+.3f}%",
+            f"Taker buy/sell {taker_ratio:.2f}x",
         ]
-        if position_snapshot['ratio'] >= 1.15:
-            score += 2
-            reasons.append(f"Position support {position_snapshot['ratio']:.2f}")
-        result = {'symbol': symbol, 'score': min(score, 100), 'pattern': 'ACCOUNT_LED_ACCUMULATION', 'classification': 'INSTITUTIONAL_ACCUMULATION', 'decisive_feature': 'top_account_ratio', 'direction': 'UP', 'price': kl['close'][-1], 'reasons': reasons[:8], 'funding': funding_rate, 'timestamp': datetime.now().isoformat(), 'feature_scores': {'top_account_ratio': round(account_score_val, 3), 'taker_aggression': round(taker_score, 3), 'funding_regime': round(funding_score_val, 3)}}
-        attach_signal_stage(result, price_change_5m, price_change_15m, 0.0, 0.0, funding_rate, recent_buy)
+        classification, decisive_feature = classify_bullish_signal({'position_ratio': position_ratio, 'account_ratio': account_ratio, 'top_position_long_pct': top_position_long_pct, 'top_account_long_pct': top_account_long_pct, 'oi_change_15m': oi_change_15m, 'price_change_15m': price_change_15m, 'price_change_5m': price_change_5m, 'funding_rate': funding_rate, 'basis': basis, 'taker_buy_ratio_recent': recent_buy, 'oi_rising_strongly': oi_change_15m >= 2.3, 'price_breakout_confirmed': price_change_5m >= 0.7})
+        early_ok, early_reason = pre_pump_early_filter(price_5m=price_change_5m, price_15m=price_change_15m, funding_rate=funding_rate, oi_15m=oi_change_15m if 'oi_change_15m' in locals() else 0.0)
+        if not early_ok:
+            return log_rejection(symbol, 'ACCOUNT_LED_ACCUMULATION', early_reason, price_change_5m=price_change_5m, price_change_15m=price_change_15m, funding_rate=funding_rate)
+
+        result = {'symbol': symbol, 'score': min(score, 100), 'pattern': 'ACCOUNT_LED_ACCUMULATION', 'classification': classification, 'decisive_feature': decisive_feature, 'direction': 'UP', 'price': kl['close'][-1], 'reasons': reasons[:8], 'funding': funding_rate, 'timestamp': datetime.now().isoformat(), 'feature_scores': feature_scores}
+        attach_signal_stage(result, price_change_5m, price_change_15m, oi_change_5m, oi_change_15m, funding_rate, recent_buy)
         apply_time_window_boost(result)
-        log_acceptance(symbol, 'ACCOUNT_LED_ACCUMULATION', score=result['score'], price=result['price'], reasons=result['reasons'], stage=result.get('signal_stage'), classification=result.get('classification'), decisive_feature=result.get('decisive_feature'), feature_scores=result.get('feature_scores'), taker_buy_sell_ratio=taker_ratio)
+        log_acceptance(symbol, 'ACCOUNT_LED_ACCUMULATION', score=result['score'], price=result['price'], reasons=result['reasons'], stage=result.get('signal_stage'), classification=result.get('classification'), decisive_feature=result.get('decisive_feature'), feature_scores=result.get('feature_scores'), taker_buy_sell_ratio=taker_ratio, account_led_divergence=account_led_divergence, position_led_divergence=position_led_divergence)
         return result
     except Exception as e:
         diagnostics.log_error(symbol, 'ACCOUNT_LED_ACCUMULATION', str(e))
         return None
-
 
 def detect_exhaustion_risk(symbol):
     """خطر إرهاق بعد صعود قوي وتدهور الزخم قصير المدى."""
@@ -3669,7 +3722,7 @@ def detect_exhaustion_risk(symbol):
         return None
 
 # =============================================================================
-# قاموس الترجمة العربية (محدث)
+# قاموس legacy-only للأنماط القديمة (تشخيص داخلي فقط)
 # =============================================================================
 PATTERN_ARABIC = {
     'LONG_TERM_ACCUMULATION': {
@@ -3767,6 +3820,11 @@ PATTERN_ARABIC = {
         'default_direction': 'شراء',
         'emoji': '⚡'
     },
+    'FLOW_LIQUIDITY_VACUUM_BREAKOUT': {
+        'name': 'اختراق فراغ سيولة تدفقي',
+        'default_direction': 'شراء',
+        'emoji': '⚡'
+    },
     'OI_EXPANSION_PUMP': {
         'name': 'ضخ بتمدد الفائدة المفتوحة',
         'default_direction': 'شراء',
@@ -3791,8 +3849,58 @@ PATTERN_ARABIC = {
         'name': 'اختراق فراغ سيولة',
         'default_direction': 'شراء',
         'emoji': '⚡'
+    },
+    'NO_CLEAR_BULLISH_FAMILY': {
+        'name': 'بصمة صاعدة غير مكتملة',
+        'default_direction': 'شراء',
+        'emoji': '⚪'
     }
 }
+
+CLASSIFICATION_DISPLAY = {
+    'POSITION_LED_SQUEEZE_BUILDUP': {'name': 'بناء سكيز تقوده المراكز', 'emoji': '🎯', 'direction': 'UP'},
+    'ACCOUNT_LED_ACCUMULATION': {'name': 'تجميع تقوده الحسابات', 'emoji': '🏦', 'direction': 'UP'},
+    'CONSENSUS_BULLISH_EXPANSION': {'name': 'توسع صاعد مؤسسي متوافق', 'emoji': '🟢', 'direction': 'UP'},
+    'FLOW_LIQUIDITY_VACUUM_BREAKOUT': {'name': 'اختراق فراغ سيولة تدفقي', 'emoji': '⚡', 'direction': 'UP'},
+    'INSTITUTIONAL_ACCUMULATION': {'name': 'تراكم مؤسسي', 'emoji': '🏦', 'direction': 'UP'},
+    'SHORT_SQUEEZE_BUILDUP': {'name': 'بناء ضغط قصير', 'emoji': '🧠', 'direction': 'UP'},
+    'LIQUIDITY_VACUUM_BREAKOUT': {'name': 'اختراق فراغ سيولة', 'emoji': '⚡', 'direction': 'UP'},
+    'NO_CLEAR_BULLISH_FAMILY': {'name': 'بصمة صاعدة غير مكتملة', 'emoji': '⚪', 'direction': 'UP'},
+    'EXHAUSTION_RISK': {'name': 'خطر إرهاق صاعد', 'emoji': '🧯', 'direction': 'DOWN'},
+    'BEARISH_GENERIC': {'name': 'إشارة هابطة عامة', 'emoji': '🔻', 'direction': 'DOWN'},
+    'LATE_CROWD_LONG': {'name': 'ازدحام شراء متأخر', 'emoji': '🚫', 'direction': 'DOWN'},
+}
+
+def get_primary_display(signal_data):
+    classification = signal_data.get('classification')
+    pattern = signal_data.get('pattern')
+    key = classification or pattern or 'UNKNOWN'
+    info = CLASSIFICATION_DISPLAY.get(key)
+    if info:
+        return key, info.get('name', key), info.get('emoji', '🔹')
+    if key in PATTERN_ARABIC:
+        return key, key, '🔹'
+    return key, key, '🔹'
+
+def direction_to_ar(direction):
+    if direction == 'UP':
+        return '🟢 شراء'
+    if direction == 'DOWN':
+        return '🔴 بيع'
+    return '⚪ محايد'
+
+def format_feature_scores_brief(feature_scores, top_n=4):
+    if not feature_scores or not isinstance(feature_scores, dict):
+        return 'غير متاح'
+    pairs = []
+    for k, v in feature_scores.items():
+        try:
+            pairs.append((k, float(v)))
+        except Exception:
+            continue
+    pairs.sort(key=lambda x: x[1], reverse=True)
+    brief = [f"{k}:{v:.2f}" for k, v in pairs[:top_n]]
+    return ' | '.join(brief) if brief else 'غير متاح'
 
 # =============================================================================
 # قاعدة بيانات الإشارات
@@ -3806,11 +3914,9 @@ class SignalDatabase:
         "price": "REAL",
         "direction": "TEXT DEFAULT 'UP'",
         "reasons": "TEXT",
-        "power_level": "TEXT",
-        "stop_loss": "REAL",
-        "take_profit1": "REAL",
-        "take_profit2": "REAL",
+        "signal_quality_tier": "TEXT",
         "signal_stage": "TEXT DEFAULT 'SETUP'",
+        "classification": "TEXT",
         "evaluated": "INTEGER DEFAULT 0",
         "outcome": "INTEGER DEFAULT 0",
         "price_after": "REAL",
@@ -3876,11 +3982,9 @@ class SignalDatabase:
                     price REAL,
                     direction TEXT,
                     reasons TEXT,
-                    power_level TEXT,
-                    stop_loss REAL,
-                    take_profit1 REAL,
-                    take_profit2 REAL,
+                    signal_quality_tier TEXT,
                     signal_stage TEXT DEFAULT 'SETUP',
+                    classification TEXT,
                     evaluated INTEGER DEFAULT 0,
                     outcome INTEGER DEFAULT 0,
                     price_after REAL,
@@ -3900,8 +4004,8 @@ class SignalDatabase:
         with sqlite3.connect(self.db_path, timeout=10) as conn:
             self._ensure_signal_schema(conn)
             conn.execute("""
-                INSERT INTO signals (timestamp, symbol, pattern, score, price, direction, reasons, power_level, stop_loss, take_profit1, take_profit2, signal_stage, trigger_high, trigger_low)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO signals (timestamp, symbol, pattern, score, price, direction, reasons, signal_quality_tier, signal_stage, classification, trigger_high, trigger_low)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 signal_data.get('timestamp', datetime.now().isoformat()),
                 signal_data.get('symbol', ''),
@@ -3910,11 +4014,9 @@ class SignalDatabase:
                 float(signal_data.get('price', 0) or 0),
                 signal_data.get('direction', 'UP'),
                 json.dumps(signal_data.get('reasons', []), ensure_ascii=False),
-                signal_data.get('power_level', 'عادية'),
-                float(signal_data.get('stop_loss', 0) or 0),
-                float(signal_data.get('take_profit1', 0) or 0),
-                float(signal_data.get('take_profit2', 0) or 0),
+                signal_data.get('signal_quality_tier', 'مرشح مبكر'),
                 signal_data.get('signal_stage', 'SETUP'),
+                signal_data.get('classification', signal_data.get('pattern', 'UNKNOWN')),
                 float(signal_data.get('trigger_high', 0) or 0),
                 float(signal_data.get('trigger_low', 0) or 0)
             ))
@@ -3986,7 +4088,7 @@ class SignalDatabase:
         with sqlite3.connect(self.db_path, timeout=10) as conn:
             self._configure_connection(conn)
             cur = conn.execute("""
-                SELECT pattern,
+                SELECT COALESCE(NULLIF(classification, ''), pattern) AS calibration_key,
                        COUNT(*) AS total,
                        SUM(CASE WHEN outcome_5m = 1 THEN 1 ELSE 0 END) AS win_5m,
                        SUM(CASE WHEN outcome_15m = 1 THEN 1 ELSE 0 END) AS win_15m,
@@ -3994,7 +4096,7 @@ class SignalDatabase:
                        SUM(CASE WHEN invalidated = 1 THEN 1 ELSE 0 END) AS invalidated_count
                 FROM signals
                 WHERE timestamp >= ?
-                GROUP BY pattern
+                GROUP BY calibration_key
                 ORDER BY total DESC
             """, (cutoff,))
             return cur.fetchall()
@@ -4009,178 +4111,8 @@ class SignalDatabase:
 db = SignalDatabase()
 
 # =============================================================================
-# نظام المعايرة التكيفية للأنماط
+# تم حذف نظام المعايرة القديم بالكامل
 # =============================================================================
-VALID_CALIBRATION_PATTERNS = {
-    "SMART_DIVERGENCE_SQUEEZE",
-    "POSITION_LED_SQUEEZE_BUILDUP",
-    "CONSENSUS_BULLISH_EXPANSION",
-    "FLOW_BREAKOUT_NEUTRAL_FUNDING",
-    "OI_EXPANSION_CONTINUATION",
-    "ACCOUNT_LED_ACCUMULATION",
-    "EXHAUSTION_RISK",
-    "BEAR_SQUEEZE",
-    "WHALE_MOMENTUM_UP",
-    "WHALE_MOMENTUM_DOWN",
-    "WHALE_MOMENTUM",
-    "WHALE_SETUP",
-    "PRE_PUMP",
-    "PRE_CLOSE_SQUEEZE",
-    "RETAIL_TRAP",
-    "RETAIL_TRAP_DOWN",
-    "RETAIL_TRAP_UP",
-    "SMART_MONEY_DIVERGENCE",
-    "PRE_EXPLOSION_SETUP",
-    "STRONG_UPTREND",
-    "SKYROCKET",
-}
-
-def _normalize_calibration_pattern(pattern):
-    pattern = str(pattern or '').strip().upper()
-    if not pattern or pattern == 'NULL' or pattern not in VALID_CALIBRATION_PATTERNS:
-        return ''
-    return pattern
-
-class PatternCalibrator:
-    def __init__(self, db_obj, path=CALIBRATION_PATH):
-        self.db = db_obj
-        self.path = path
-        self.rules = {}
-        self.last_refresh = None
-        self.load()
-
-    def load(self):
-        try:
-            if os.path.exists(self.path):
-                with open(self.path, 'r', encoding='utf-8') as f:
-                    raw_rules = json.load(f)
-                if isinstance(raw_rules, dict):
-                    cleaned = {}
-                    for k, v in raw_rules.items():
-                        nk = _normalize_calibration_pattern(k)
-                        if nk and isinstance(v, dict):
-                            cleaned[nk] = v
-                    self.rules = cleaned
-                else:
-                    self.rules = {}
-            else:
-                self.rules = {}
-        except Exception:
-            self.rules = {}
-
-    def save(self):
-        try:
-            ensure_parent_dir(self.path)
-            with open(self.path, 'w', encoding='utf-8') as f:
-                json.dump(self.rules, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-
-    def refresh_from_db(self, lookback_hours=CALIBRATION_LOOKBACK_HOURS):
-        if not ENABLE_AUTO_CALIBRATION:
-            return {}
-        rows = self.db.get_pattern_quality_metrics(lookback_hours=lookback_hours)
-        filtered_rows = []
-        total_signals = 0
-        for row in rows:
-            pattern, total, win5, win15, win30, invalidated = row
-            pattern = _normalize_calibration_pattern(pattern)
-            total = int(total or 0)
-            if not pattern or total <= 0:
-                continue
-            filtered_rows.append((pattern, total, win5, win15, win30, invalidated))
-            total_signals += total
-
-        if total_signals < MIN_SIGNALS_FOR_CALIBRATION:
-            self.rules = {k: v for k, v in self.rules.items() if _normalize_calibration_pattern(k)}
-            self.last_refresh = datetime.now()
-            return {}
-
-        updated = {}
-        for row in filtered_rows:
-            pattern, total, win5, win15, win30, invalidated = row
-            if total < MIN_SIGNALS_FOR_CALIBRATION:
-                continue
-            win5 = int(win5 or 0)
-            win15 = int(win15 or 0)
-            win30 = int(win30 or 0)
-            invalidated = int(invalidated or 0)
-            wr5 = win5 / total
-            wr15 = win15 / total
-            wr30 = win30 / total
-            invr = invalidated / total
-            quality = (0.20 * wr5) + (0.45 * wr15) + (0.35 * wr30) - (0.25 * invr)
-            quality = max(0.0, min(1.0, quality))
-            score_bias = int(round((quality - 0.55) * 20))
-            score_bias = max(-PATTERN_SCORE_BIAS_LIMIT, min(PATTERN_SCORE_BIAS_LIMIT, score_bias))
-            min_accept_score = 65
-            if quality < 0.40:
-                min_accept_score = 82
-            elif quality < 0.50:
-                min_accept_score = 76
-            elif quality < 0.60:
-                min_accept_score = 71
-            elif quality > 0.72:
-                min_accept_score = 64
-            updated[pattern] = {
-                'total': total,
-                'win_rate_5m': round(wr5, 4),
-                'win_rate_15m': round(wr15, 4),
-                'win_rate_30m': round(wr30, 4),
-                'invalidation_rate': round(invr, 4),
-                'quality': round(quality, 4),
-                'score_bias': score_bias,
-                'min_accept_score': min_accept_score,
-                'updated_at': datetime.now().isoformat()
-            }
-        self.rules = {k: v for k, v in self.rules.items() if _normalize_calibration_pattern(k)}
-        if updated:
-            self.rules.update(updated)
-            self.save()
-        self.last_refresh = datetime.now()
-        return updated
-
-    def apply(self, signal_data):
-        if not signal_data or not ENABLE_AUTO_CALIBRATION:
-            return signal_data
-        rule = self.rules.get(_normalize_calibration_pattern(signal_data.get('pattern')))
-        if not rule:
-            return signal_data
-        signal_data['calibration_quality'] = rule.get('quality')
-        signal_data['calibration_min_accept_score'] = rule.get('min_accept_score')
-        bias = int(rule.get('score_bias', 0))
-        if bias:
-            signal_data['score'] = max(0, min(100, int(signal_data.get('score', 0) + bias)))
-            signal_data.setdefault('reasons', []).append(f"معايرة النمط {bias:+d} (جودة {rule.get('quality', 0):.2f})")
-        if signal_data.get('score', 0) < int(rule.get('min_accept_score', 65)):
-            diagnostics.log_event('CALIBRATION_REJECT', signal_data.get('symbol', ''), signal_data.get('pattern', ''), {
-                'score': signal_data.get('score'),
-                'min_accept_score': rule.get('min_accept_score'),
-                'quality': rule.get('quality')
-            })
-            return None
-        return signal_data
-
-    def print_summary(self):
-        clean_rules = {
-            _normalize_calibration_pattern(k): v
-            for k, v in self.rules.items()
-            if _normalize_calibration_pattern(k) and isinstance(v, dict)
-        }
-        if not clean_rules:
-            print("🎛️ لا توجد معايرة محفوظة بعد.")
-            return
-        print("🎛️ ملخص المعايرة:")
-        items = sorted(clean_rules.items(), key=lambda kv: str(kv[0] or ''))
-        for pattern, rule in items:
-            if not isinstance(rule, dict) or 'quality' not in rule:
-                continue
-            quality = float(rule.get('quality', 0.0) or 0.0)
-            bias = int(rule.get('score_bias', 0) or 0)
-            min_accept = int(rule.get('min_accept_score', 65) or 65)
-            print(f"   • {pattern}: جودة={quality:.2f} | bias={bias:+d} | min={min_accept}")
-
-pattern_calibrator = PatternCalibrator(db)
 
 # =============================================================================
 # نظام تتبع تحديثات الإشارات
@@ -4244,215 +4176,361 @@ def clear_invalid_symbols():
     with invalid_symbols_lock:
         invalid_symbols.clear()
 
+
+CORE_BULLISH_PATTERNS = {
+    'POSITION_LED_SQUEEZE_BUILDUP',
+    'ACCOUNT_LED_ACCUMULATION',
+    'CONSENSUS_BULLISH_EXPANSION',
+    'FLOW_LIQUIDITY_VACUUM_BREAKOUT',
+}
+
+BEARISH_PATTERNS = {
+    'BEAR_SQUEEZE',
+    'RETAIL_TRAP_DOWN',
+    'WHALE_MOMENTUM_DOWN',
+    'EXHAUSTION_RISK',
+}
+
+def _enforce_signal_consistency(signal_data):
+    if not signal_data:
+        return signal_data
+    pattern = str(signal_data.get('pattern', '') or '')
+    direction = signal_data.get('direction', 'UP')
+    classification = signal_data.get('classification')
+
+    if pattern in CORE_BULLISH_PATTERNS:
+        signal_data['direction'] = 'UP'
+        if classification not in CORE_BULLISH_PATTERNS:
+            signal_data['classification'] = pattern
+
+    if pattern in BEARISH_PATTERNS and direction != 'DOWN':
+        signal_data['direction'] = 'DOWN'
+
+    return signal_data
+
+def _dedupe_symbol_signals(results):
+    best = {}
+    for r in results:
+        key = (r.get('pattern'), r.get('classification'), r.get('direction'))
+        if key not in best or float(r.get('score', 0)) > float(best[key].get('score', 0)):
+            best[key] = r
+    return list(best.values())
+
+def _pct_window(closes, lookback=1):
+    try:
+        if not closes or len(closes) <= lookback:
+            return 0.0
+        return pct_change(closes[-1-lookback], closes[-1])
+    except Exception:
+        return 0.0
+
+def build_mtf_context(symbol):
+    daily = get_klines(symbol, interval='1d', limit=40)
+    h4 = get_klines(symbol, interval='4h', limit=40)
+    m15 = get_klines(symbol, interval='15m', limit=24)
+    m5 = get_klines(symbol, interval='5m', limit=12)
+    if not daily or not h4 or not m15 or not m5:
+        return None
+
+    d_close = daily.get('close', [])
+    h4_close = h4.get('close', [])
+    m15_close = m15.get('close', [])
+    m5_close = m5.get('close', [])
+    if len(d_close) < 20 or len(h4_close) < 20 or len(m15_close) < 8 or len(m5_close) < 4:
+        return None
+
+    daily_trend_pct = _pct_window(d_close, lookback=10)
+    h4_trend_pct = _pct_window(h4_close, lookback=6)
+    m15_move_pct = _pct_window(m15_close, lookback=4)
+    m5_move_pct = _pct_window(m5_close, lookback=1)
+
+    if daily_trend_pct >= 1.2:
+        daily_bias = 'UP'
+        daily_reason = 'اتجاه يومي صاعد واضح مع زخم أعلى من الحد الأدنى'
+    elif daily_trend_pct <= -1.2:
+        daily_bias = 'DOWN'
+        daily_reason = 'اتجاه يومي هابط واضح وضغط بيعي مستمر'
+    else:
+        daily_bias = 'NEUTRAL'
+        daily_reason = 'اتجاه يومي محايد/متذبذب بدون انحياز قوي'
+
+    if h4_trend_pct >= 0.6:
+        h4_bias = 'UP'
+        h4_reason = '4H يؤكد الميل الصاعد مع تسارع متوسط'
+    elif h4_trend_pct <= -0.6:
+        h4_bias = 'DOWN'
+        h4_reason = '4H يؤكد الميل الهابط مع تسارع متوسط'
+    else:
+        h4_bias = 'NEUTRAL'
+        h4_reason = '4H حيادي ولم يحسم التأكيد بعد'
+
+    zone = 'NEUTRAL'
+    zone_reason = 'لا توجد منطقة اهتمام واضحة على 15m'
+    if abs(m15_move_pct) >= 0.5:
+        if m15_move_pct > 0:
+            zone = 'BULLISH_INTEREST'
+            zone_reason = '15m يُظهر تهيئة صاعدة/Build-up في منطقة اهتمام'
+        else:
+            zone = 'BEARISH_INTEREST'
+            zone_reason = '15m يُظهر ضعفًا/فشلًا في منطقة اهتمام هابطة'
+
+    entry = 'WAIT'
+    entry_reason = '5m لم يعطِ تفعيل دخول واضح'
+    if m5_move_pct >= 0.20:
+        entry = 'LONG_TRIGGER'
+        entry_reason = '5m يعطي تفعيل دخول شراء مبكر'
+    elif m5_move_pct <= -0.20:
+        entry = 'SHORT_TRIGGER'
+        entry_reason = '5m يعطي تفعيل دخول بيع/هبوط'
+
+    return {
+        'daily_bias': daily_bias,
+        'h4_bias': h4_bias,
+        'm15_zone': zone,
+        'm5_entry': entry,
+        'daily_trend_pct': round(daily_trend_pct, 3),
+        'h4_trend_pct': round(h4_trend_pct, 3),
+        'm15_move_pct': round(m15_move_pct, 3),
+        'm5_move_pct': round(m5_move_pct, 3),
+        'daily_reason': daily_reason,
+        'h4_reason': h4_reason,
+        'm15_reason': zone_reason,
+        'm5_reason': entry_reason,
+    }
+
+def is_mtf_aligned(direction, mtf):
+    if not mtf:
+        return False, 'missing_mtf_context'
+
+    daily = mtf.get('daily_bias', 'NEUTRAL')
+    h4 = mtf.get('h4_bias', 'NEUTRAL')
+    m15_zone = mtf.get('m15_zone', 'NEUTRAL')
+    m5_entry = mtf.get('m5_entry', 'WAIT')
+
+    if direction == 'UP':
+        if daily == 'DOWN':
+            return False, 'daily_bias_down'
+        if h4 == 'DOWN':
+            return False, 'h4_bias_down'
+        if m15_zone == 'BEARISH_INTEREST':
+            return False, 'm15_bearish_interest'
+        if m5_entry == 'SHORT_TRIGGER':
+            return False, 'm5_short_trigger'
+        if daily == 'UP' and h4 == 'UP' and m15_zone in {'BULLISH_INTEREST', 'NEUTRAL'}:
+            return True, 'full_up_alignment'
+        return True, 'up_partial_alignment'
+
+    if direction == 'DOWN':
+        if daily == 'UP':
+            return False, 'daily_bias_up'
+        if h4 == 'UP':
+            return False, 'h4_bias_up'
+        if m15_zone == 'BULLISH_INTEREST':
+            return False, 'm15_bullish_interest'
+        if m5_entry == 'LONG_TRIGGER':
+            return False, 'm5_long_trigger'
+        if daily == 'DOWN' and h4 == 'DOWN' and m15_zone in {'BEARISH_INTEREST', 'NEUTRAL'}:
+            return True, 'full_down_alignment'
+        return True, 'down_partial_alignment'
+
+    return False, 'unknown_direction'
+
+
 def evaluate_symbol_patterns(sym):
-    """تجميع كل الأنماط الممكنة للرمز بدل التوقف عند أول نمط."""
+    """تشغيل فعلي محصور في العائلات الأربع + ترشيح هرمي احتياطي لمنع ضياع الحالات المبكرة."""
     results = []
-    pattern_functions = [
+    mtf = build_mtf_context(sym)
+    if not mtf:
+        return []
+
+    core_bullish_functions = [
         detect_position_led_squeeze_buildup,
-        detect_pre_squeeze_up,
+        detect_account_led_accumulation,
         detect_consensus_bullish_expansion,
         detect_flow_breakout,
-        detect_oi_expansion_pump,
-        detect_account_led_accumulation,
-        detect_exhaustion_risk,
-        bear_squeeze_pattern,
-        whale_momentum_pattern,
-        pre_close_squeeze_pattern,
-        retail_trap_pattern,
-        detect_strong_uptrend,
-        detect_skyrocket_enhanced,
-        detect_smart_money_divergence,
-        detect_pre_explosion_setup,
     ]
 
-    for fn in pattern_functions:
+    def _run_detector(fn):
         try:
             res = fn(sym)
-            if res:
-                power_score, power_level, power_reasons = assess_signal_power(
-                    res['symbol'], res['score'], {}
-                )
-                res['power_level'] = power_level
-                for reason in power_reasons:
-                    if reason not in res['reasons']:
-                        res['reasons'].append(reason)
-                stop_loss, tp1, tp2 = calculate_risk_management(
-                    res['symbol'], res['price'], res['direction']
-                )
-                res['stop_loss'] = stop_loss
-                res['take_profit1'] = tp1
-                res['take_profit2'] = tp2
-                res = validate_and_finalize_signal(res)
-                if res:
-                    results.append(res)
+            if not res:
+                return None
+
+            _enforce_signal_consistency(res)
+            aligned, mtf_reason = is_mtf_aligned(res.get('direction', 'UP'), mtf)
+            if not aligned:
+                return log_rejection(sym, res.get('pattern', 'UNKNOWN'), f'mtf_reject:{mtf_reason}', mtf=mtf)
+
+            res['mtf_context'] = mtf
+            res['daily_view'] = mtf.get('daily_reason', '')
+            res['h4_view'] = mtf.get('h4_reason', '')
+            res['m15_view'] = mtf.get('m15_reason', '')
+            res['m5_view'] = mtf.get('m5_reason', '')
+            res.setdefault('reasons', []).append(
+                f"تسلسل MTF: 1D={mtf.get('daily_bias')} | 4H={mtf.get('h4_bias')} | 15m={mtf.get('m15_zone')} | 5m={mtf.get('m5_entry')}"
+            )
+
+            if mtf.get('daily_bias') == 'UP':
+                res['score'] = min(100, float(res.get('score', 0)) + 4)
+            if mtf.get('h4_bias') == 'UP':
+                res['score'] = min(100, float(res.get('score', 0)) + 3)
+            if mtf.get('m5_entry') == 'LONG_TRIGGER':
+                res['score'] = min(100, float(res.get('score', 0)) + 2)
+
+            quality_score, quality_level, quality_reasons = assess_signal_quality(res['symbol'], res['score'], res)
+            res['score'] = max(float(res.get('score', 0)), float(quality_score))
+            res['signal_quality_tier'] = quality_level
+            for reason in quality_reasons:
+                if reason not in res['reasons']:
+                    res['reasons'].append(reason)
+            return validate_and_finalize_signal(res)
         except Exception as e:
             diagnostics.log_error(sym, fn.__name__, str(e))
             if DEBUG:
                 print(f"⚠️ خطأ في {fn.__name__} لـ {sym}: {e}")
-    return results
+            return None
+
+    for fn in core_bullish_functions:
+        res = _run_detector(fn)
+        if res:
+            results.append(res)
+
+    # fallback هرمي: إذا لم تنجح detectors رغم وجود توافق MTF واضح، أنشئ مرشح مبكر منطقي
+    if not results:
+        try:
+            if mtf.get('daily_bias') in {'UP', 'NEUTRAL'} and mtf.get('h4_bias') in {'UP', 'NEUTRAL'} and mtf.get('m15_zone') == 'BULLISH_INTEREST' and mtf.get('m5_entry') != 'SHORT_TRIGGER':
+                pos = get_top_position_snapshot(sym, period='5m')
+                acc = get_top_account_snapshot(sym, period='5m')
+                crowd = get_global_long_short_snapshot(sym, period='5m')
+                ctx = get_short_term_context(sym, interval='5m', limit=12)
+                if pos and acc and ctx:
+                    ls_ratio = float((crowd or {}).get('ratio', acc.get('ratio', 1.0)) or acc.get('ratio', 1.0))
+                    features = {
+                        'position_ratio': float(pos.get('ratio', 0.0) or 0.0),
+                        'account_ratio': float(acc.get('ratio', 0.0) or 0.0),
+                        'ls_ratio': ls_ratio,
+                        'top_position_long_pct': float(pos.get('long_pct', 50.0) or 50.0),
+                        'top_account_long_pct': float(acc.get('long_pct', 50.0) or 50.0),
+                        'oi_change_15m': float(ctx.get('oi_15m', 0.0) or 0.0),
+                        'price_change_15m': float(ctx.get('price_15m', 0.0) or 0.0),
+                        'price_change_5m': float(ctx.get('price_5m', 0.0) or 0.0),
+                        'funding_rate': float(ctx.get('funding', 0.0) or 0.0),
+                        'basis': float(ctx.get('basis', 0.0) or 0.0),
+                        'taker_buy_ratio_recent': float(ctx.get('recent_buy_ratio', 0.0) or 0.0),
+                        'trade_count_zscore': 0.0,
+                    }
+                    classification, decisive_feature = classify_bullish_signal(features)
+                    if classification in CORE_BULLISH_PATTERNS:
+                        fallback_score = 56.0
+                        if mtf.get('daily_bias') == 'UP':
+                            fallback_score += 4
+                        if mtf.get('h4_bias') == 'UP':
+                            fallback_score += 3
+                        if mtf.get('m5_entry') == 'LONG_TRIGGER':
+                            fallback_score += 3
+                        fallback = {
+                            'symbol': sym,
+                            'score': min(100.0, fallback_score),
+                            'pattern': classification,
+                            'classification': classification,
+                            'direction': 'UP',
+                            'signal_stage': 'EARLY',
+                            'decisive_feature': decisive_feature,
+                            'price': float(ctx.get('last_close', 0.0) or 0.0),
+                            'feature_scores': {
+                                'oi_regime': round(min(1.0, max(0.0, features['oi_change_15m'] / 3.0)), 3),
+                                'taker_aggression': round(min(1.0, max(0.0, features['taker_buy_ratio_recent'])), 3),
+                            },
+                            'reasons': [
+                                'توافق هرمي واضح بين 1D و4H و15m قبل الدخول',
+                                f"15m في منطقة اهتمام صاعدة ({mtf.get('m15_move_pct', 0):+.2f}%)",
+                                f"5m حالة التفعيل: {mtf.get('m5_entry')}",
+                                'الترشيح مبني على حالة مؤسسية من العائلات الأربع وليس شرطًا منفردًا',
+                            ],
+                            'timestamp': datetime.now().isoformat(),
+                            'mtf_context': mtf,
+                            'daily_view': mtf.get('daily_reason', ''),
+                            'h4_view': mtf.get('h4_reason', ''),
+                            'm15_view': mtf.get('m15_reason', ''),
+                            'm5_view': mtf.get('m5_reason', ''),
+                        }
+                        q_score, q_level, q_reasons = assess_signal_quality(sym, fallback['score'], fallback)
+                        fallback['score'] = max(fallback['score'], q_score)
+                        fallback['signal_quality_tier'] = q_level
+                        for rr in q_reasons:
+                            if rr not in fallback['reasons']:
+                                fallback['reasons'].append(rr)
+                        fallback = validate_and_finalize_signal(fallback)
+                        if fallback:
+                            results.append(fallback)
+        except Exception as e:
+            diagnostics.log_error(sym, 'fallback_mtf_candidate', str(e))
+
+    return _dedupe_symbol_signals(results)
+
 
 # =============================================================================
 # دالة إرسال إشارة فردية
 # =============================================================================
 def send_individual_signal(signal_data):
-    """إرسال تنبيه فوري عند اكتشاف إشارة جديدة أو محدثة."""
+    """إرسال تنبيه فوري عند اكتشاف إشارة جديدة أو محدثة مع جعل classification هو العنوان الرئيسي."""
     if signal_data['score'] < SIGNAL_MIN_SCORE:
         diagnostics.log_reject(signal_data.get('symbol', 'UNKNOWN'), signal_data.get('pattern', 'UNKNOWN'), 'signal_below_send_threshold', {'score': signal_data.get('score')})
-        return  # تجاهل الإشارات الضعيفة
+        return
 
-    pattern_key = signal_data['pattern']
-    pattern_info = PATTERN_ARABIC.get(pattern_key, {
-        'name': pattern_key,
-        'default_direction': 'غير معروف',
-        'emoji': '🔹'
-    })
-    emoji = pattern_info['emoji']
-    pattern_name_ar = pattern_info['name']
+    primary_key, primary_name, primary_emoji = get_primary_display(signal_data)
     direction = signal_data.get('direction', 'UP')
-    if direction == 'UP':
-        direction_ar = '🟢 شراء'
-    elif direction == 'DOWN':
-        direction_ar = '🔴 بيع'
-    else:
-        direction_ar = pattern_info['default_direction']
-    classification = signal_data.get('classification')
-    classification_info = PATTERN_ARABIC.get(classification, {'name': classification}) if classification else None
-
+    direction_ar = direction_to_ar(direction)
+    signal_stage = signal_data.get('signal_stage', 'SETUP')
+    decisive_feature = signal_data.get('decisive_feature', 'score')
     reasons = "، ".join(signal_data.get('reasons', []))
-    stop_loss = signal_data.get('stop_loss') or 0
-    tp1 = signal_data.get('take_profit1') or 0
-    tp2 = signal_data.get('take_profit2') or 0
-
-    # إضافة إشارة إذا كان هناك أنماط متعددة (سيتم إضافتها في deep_scan)
+    feature_scores_txt = format_feature_scores_brief(signal_data.get('feature_scores', {}))
     multi_pattern_hint = signal_data.get('multi_pattern_hint', '')
+    mtf = signal_data.get('mtf_context', {})
 
-    classification_line = f"\n   التصنيف: {classification_info.get('name', classification)}" if classification_info else ''
     message = (
         f"🔔 *إشارة جديدة: {signal_data['symbol']}* {multi_pattern_hint}\n"
-        f"{emoji} النمط: {pattern_name_ar} [{signal_data.get('power_level', 'عادية')}]\n"
+        f"{primary_emoji} التصنيف: *{primary_name}* (`{primary_key}`) [{signal_data.get('signal_quality_tier', 'مرشح مبكر')}]\n"
         f"   الدرجة: {signal_data['score']}\n"
-        f"   الاتجاه: {direction_ar}{classification_line}\n"
+        f"   الاتجاه: {direction_ar}\n"
+        f"   المرحلة: {signal_stage}\n"
         f"   السعر: {signal_data['price']:.6f}\n"
-        f"   وقف الخسارة: {stop_loss:.6f} | الهدف1: {tp1:.6f} | الهدف2: {tp2:.6f}\n"
-        f"   أسباب: {reasons}"
+        f"   D={mtf.get('daily_bias','?')}({mtf.get('daily_trend_pct',0):+.2f}%) | 4H={mtf.get('h4_bias','?')}({mtf.get('h4_trend_pct',0):+.2f}%) | 15m={mtf.get('m15_zone','?')} | 5m={mtf.get('m5_entry','?')}\n"
+        f"   العامل الحاسم: {decisive_feature}\n"
+        f"   أعلى الميزات: {feature_scores_txt}\n"
+        f"   أسباب: {reasons}\n"
     )
     send_telegram(message)
 
 # =============================================================================
 # المسح العميق (معدل لإرسال التنبيهات الفورية)
 # =============================================================================
-def deep_scan(candidates, learning_system):
-    all_results = []  # جميع الإشارات
-    symbol_signals = defaultdict(list)  # لتجميع الإشارات لكل رمز
+def deep_scan(candidates):
+    symbol_signals = defaultdict(list)
+    candidates = list(candidates)
     print(f"🔍 تحليل عميق لـ {len(candidates)} عملة...")
 
     clear_invalid_symbols()
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_long = {executor.submit(detect_long_term_accumulation, sym): sym for sym in candidates if not is_symbol_invalid(sym)}
-        long_results = []
-        remaining = []
-        for future in as_completed(future_long):
-            sym = future_long[future]
+        future_eval = {executor.submit(evaluate_symbol_patterns, sym): sym for sym in candidates if not is_symbol_invalid(sym)}
+        for future in as_completed(future_eval):
+            sym = future_eval[future]
             try:
-                res = future.result(timeout=30)
-                if res:
-                    print(f"   📅 {sym}: {res['score']} LONG_TERM_ACCUMULATION")
-                    # تقييم القوة وإدارة المخاطر
-                    power_score, power_level, power_reasons = assess_signal_power(res['symbol'], res['score'], {})
-                    res['power_level'] = power_level
-                    res['reasons'].extend(power_reasons)
-                    stop_loss, tp1, tp2 = calculate_risk_management(res['symbol'], res['price'], res['direction'])
-                    res['stop_loss'] = stop_loss
-                    res['take_profit1'] = tp1
-                    res['take_profit2'] = tp2
-                    long_results.append(res)
-                    symbol_signals[sym].append(res)
-                else:
-                    remaining.append(sym)
-                # لا تأخير بين الرموز
+                symbol_results = future.result(timeout=35)
+                if symbol_results:
+                    for res in symbol_results:
+                        primary_key, primary_name, primary_emoji = get_primary_display(res)
+                        print(f"   {primary_emoji} {sym}: {res['score']} | {primary_key}")
+                        symbol_signals[sym].append(res)
             except Exception as e:
                 print(f"   ❌ {sym}: {str(e)[:50]}")
                 if "400" in str(e) or "404" in str(e):
                     mark_symbol_invalid(sym)
-                remaining.append(sym)
 
-        if remaining:
-            future_pre = {executor.submit(detect_pre_pump, sym): sym for sym in remaining if not is_symbol_invalid(sym)}
-            pre_results = []
-            still_remaining = []
-            for future in as_completed(future_pre):
-                sym = future_pre[future]
-                try:
-                    res = future.result(timeout=30)
-                    if res:
-                        print(f"   🕒 {sym}: {res['score']} PRE_PUMP")
-                        power_score, power_level, power_reasons = assess_signal_power(res['symbol'], res['score'], {})
-                        res['power_level'] = power_level
-                        res['reasons'].extend(power_reasons)
-                        stop_loss, tp1, tp2 = calculate_risk_management(res['symbol'], res['price'], res['direction'])
-                        res['stop_loss'] = stop_loss
-                        res['take_profit1'] = tp1
-                        res['take_profit2'] = tp2
-                        pre_results.append(res)
-                        symbol_signals[sym].append(res)
-                    else:
-                        still_remaining.append(sym)
-                except Exception as e:
-                    print(f"   ❌ {sym}: {str(e)[:50]}")
-                    if "400" in str(e) or "404" in str(e):
-                        mark_symbol_invalid(sym)
-                    still_remaining.append(sym)
-
-            if still_remaining:
-                individual_results = []
-                whale_candidates = []
-                for sym in still_remaining:
-                    if is_symbol_invalid(sym):
-                        continue
-                    symbol_results = evaluate_symbol_patterns(sym)
-                    if symbol_results:
-                        for res in symbol_results:
-                            print(f"   {PATTERN_ARABIC.get(res['pattern'], {}).get('emoji', '🔹')} {sym}: {res['score']} {res['pattern']}")
-                            individual_results.append(res)
-                            symbol_signals[sym].append(res)
-                    else:
-                        whale_candidates.append(sym)
-
-                whale_results = []
-                if whale_candidates:
-                    future_whale = {executor.submit(detect_whale_setup, sym): sym for sym in whale_candidates if not is_symbol_invalid(sym)}
-                    for future in as_completed(future_whale):
-                        sym = future_whale[future]
-                        try:
-                            res = future.result(timeout=30)
-                            if res:
-                                print(f"   🐋 {sym}: {res['score']} WHALE_SETUP")
-                                power_score, power_level, power_reasons = assess_signal_power(res['symbol'], res['score'], {})
-                                res['power_level'] = power_level
-                                res['reasons'].extend(power_reasons)
-                                stop_loss, tp1, tp2 = calculate_risk_management(res['symbol'], res['price'], res['direction'])
-                                res['stop_loss'] = stop_loss
-                                res['take_profit1'] = tp1
-                                res['take_profit2'] = tp2
-                                whale_results.append(res)
-                                symbol_signals[sym].append(res)
-                        except Exception as e:
-                            print(f"   ❌ {sym}: {str(e)[:50]}")
-                            if "400" in str(e) or "404" in str(e):
-                                mark_symbol_invalid(sym)
-
-                all_results = (long_results + pre_results + individual_results + whale_results)
-            else:
-                all_results = (long_results + pre_results)
-        else:
-            all_results = long_results
-
-    # بعد جمع كل الإشارات، نضيف تعليق "فرصة دخول عالية" إذا تعددت الأنماط
     final_results = []
     for sym, sigs in symbol_signals.items():
         if len(sigs) > 1:
-            # هناك أكثر من نمط لنفس الرمز
             for sig in sigs:
                 sig['multi_pattern_hint'] = "🔥 (فرصة دخول عالية)"
                 final_results.append(sig)
@@ -4477,44 +4555,64 @@ def send_telegram(message, echo_to_console=True):
 
 def generate_report(results):
     if not results:
-        print("⚠️ لا توجد إشارات.")
+        print("⚠️ لا توجد إشارات مؤهلة بعد التسلسل الهرمي 1D→4H→15m→5m. راجع diagnostics.jsonl لمعرفة سبب الرفض لكل حالة.")
         return
+
     results.sort(key=lambda x: x['score'], reverse=True)
-    lines = ["🚀 *تقرير الماسح المتكامل*\n"]
-    for r in results[:10]:
-        pattern_key = r['pattern']
-        pattern_info = PATTERN_ARABIC.get(pattern_key, {
-            'name': pattern_key,
-            'default_direction': 'غير معروف',
-            'emoji': '🔹'
-        })
-        emoji = pattern_info['emoji']
-        pattern_name_ar = pattern_info['name']
-        direction = r.get('direction', 'UP')
-        if direction == 'UP':
-            direction_ar = '🟢 شراء'
-        elif direction == 'DOWN':
-            direction_ar = '🔴 بيع'
-        else:
-            direction_ar = pattern_info['default_direction']
+    bulls = sorted([r for r in results if r.get('direction') == 'UP'], key=lambda x: x.get('score', 0), reverse=True)
+    bears = sorted([r for r in results if r.get('direction') == 'DOWN'], key=lambda x: x.get('score', 0), reverse=True)
+    top_results = (bulls[:5] + bears[:5]) if (bulls or bears) else results[:10]
 
-        reasons = "، ".join(r.get('reasons', []))
-        stop_loss = r.get('stop_loss') or 0
-        tp1 = r.get('take_profit1') or 0
-        tp2 = r.get('take_profit2') or 0
-        multi_hint = r.get('multi_pattern_hint', '')
-        signal_stage = r.get('signal_stage', 'SETUP')
-        classification = r.get('classification')
-        classification_info = PATTERN_ARABIC.get(classification, {'name': classification}) if classification else None
-        classification_line = f" | التصنيف: {classification_info.get('name', classification)}" if classification_info else ''
+    lines = [
+        "🚀 *تقرير البصمات المؤسسية المبكرة*\n",
+        "📌 الهدف: اكتشاف الارتفاع قبل حدوثه | اليومي=اتجاه | 4H=تأكيد | 15m=منطقة اهتمام | 5m=دخول\n"
+    ]
 
+    if bulls:
+        lines.append("🟢 *أفضل العملات المرشحة للصعود:*")
+    for r in bulls[:5]:
+        _, primary_name, primary_emoji = get_primary_display(r)
+        mtf = r.get('mtf_context', {})
+        reasons = "، ".join(r.get('reasons', [])[:6])
+        stage = r.get('signal_stage', 'SETUP')
         lines.append(
-            f"{emoji} *{r['symbol']}*: {r['score']} ({pattern_name_ar}) {multi_hint} [{r.get('power_level', 'عادية')}]\n"
-            f"   الاتجاه: {direction_ar} | المرحلة: {signal_stage}{classification_line}\n"
-            f"   السعر: {r['price']:.6f}\n"
-            f"   وقف الخسارة: {stop_loss:.6f} | الهدف1: {tp1:.6f} | الهدف2: {tp2:.6f}\n"
-            f"   أسباب: {reasons}\n"
+            f"{primary_emoji} *{r['symbol']}*\n"
+            f"- الاتجاه المتوقع: صعود\n"
+            f"- التصنيف الأساسي: {primary_name}\n"
+            f"- جودة الإشارة: {r.get('signal_quality_tier', 'مرشح مبكر')}\n"
+            f"- 1D: {mtf.get('daily_bias','?')} ({mtf.get('daily_trend_pct',0):+.2f}%) — {r.get('daily_view','')}\n"
+            f"- 4H: {mtf.get('h4_bias','?')} ({mtf.get('h4_trend_pct',0):+.2f}%) — {r.get('h4_view','')}\n"
+            f"- 15m: {mtf.get('m15_zone','?')} ({mtf.get('m15_move_pct',0):+.2f}%) — {r.get('m15_view','')}\n"
+            f"- 5m: {mtf.get('m5_entry','?')} ({mtf.get('m5_move_pct',0):+.2f}%) — {r.get('m5_view','')}\n"
+            f"- العامل الحاسم: {r.get('decisive_feature','score')}\n"
+            f"- لماذا تم ترشيحها: {reasons}\n"
+            f"- لماذا ليست عشوائية: توافق هرمي 1D→4H→15m→5m + حالة مؤسسية\n"
+            f"- حالة الدخول: {stage}\n"
         )
+
+    if bears:
+        lines.append("🔴 *أفضل العملات المرشحة للهبوط:*")
+    for r in bears[:5]:
+        _, primary_name, primary_emoji = get_primary_display(r)
+        mtf = r.get('mtf_context', {})
+        reasons = "، ".join(r.get('reasons', [])[:6])
+        stage = r.get('signal_stage', 'SETUP')
+        lines.append(
+            f"{primary_emoji} *{r['symbol']}*\n"
+            f"- الاتجاه المتوقع: هبوط\n"
+            f"- التصنيف الأساسي: {primary_name}\n"
+            f"- جودة الإشارة: {r.get('signal_quality_tier', 'مرشح مبكر')}\n"
+            f"- 1D: {mtf.get('daily_bias','?')} ({mtf.get('daily_trend_pct',0):+.2f}%) — {r.get('daily_view','')}\n"
+            f"- 4H: {mtf.get('h4_bias','?')} ({mtf.get('h4_trend_pct',0):+.2f}%) — {r.get('h4_view','')}\n"
+            f"- 15m: {mtf.get('m15_zone','?')} ({mtf.get('m15_move_pct',0):+.2f}%) — {r.get('m15_view','')}\n"
+            f"- 5m: {mtf.get('m5_entry','?')} ({mtf.get('m5_move_pct',0):+.2f}%) — {r.get('m5_view','')}\n"
+            f"- العامل الحاسم: {r.get('decisive_feature','score')}\n"
+            f"- لماذا تم ترشيحها: {reasons}\n"
+            f"- لماذا ليست عشوائية: توافق هرمي 1D→4H→15m→5m + حالة موثقة\n"
+            f"- حالة الدخول: {stage}\n"
+        )
+
+    for r in top_results:
         try:
             db.save_signal(r)
         except Exception as e:
@@ -4525,45 +4623,20 @@ def generate_report(results):
     full = "\n".join(lines)
     print(full)
     send_telegram(full, echo_to_console=False)
-
-def generate_backtest_report(lookback_hours=BACKTEST_LOOKBACK_HOURS):
-    rows = db.get_backtest_summary(lookback_hours=lookback_hours)
-    if not rows:
-        print("📈 لا توجد بيانات كافية للباك تست بعد.")
-        return
-    print("\n📈 ملخص الباك تست المحلي:")
-    for pattern, total, win5, win15, win30 in rows[:10]:
-        total = total or 0
-        r5 = (win5 / total * 100) if total else 0
-        r15 = (win15 / total * 100) if total else 0
-        r30 = (win30 / total * 100) if total else 0
-        print(f"   {pattern}: total={total} | 5m={r5:.1f}% | 15m={r15:.1f}% | 30m={r30:.1f}%")
-
 # =============================================================================
 # الحلقة الرئيسية
 # =============================================================================
 def main():
     print("="*70)
-    print("الماسح المتوازي المتقدم - الإصدار v5.3.1 الاحترافي لـ Pydroid 3".center(70))
+    print("الماسح المتوازي المتقدم - تحليل متعدد الفريمات".center(70))
     print("="*70)
     if ENABLE_DIAGNOSTICS:
         print(f"🧪 سجل التشخيص: {DIAGNOSTICS_PATH}")
 
     all_symbols = get_all_usdt_perpetuals()
+    global TRADING_SYMBOLS_SET
+    TRADING_SYMBOLS_SET = set(all_symbols)
     print(f"✅ إجمالي العقود: {len(all_symbols)}")
-
-    if ENABLE_HMM:
-        print("🔄 تدريب نموذج HMM...")
-        hmm_detector.fit_model()
-        regime = hmm_detector.get_current_regime()
-        print(f"📊 حالة السوق الحالية: {regime['regime_name']}")
-
-    learning_system = LearningSystem(db)
-    if ENABLE_AUTO_CALIBRATION:
-        updated = pattern_calibrator.refresh_from_db(CALIBRATION_LOOKBACK_HOURS)
-        if updated:
-            print(f"🎛️ تم تحديث معايرة {len(updated)} نمط من نتائجك الأخيرة")
-        pattern_calibrator.print_summary()
 
     while True:
         start_time = time.time()
@@ -4573,27 +4646,8 @@ def main():
         if not candidates:
             print("⚠️ لا توجد مرشحات بعد الفلترة.")
         else:
-            results = deep_scan(candidates, learning_system)
+            results = deep_scan(candidates)
             generate_report(results)
-
-        invalidated_count = learning_system.invalidate_signals()
-        if invalidated_count:
-            print(f"🚫 تم إبطال {invalidated_count} إشارة بعد كسر الشروط المرجعية")
-
-        if ENABLE_LEARNING:
-            evaluated_count = learning_system.evaluate_signals()
-            if evaluated_count:
-                print(f"🧠 تم تقييم {evaluated_count} نتيجة عبر آفاق 5m/15m/30m")
-            hours_since_last = (datetime.now() - learning_system.last_learning_time).total_seconds() / 3600
-            if hours_since_last >= LEARNING_INTERVAL_HOURS:
-                print("🔄 جاري تحديث الأوزان وعرض ملخص الباك تست...")
-                learning_system.adjust_weights()
-                generate_backtest_report()
-                if ENABLE_AUTO_CALIBRATION:
-                    updated = pattern_calibrator.refresh_from_db(CALIBRATION_LOOKBACK_HOURS)
-                    if updated:
-                        print(f"🎛️ تم تحديث معايرة {len(updated)} نمط بعد التعلم")
-                learning_system.last_learning_time = datetime.now()
 
         elapsed = time.time() - start_time
         print(f"⏱️ استغرق المسح: {elapsed:.2f} ثانية")
