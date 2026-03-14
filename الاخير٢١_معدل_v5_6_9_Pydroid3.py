@@ -1176,7 +1176,7 @@ def directional_consistency_ok(signal_data, context):
             return False, 'up_direction_not_confirmed_by_recent_candles'
         if buy < 0.52 and context['buy_accel'] < 0.0:
             return False, 'up_signal_without_taker_buy_support'
-        if pattern in {'WHALE_MOMENTUM', 'WHALE_MOMENTUM_UP', 'FLOW_BREAKOUT', 'FLOW_BREAKOUT_NEUTRAL_FUNDING', 'SKYROCKET', 'STRONG_UPTREND', 'CONSENSUS_BULLISH_EXPANSION', 'ACCOUNT_LED_ACCUMULATION', 'FLOW_LIQUIDITY_VACUUM_BREAKOUT'} and p15 > 6.5:
+        if pattern in {'WHALE_MOMENTUM', 'WHALE_MOMENTUM_UP', 'FLOW_BREAKOUT', 'FLOW_LIQUIDITY_VACUUM_BREAKOUT', 'SKYROCKET', 'STRONG_UPTREND', 'CONSENSUS_BULLISH_EXPANSION', 'ACCOUNT_LED_ACCUMULATION'} and p15 > 6.5:
             return False, 'up_signal_arrived_too_late'
         if pattern in {'PRE_SQUEEZE_UP', 'PRE_EXPLOSION_SETUP', 'SMART_DIVERGENCE_SQUEEZE', 'POSITION_LED_SQUEEZE_BUILDUP'} and p15 > 5.0:
             return False, 'setup_arrived_after_expansion'
@@ -1265,7 +1265,7 @@ def validate_and_finalize_signal(signal_data):
         funding_rate=signal_data.get('funding'),
         buy_ratio=context['recent_buy_ratio']
     )
-    if signal_data.get('signal_stage') == 'LATE' and signal_data.get('pattern') in {'WHALE_MOMENTUM_UP', 'FLOW_BREAKOUT', 'FLOW_BREAKOUT_NEUTRAL_FUNDING', 'SKYROCKET', 'STRONG_UPTREND', 'CONSENSUS_BULLISH_EXPANSION'}:
+    if signal_data.get('signal_stage') == 'LATE' and signal_data.get('pattern') in {'WHALE_MOMENTUM_UP', 'FLOW_BREAKOUT', 'FLOW_LIQUIDITY_VACUUM_BREAKOUT', 'SKYROCKET', 'STRONG_UPTREND', 'CONSENSUS_BULLISH_EXPANSION'}:
         diagnostics.log_reject(signal_data.get('symbol', 'UNKNOWN'), signal_data.get('pattern', 'UNKNOWN'), 'late_stage_after_validation', signal_data.get('validation_context', {}))
         return None
     diagnostics.log_accept(signal_data.get('symbol', 'UNKNOWN'), signal_data.get('pattern', 'UNKNOWN'), signal_data.get('score'), signal_data.get('price'), signal_data.get('reasons', []), signal_data.get('validation_context', {}))
@@ -4428,117 +4428,103 @@ def send_individual_signal(signal_data):
 # المسح العميق (معدل لإرسال التنبيهات الفورية)
 # =============================================================================
 def deep_scan(candidates, learning_system):
-    all_results = []  # جميع الإشارات
-    symbol_signals = defaultdict(list)  # لتجميع الإشارات لكل رمز
+    symbol_signals = defaultdict(list)
     print(f"🔍 تحليل عميق لـ {len(candidates)} عملة...")
 
     clear_invalid_symbols()
 
+    # 1) القلب الحاكم: العائلات المؤسسية الأربع (مع fallback داخلي من evaluate_symbol_patterns)
+    no_signal_symbols = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_long = {executor.submit(detect_long_term_accumulation, sym): sym for sym in candidates if not is_symbol_invalid(sym)}
-        long_results = []
-        remaining = []
-        for future in as_completed(future_long):
-            sym = future_long[future]
+        future_eval = {executor.submit(evaluate_symbol_patterns, sym): sym for sym in candidates if not is_symbol_invalid(sym)}
+        for future in as_completed(future_eval):
+            sym = future_eval[future]
             try:
-                res = future.result(timeout=30)
-                if res:
-                    print(f"   📅 {sym}: {res['score']} LONG_TERM_ACCUMULATION")
-                    # تقييم القوة وإدارة المخاطر
-                    power_score, power_level, power_reasons = assess_signal_power(res['symbol'], res['score'], {})
-                    res['power_level'] = power_level
-                    res['reasons'].extend(power_reasons)
-                    stop_loss, tp1, tp2 = calculate_risk_management(res['symbol'], res['price'], res['direction'])
-                    res['stop_loss'] = stop_loss
-                    res['take_profit1'] = tp1
-                    res['take_profit2'] = tp2
-                    long_results.append(res)
-                    symbol_signals[sym].append(res)
+                symbol_results = future.result(timeout=35)
+                if symbol_results:
+                    for res in symbol_results:
+                        print(f"   {PATTERN_ARABIC.get(res['pattern'], {}).get('emoji', '🔹')} {sym}: {res['score']} {res['pattern']}")
+                        symbol_signals[sym].append(res)
                 else:
-                    remaining.append(sym)
-                # لا تأخير بين الرموز
+                    no_signal_symbols.append(sym)
             except Exception as e:
                 print(f"   ❌ {sym}: {str(e)[:50]}")
                 if "400" in str(e) or "404" in str(e):
                     mark_symbol_invalid(sym)
-                remaining.append(sym)
+                no_signal_symbols.append(sym)
 
-        if remaining:
-            future_pre = {executor.submit(detect_pre_pump, sym): sym for sym in remaining if not is_symbol_invalid(sym)}
-            pre_results = []
-            still_remaining = []
-            for future in as_completed(future_pre):
-                sym = future_pre[future]
+    # 2) fallback متأخر فقط: LONG_TERM ثم PRE_PUMP ثم WHALE_SETUP
+    def _finalize_legacy_signal(res):
+        if not res:
+            return None
+        res = _enforce_signal_consistency(res)
+        power_score, power_level, power_reasons = assess_signal_power(res['symbol'], res['score'], {})
+        res['power_level'] = power_level
+        for reason in power_reasons:
+            if reason not in res['reasons']:
+                res['reasons'].append(reason)
+        stop_loss, tp1, tp2 = calculate_risk_management(res['symbol'], res['price'], res['direction'])
+        res['stop_loss'] = stop_loss
+        res['take_profit1'] = tp1
+        res['take_profit2'] = tp2
+        return validate_and_finalize_signal(res)
+
+    still_no_signal = []
+    if no_signal_symbols:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_long = {executor.submit(detect_long_term_accumulation, sym): sym for sym in no_signal_symbols if not is_symbol_invalid(sym)}
+            for future in as_completed(future_long):
+                sym = future_long[future]
                 try:
-                    res = future.result(timeout=30)
+                    res = _finalize_legacy_signal(future.result(timeout=30))
                     if res:
-                        print(f"   🕒 {sym}: {res['score']} PRE_PUMP")
-                        power_score, power_level, power_reasons = assess_signal_power(res['symbol'], res['score'], {})
-                        res['power_level'] = power_level
-                        res['reasons'].extend(power_reasons)
-                        stop_loss, tp1, tp2 = calculate_risk_management(res['symbol'], res['price'], res['direction'])
-                        res['stop_loss'] = stop_loss
-                        res['take_profit1'] = tp1
-                        res['take_profit2'] = tp2
-                        pre_results.append(res)
+                        print(f"   📅 {sym}: {res['score']} LONG_TERM_ACCUMULATION")
                         symbol_signals[sym].append(res)
                     else:
-                        still_remaining.append(sym)
+                        still_no_signal.append(sym)
                 except Exception as e:
                     print(f"   ❌ {sym}: {str(e)[:50]}")
                     if "400" in str(e) or "404" in str(e):
                         mark_symbol_invalid(sym)
-                    still_remaining.append(sym)
+                    still_no_signal.append(sym)
 
-            if still_remaining:
-                individual_results = []
-                whale_candidates = []
-                for sym in still_remaining:
-                    if is_symbol_invalid(sym):
-                        continue
-                    symbol_results = evaluate_symbol_patterns(sym)
-                    if symbol_results:
-                        for res in symbol_results:
-                            print(f"   {PATTERN_ARABIC.get(res['pattern'], {}).get('emoji', '🔹')} {sym}: {res['score']} {res['pattern']}")
-                            individual_results.append(res)
-                            symbol_signals[sym].append(res)
+    final_no_signal = []
+    if still_no_signal:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_pre = {executor.submit(detect_pre_pump, sym): sym for sym in still_no_signal if not is_symbol_invalid(sym)}
+            for future in as_completed(future_pre):
+                sym = future_pre[future]
+                try:
+                    res = _finalize_legacy_signal(future.result(timeout=30))
+                    if res:
+                        print(f"   🕒 {sym}: {res['score']} PRE_PUMP")
+                        symbol_signals[sym].append(res)
                     else:
-                        whale_candidates.append(sym)
+                        final_no_signal.append(sym)
+                except Exception as e:
+                    print(f"   ❌ {sym}: {str(e)[:50]}")
+                    if "400" in str(e) or "404" in str(e):
+                        mark_symbol_invalid(sym)
+                    final_no_signal.append(sym)
 
-                whale_results = []
-                if whale_candidates:
-                    future_whale = {executor.submit(detect_whale_setup, sym): sym for sym in whale_candidates if not is_symbol_invalid(sym)}
-                    for future in as_completed(future_whale):
-                        sym = future_whale[future]
-                        try:
-                            res = future.result(timeout=30)
-                            if res:
-                                print(f"   🐋 {sym}: {res['score']} WHALE_SETUP")
-                                power_score, power_level, power_reasons = assess_signal_power(res['symbol'], res['score'], {})
-                                res['power_level'] = power_level
-                                res['reasons'].extend(power_reasons)
-                                stop_loss, tp1, tp2 = calculate_risk_management(res['symbol'], res['price'], res['direction'])
-                                res['stop_loss'] = stop_loss
-                                res['take_profit1'] = tp1
-                                res['take_profit2'] = tp2
-                                whale_results.append(res)
-                                symbol_signals[sym].append(res)
-                        except Exception as e:
-                            print(f"   ❌ {sym}: {str(e)[:50]}")
-                            if "400" in str(e) or "404" in str(e):
-                                mark_symbol_invalid(sym)
+    if final_no_signal:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_whale = {executor.submit(detect_whale_setup, sym): sym for sym in final_no_signal if not is_symbol_invalid(sym)}
+            for future in as_completed(future_whale):
+                sym = future_whale[future]
+                try:
+                    res = _finalize_legacy_signal(future.result(timeout=30))
+                    if res:
+                        print(f"   🐋 {sym}: {res['score']} WHALE_SETUP (fallback)")
+                        symbol_signals[sym].append(res)
+                except Exception as e:
+                    print(f"   ❌ {sym}: {str(e)[:50]}")
+                    if "400" in str(e) or "404" in str(e):
+                        mark_symbol_invalid(sym)
 
-                all_results = (long_results + pre_results + individual_results + whale_results)
-            else:
-                all_results = (long_results + pre_results)
-        else:
-            all_results = long_results
-
-    # بعد جمع كل الإشارات، نضيف تعليق "فرصة دخول عالية" إذا تعددت الأنماط
     final_results = []
     for sym, sigs in symbol_signals.items():
         if len(sigs) > 1:
-            # هناك أكثر من نمط لنفس الرمز
             for sig in sigs:
                 sig['multi_pattern_hint'] = "🔥 (فرصة دخول عالية)"
                 final_results.append(sig)
