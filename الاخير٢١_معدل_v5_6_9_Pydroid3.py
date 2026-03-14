@@ -37,6 +37,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "MIN_QUOTE_VOLUME_24H": 1_000_000,
     "MIN_PRICE_CHANGE_24H": 1.0,
     "ENABLE_CONSOLE_OUTPUT": True,
+    "PRINT_SCAN_PROGRESS": True,
 }
 
 
@@ -593,7 +594,13 @@ class ScannerEngine:
 
     def run_once(self) -> List[Signal]:
         out: List[Signal] = []
-        for sym in self.candidate_symbols():
+        candidates = self.candidate_symbols()
+        print(f"[SCAN] candidates={len(candidates)}")
+
+        for idx, sym in enumerate(candidates, start=1):
+            if self.cfg.get("PRINT_SCAN_PROGRESS", True) and (idx == 1 or idx % 20 == 0 or idx == len(candidates)):
+                print(f"[SCAN] processing {idx}/{len(candidates)}: {sym}")
+
             snap = self.builder.snapshot(sym)
             if not snap:
                 continue
@@ -602,6 +609,7 @@ class ScannerEngine:
                 out.append(sig)
 
         out.sort(key=lambda s: s.score, reverse=True)
+        print(f"[SCAN] done. signals={len(out)}")
         return out
 
 
@@ -634,10 +642,16 @@ def print_signals(signals: List[Signal]) -> None:
 
 def main() -> None:
     cfg = load_config()
+    print("[BOOT] Pre-Pump scanner started")
     engine = ScannerEngine(cfg)
-    signals = engine.run_once()
-    if cfg.get("ENABLE_CONSOLE_OUTPUT", True):
-        print_signals(signals)
+    try:
+        signals = engine.run_once()
+    except Exception as exc:
+        print(f"[ERROR] scan failed: {exc}")
+        raise
+
+    # Always print final outcome to avoid silent runs
+    print_signals(signals)
 
 
 if __name__ == "__main__":
