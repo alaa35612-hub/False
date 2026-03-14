@@ -3821,6 +3821,50 @@ PATTERN_ARABIC = {
     }
 }
 
+CLASSIFICATION_DISPLAY = {
+    'POSITION_LED_SQUEEZE_BUILDUP': {'name': 'بناء سكيز تقوده المراكز', 'emoji': '🎯', 'direction': 'UP'},
+    'ACCOUNT_LED_ACCUMULATION': {'name': 'تجميع تقوده الحسابات', 'emoji': '🏦', 'direction': 'UP'},
+    'CONSENSUS_BULLISH_EXPANSION': {'name': 'توسع صاعد مؤسسي متوافق', 'emoji': '🟢', 'direction': 'UP'},
+    'FLOW_LIQUIDITY_VACUUM_BREAKOUT': {'name': 'اختراق فراغ سيولة تدفقي', 'emoji': '⚡', 'direction': 'UP'},
+    'INSTITUTIONAL_ACCUMULATION': {'name': 'تراكم مؤسسي', 'emoji': '🏦', 'direction': 'UP'},
+    'SHORT_SQUEEZE_BUILDUP': {'name': 'بناء ضغط قصير', 'emoji': '🧠', 'direction': 'UP'},
+    'LIQUIDITY_VACUUM_BREAKOUT': {'name': 'اختراق فراغ سيولة', 'emoji': '⚡', 'direction': 'UP'},
+    'NO_CLEAR_BULLISH_FAMILY': {'name': 'بصمة صاعدة غير مكتملة', 'emoji': '⚪', 'direction': 'UP'},
+    'EXHAUSTION_RISK': {'name': 'خطر إرهاق صاعد', 'emoji': '🧯', 'direction': 'DOWN'},
+    'BEARISH_GENERIC': {'name': 'إشارة هابطة عامة', 'emoji': '🔻', 'direction': 'DOWN'},
+    'LATE_CROWD_LONG': {'name': 'ازدحام شراء متأخر', 'emoji': '🚫', 'direction': 'DOWN'},
+}
+
+def get_primary_display(signal_data):
+    classification = signal_data.get('classification')
+    pattern = signal_data.get('pattern')
+    key = classification or pattern or 'UNKNOWN'
+    info = CLASSIFICATION_DISPLAY.get(key)
+    if info:
+        return key, info.get('name', key), info.get('emoji', '🔹')
+    legacy = PATTERN_ARABIC.get(key, {'name': key, 'emoji': '🔹'})
+    return key, legacy.get('name', key), legacy.get('emoji', '🔹')
+
+def direction_to_ar(direction):
+    if direction == 'UP':
+        return '🟢 شراء'
+    if direction == 'DOWN':
+        return '🔴 بيع'
+    return '⚪ محايد'
+
+def format_feature_scores_brief(feature_scores, top_n=4):
+    if not feature_scores or not isinstance(feature_scores, dict):
+        return 'غير متاح'
+    pairs = []
+    for k, v in feature_scores.items():
+        try:
+            pairs.append((k, float(v)))
+        except Exception:
+            continue
+    pairs.sort(key=lambda x: x[1], reverse=True)
+    brief = [f"{k}:{v:.2f}" for k, v in pairs[:top_n]]
+    return ' | '.join(brief) if brief else 'غير متاح'
+
 # =============================================================================
 # قاعدة بيانات الإشارات
 # =============================================================================
@@ -4385,46 +4429,36 @@ def evaluate_symbol_patterns(sym):
 # دالة إرسال إشارة فردية
 # =============================================================================
 def send_individual_signal(signal_data):
-    """إرسال تنبيه فوري عند اكتشاف إشارة جديدة أو محدثة."""
+    """إرسال تنبيه فوري عند اكتشاف إشارة جديدة أو محدثة مع جعل classification هو العنوان الرئيسي."""
     if signal_data['score'] < SIGNAL_MIN_SCORE:
         diagnostics.log_reject(signal_data.get('symbol', 'UNKNOWN'), signal_data.get('pattern', 'UNKNOWN'), 'signal_below_send_threshold', {'score': signal_data.get('score')})
-        return  # تجاهل الإشارات الضعيفة
+        return
 
-    pattern_key = signal_data['pattern']
-    pattern_info = PATTERN_ARABIC.get(pattern_key, {
-        'name': pattern_key,
-        'default_direction': 'غير معروف',
-        'emoji': '🔹'
-    })
-    emoji = pattern_info['emoji']
-    pattern_name_ar = pattern_info['name']
+    primary_key, primary_name, primary_emoji = get_primary_display(signal_data)
     direction = signal_data.get('direction', 'UP')
-    if direction == 'UP':
-        direction_ar = '🟢 شراء'
-    elif direction == 'DOWN':
-        direction_ar = '🔴 بيع'
-    else:
-        direction_ar = pattern_info['default_direction']
-    classification = signal_data.get('classification')
-    classification_info = PATTERN_ARABIC.get(classification, {'name': classification}) if classification else None
-
+    direction_ar = direction_to_ar(direction)
+    signal_stage = signal_data.get('signal_stage', 'SETUP')
+    decisive_feature = signal_data.get('decisive_feature', 'score')
     reasons = "، ".join(signal_data.get('reasons', []))
+    feature_scores_txt = format_feature_scores_brief(signal_data.get('feature_scores', {}))
     stop_loss = signal_data.get('stop_loss') or 0
     tp1 = signal_data.get('take_profit1') or 0
     tp2 = signal_data.get('take_profit2') or 0
-
-    # إضافة إشارة إذا كان هناك أنماط متعددة (سيتم إضافتها في deep_scan)
     multi_pattern_hint = signal_data.get('multi_pattern_hint', '')
+    internal_pattern = signal_data.get('pattern', '')
 
-    classification_line = f"\n   التصنيف: {classification_info.get('name', classification)}" if classification_info else ''
     message = (
         f"🔔 *إشارة جديدة: {signal_data['symbol']}* {multi_pattern_hint}\n"
-        f"{emoji} النمط: {pattern_name_ar} [{signal_data.get('power_level', 'عادية')}]\n"
+        f"{primary_emoji} التصنيف: *{primary_name}* (`{primary_key}`) [{signal_data.get('power_level', 'عادية')}]\n"
         f"   الدرجة: {signal_data['score']}\n"
-        f"   الاتجاه: {direction_ar}{classification_line}\n"
+        f"   الاتجاه: {direction_ar}\n"
+        f"   المرحلة: {signal_stage}\n"
         f"   السعر: {signal_data['price']:.6f}\n"
         f"   وقف الخسارة: {stop_loss:.6f} | الهدف1: {tp1:.6f} | الهدف2: {tp2:.6f}\n"
-        f"   أسباب: {reasons}"
+        f"   العامل الحاسم: {decisive_feature}\n"
+        f"   أعلى الميزات: {feature_scores_txt}\n"
+        f"   أسباب: {reasons}\n"
+        f"   النمط الداخلي (تشخيص): {internal_pattern}"
     )
     send_telegram(message)
 
@@ -4447,7 +4481,8 @@ def deep_scan(candidates, learning_system):
                 symbol_results = future.result(timeout=35)
                 if symbol_results:
                     for res in symbol_results:
-                        print(f"   {PATTERN_ARABIC.get(res['pattern'], {}).get('emoji', '🔹')} {sym}: {res['score']} {res['pattern']}")
+                        primary_key, primary_name, primary_emoji = get_primary_display(res)
+                        print(f"   {primary_emoji} {sym}: {res['score']} | {primary_key}")
                         symbol_signals[sym].append(res)
                 else:
                     no_signal_symbols.append(sym)
@@ -4482,7 +4517,8 @@ def deep_scan(candidates, learning_system):
                 try:
                     res = _finalize_legacy_signal(future.result(timeout=30))
                     if res:
-                        print(f"   📅 {sym}: {res['score']} LONG_TERM_ACCUMULATION")
+                        primary_key, primary_name, primary_emoji = get_primary_display(res)
+                        print(f"   {primary_emoji} {sym}: {res['score']} | {primary_key}")
                         symbol_signals[sym].append(res)
                     else:
                         still_no_signal.append(sym)
@@ -4501,7 +4537,8 @@ def deep_scan(candidates, learning_system):
                 try:
                     res = _finalize_legacy_signal(future.result(timeout=30))
                     if res:
-                        print(f"   🕒 {sym}: {res['score']} PRE_PUMP")
+                        primary_key, primary_name, primary_emoji = get_primary_display(res)
+                        print(f"   {primary_emoji} {sym}: {res['score']} | {primary_key}")
                         symbol_signals[sym].append(res)
                     else:
                         final_no_signal.append(sym)
@@ -4519,7 +4556,8 @@ def deep_scan(candidates, learning_system):
                 try:
                     res = _finalize_legacy_signal(future.result(timeout=30))
                     if res:
-                        print(f"   🐋 {sym}: {res['score']} WHALE_SETUP (fallback)")
+                        primary_key, primary_name, primary_emoji = get_primary_display(res)
+                        print(f"   {primary_emoji} {sym}: {res['score']} | {primary_key} (fallback)")
                         symbol_signals[sym].append(res)
                 except Exception as e:
                     print(f"   ❌ {sym}: {str(e)[:50]}")
@@ -4555,42 +4593,35 @@ def generate_report(results):
     if not results:
         print("⚠️ لا توجد إشارات.")
         return
-    results.sort(key=lambda x: x['score'], reverse=True)
-    lines = ["🚀 *تقرير الماسح المتكامل*\n"]
-    for r in results[:10]:
-        pattern_key = r['pattern']
-        pattern_info = PATTERN_ARABIC.get(pattern_key, {
-            'name': pattern_key,
-            'default_direction': 'غير معروف',
-            'emoji': '🔹'
-        })
-        emoji = pattern_info['emoji']
-        pattern_name_ar = pattern_info['name']
-        direction = r.get('direction', 'UP')
-        if direction == 'UP':
-            direction_ar = '🟢 شراء'
-        elif direction == 'DOWN':
-            direction_ar = '🔴 بيع'
-        else:
-            direction_ar = pattern_info['default_direction']
 
+    results.sort(key=lambda x: x['score'], reverse=True)
+    lines = ["🚀 *تقرير الماسح المتكامل (Classification-first)*\n"]
+
+    for r in results[:10]:
+        primary_key, primary_name, primary_emoji = get_primary_display(r)
+        direction_ar = direction_to_ar(r.get('direction', 'UP'))
         reasons = "، ".join(r.get('reasons', []))
         stop_loss = r.get('stop_loss') or 0
         tp1 = r.get('take_profit1') or 0
         tp2 = r.get('take_profit2') or 0
         multi_hint = r.get('multi_pattern_hint', '')
         signal_stage = r.get('signal_stage', 'SETUP')
-        classification = r.get('classification')
-        classification_info = PATTERN_ARABIC.get(classification, {'name': classification}) if classification else None
-        classification_line = f" | التصنيف: {classification_info.get('name', classification)}" if classification_info else ''
+        decisive_feature = r.get('decisive_feature', 'score')
+        feature_scores_txt = format_feature_scores_brief(r.get('feature_scores', {}))
+        internal_pattern = r.get('pattern', '')
 
         lines.append(
-            f"{emoji} *{r['symbol']}*: {r['score']} ({pattern_name_ar}) {multi_hint} [{r.get('power_level', 'عادية')}]\n"
-            f"   الاتجاه: {direction_ar} | المرحلة: {signal_stage}{classification_line}\n"
+            f"{primary_emoji} *{r['symbol']}*: {r['score']} | *{primary_name}* (`{primary_key}`) {multi_hint} [{r.get('power_level', 'عادية')}]\n"
+            f"   الاتجاه: {direction_ar}\n"
+            f"   المرحلة: {signal_stage}\n"
             f"   السعر: {r['price']:.6f}\n"
             f"   وقف الخسارة: {stop_loss:.6f} | الهدف1: {tp1:.6f} | الهدف2: {tp2:.6f}\n"
+            f"   العامل الحاسم: {decisive_feature}\n"
+            f"   أعلى الميزات: {feature_scores_txt}\n"
             f"   أسباب: {reasons}\n"
+            f"   النمط الداخلي (تشخيص): {internal_pattern}\n"
         )
+
         try:
             db.save_signal(r)
         except Exception as e:
